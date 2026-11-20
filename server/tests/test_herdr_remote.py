@@ -871,6 +871,15 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(self.req("GET", "/api/terminals/t12/screen?lines=-1")[0], 400)
         self.assertEqual(self.req("GET", "/api/terminals/nope/screen")[0], 404)
 
+    def test_live_cwd_prefers_foreground(self):
+        # Herdr에서 새 Space를 ~에서 열고 cd한 뒤 claude를 띄운 경우: 터미널 cwd는 ~, 지금 폴더는 foreground.cwd
+        info = {"cwd": "/Users/me", "foreground": {"argv": ["claude"], "cwd": "/Users/me/proj", "pid": 1}}
+        self.assertEqual(hr.live_cwd(info), "/Users/me/proj")
+        self.assertEqual(hr.live_cwd({"cwd": "/Users/me"}), "/Users/me")
+        self.assertEqual(hr.live_cwd({"cwd": "/Users/me", "foreground": {"cwd": ""}}), "/Users/me")
+        self.assertEqual(hr.live_cwd({"cwd": "/Users/me", "foreground": None}), "/Users/me")
+        self.assertIsNone(hr.live_cwd(None))
+
     def test_bad_input_never_calls_hc_keys(self):
         cases = [
             ("/api/terminals/t12/keys", {"keys": ["ctrl+c"]}, 400),

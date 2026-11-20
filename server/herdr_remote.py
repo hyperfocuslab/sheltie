@@ -275,6 +275,16 @@ def status_of(info):
     return s if isinstance(s, dict) else {}
 
 
+def live_cwd(info):
+    """지금 폴더: 앞에서 도는 프로그램의 cwd(셸에서 cd한 뒤의 폴더), 없으면 터미널을 연 폴더."""
+    info = info or {}
+    fg = info.get("foreground")
+    if isinstance(fg, dict) and isinstance(fg.get("cwd"), str) and fg.get("cwd"):
+        return fg["cwd"]
+    cwd = info.get("cwd")
+    return cwd if isinstance(cwd, str) else None
+
+
 def is_claude(info):
     info = info or {}
     if info.get("agent") in ("claude", "claude-code"):
@@ -1055,7 +1065,7 @@ def find_transcript(info, home, runner=None):
     proc_start = sess.get("procStart")
     if not isinstance(proc_start, str) or _norm(proc_start) != ps_lstart(pid, runner):
         return None, None  # pid가 다른 프로세스로 재사용됐다
-    cwd = sess.get("cwd") if isinstance(sess.get("cwd"), str) else info.get("cwd")
+    cwd = sess.get("cwd") if isinstance(sess.get("cwd"), str) else live_cwd(info)
     projects = os.path.join(home, ".claude", "projects")
     if isinstance(cwd, str):
         path = os.path.join(projects, re.sub(r"[^A-Za-z0-9]", "-", cwd), sid + ".jsonl")
@@ -2540,7 +2550,7 @@ class App:
             tid = t.get("address")
             if not isinstance(tid, str) or not ID_RE.match(tid):
                 continue
-            item = {"id": tid, "name": t.get("name"), "cwd": t.get("cwd"), "agent": t.get("agent"),
+            item = {"id": tid, "name": t.get("name"), "cwd": live_cwd(t), "agent": t.get("agent"),
                     "state": t.get("state"), "status": None, "status_ms": None, "title": None,
                     "claude": is_claude(t), "preview": None, "blocked_since": None}
             try:
@@ -2548,9 +2558,10 @@ class App:
             except HcError:
                 info = None
             if isinstance(info, dict):
-                for k in ("name", "cwd", "agent", "state"):
+                for k in ("name", "agent", "state"):
                     if info.get(k) is not None:
                         item[k] = info.get(k)
+                item["cwd"] = live_cwd(info) or item["cwd"]
                 item["status"] = info.get("status") if isinstance(info.get("status"), dict) else None
                 item["status_ms"] = info.get("status_ms")
                 item["title"] = info.get("title")
@@ -2739,7 +2750,7 @@ class App:
         except HcError:
             terms = []
         for t in terms:
-            cwd = t.get("cwd")
+            cwd = live_cwd(t)
             if not isinstance(cwd, str):
                 continue
             r = rel_to_home(os.path.realpath(cwd), self.home)
