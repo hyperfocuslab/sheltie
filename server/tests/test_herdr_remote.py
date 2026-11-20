@@ -1446,7 +1446,7 @@ class QrTests(unittest.TestCase):
 class PromptHttpTests(unittest.TestCase):
     def setUp(self):
         self.home = os.path.realpath(tempfile.mkdtemp())
-        for d in ("proj/a", "proj/b", ".hidden", "Docs"):
+        for d in ("proj/a", "proj/b", "proj/Library", ".hidden", "Docs", "Library"):
             os.makedirs(os.path.join(self.home, d))
         self.outside = os.path.realpath(tempfile.mkdtemp())
         os.symlink(self.outside, os.path.join(self.home, "escape"))
@@ -1538,13 +1538,21 @@ class PromptHttpTests(unittest.TestCase):
         self.assertEqual(self.req("POST", "/api/terminals/t1/answer", {"action": "always"})[0], 400)
         self.assertEqual(self.req("POST", "/api/terminals/t1/answer", {"action": "approve", "expect_msg": PERM["msg"]})[1]["keys"], ["1"])
 
+    def test_tool_summary_tilde(self):
+        home = os.path.expanduser("~")
+        self.assertEqual(hr._tool_summary("Edit", {"file_path": home + "/p/README.md"}), "~/p/README.md")
+        self.assertEqual(hr._tool_summary("Grep", {"pattern": "x", "path": home}), "~")
+        self.assertEqual(hr._tool_summary("Read", {"file_path": home + "x/a"}), home + "x/a")  # 접두사만 같은 다른 폴더
+        self.assertEqual(hr._tool_summary("Read", {"file_path": "/etc/hosts"}), "/etc/hosts")
+        self.assertEqual(hr._tool_summary("Bash", {"command": "cat " + home + "/a"}), "cat " + home + "/a")
+
     def test_folders(self):
         code, body = self.req("GET", "/api/folders")
         self.assertEqual(code, 200)
         self.assertEqual(body["path"], "")
-        self.assertEqual(body["dirs"], ["Docs", "plink", "proj"])  # 숨김·홈 밖 링크 제외
+        self.assertEqual(body["dirs"], ["Docs", "plink", "proj"])  # 숨김·홈 밖 링크·홈의 Library 제외
         self.assertEqual(body["recent"], ["proj/a"])  # 홈 밖 cwd 제외
-        self.assertEqual(self.req("GET", "/api/folders?path=proj")[1]["dirs"], ["a", "b"])
+        self.assertEqual(self.req("GET", "/api/folders?path=proj")[1]["dirs"], ["a", "b", "Library"])  # 홈 아래가 아니면 보인다
         for bad in ("..", "../x", "/etc", ".hidden", "escape", "proj/../..", "nope"):
             with self.subTest(path=bad):
                 code, body = self.req("GET", "/api/folders?path=" + urllib.parse.quote(bad))

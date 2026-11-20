@@ -900,13 +900,25 @@ def _cap_obj(v):
     return v
 
 
+def _tilde(s):
+    """홈 아래 절대 경로를 ~/...로 줄인다(폰 화면 폭이 좁아 /Users/<이름>/ 부분이 경로 끝을 밀어낸다)."""
+    for h in {os.path.expanduser("~"), home_real()}:
+        h = h.rstrip(os.sep)
+        if h and (s == h or s.startswith(h + os.sep)):
+            return "~" + s[len(h):]
+    return s
+
+
 def _tool_summary(name, inp):
     if not isinstance(inp, dict):
         return ""
     for k in ("command", "file_path", "path", "pattern", "url", "query", "description", "prompt"):
         v = inp.get(k)
         if isinstance(v, str) and v.strip():
-            return _cap(v.strip().split("\n", 1)[0], 200)
+            v = v.strip().split("\n", 1)[0]
+            if k in ("file_path", "path"):
+                v = _tilde(v)
+            return _cap(v, 200)
     for v in inp.values():
         if isinstance(v, str) and v.strip():
             return _cap(v.strip().split("\n", 1)[0], 200)
@@ -1147,6 +1159,10 @@ def terminal_preview(info, home, runner=None, now=None):
 
 
 # ---------------------------------------------------------------- 폴더
+
+# 홈 바로 아래에서 폴더 목록에 안 보이는 것(Finder도 숨긴다. 에이전트를 여기서 시작할 일이 없다)
+HIDDEN_HOME_DIRS = frozenset({"Library"})
+
 
 def home_real():
     return os.path.realpath(os.path.expanduser("~"))
@@ -2704,7 +2720,7 @@ class App:
         try:
             with os.scandir(p) as it:
                 for e in it:
-                    if e.name.startswith("."):
+                    if e.name.startswith(".") or (p == self.home and e.name in HIDDEN_HOME_DIRS):
                         continue
                     try:
                         if not e.is_dir(follow_symlinks=True):
