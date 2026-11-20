@@ -280,6 +280,17 @@ class InstallTest(unittest.TestCase):
         self.assertTrue(any("https://raw.githubusercontent.com/" in x and x.endswith("server/herdr_remote.py")
                             for x in self.calls()))
 
+    def test_piped_from_folder_with_server_file_still_uses_github(self):
+        # curl | sh 는 $0이 "sh"라서, 서버 파일이 있는 폴더(이 저장소 루트)에서 돌려도 그 파일을 쓰면 안 된다.
+        self.fake("curl", self.FAKE_CURL_DL)
+        env = {"HOME": self.home, "PATH": self.bin + ":/usr/bin:/bin", "FAKE_LOG": self.log,
+               "TS_SERVE_FILE": self.ts_serve_file, "HERDR_REMOTE_HEALTH_TRIES": "2", "STUB_SRC": self.stub,
+               "TS_SERVE_JSON": self.ts_serve_json, "HERDR_REMOTE_SYS_AGENTS_DIR": self.sys_dir}
+        r = subprocess.run(["sh", "-s"], input=read(INSTALL), cwd=ROOT, env=env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(any("https://raw.githubusercontent.com/" in x and x.endswith("server/herdr_remote.py")
+                            for x in self.calls()))
+
     def test_http_source_rejected(self):
         r = self.lone_install(HERDR_REMOTE_SRC="http://example.invalid/herdr_remote.py")
         self.assertNotEqual(r.returncode, 0)

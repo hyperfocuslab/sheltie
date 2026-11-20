@@ -105,7 +105,11 @@ fi
 
 # ---- 2. 서버 파일
 SRC=${HERDR_REMOTE_SRC:-}
-HERE=$(cd "$(dirname "$0")" 2>/dev/null && pwd || true)
+# curl | sh로 돌면 $0은 "sh"라 dirname이 현재 폴더가 된다. 파일로 실행했을 때만 옆 파일을 쓴다.
+HERE=""
+case "$0" in
+  *install.sh) [ -f "$0" ] && HERE=$(cd "$(dirname "$0")" 2>/dev/null && pwd || true) ;;
+esac
 if [ -z "$SRC" ] && [ -n "$HERE" ] && [ -f "$HERE/server/herdr_remote.py" ]; then
   SRC="$HERE/server/herdr_remote.py"
 fi
