@@ -21,6 +21,9 @@ ssh -t my-mac 'python3 ~/Documents/github/herdr-remote/server/herdr_remote.py in
 재시작: launchctl kickstart -k gui/$(id -u)/com.hyperfocuslab.herdr-remote; tail ~/Library/Logs/herdr-remote.log
 해제: launchctl bootout gui/$(id -u)/com.hyperfocuslab.herdr-remote && sudo rm /Library/LaunchAgents/com.hyperfocuslab.herdr-remote.plist
 APNs 키: Apple Developer에서 받은 .p8을 ~/.config/herdr-remote/AuthKey.p8 (0600)에 둔다. 없으면 푸시만 꺼진다.
+중계 모드: APNs 키 파일이 없고 설정의 push_relay_url이 비어 있으면 기본 중계(DEFAULT_RELAY_URL)로 키 없이 보낸다
+(App Store판 앱, 기기마다 relay_sig 필요). push_relay_url에 https 주소를 넣으면 그 중계를 쓰고, "off"면 중계를 끈다.
+키 파일이 있고 push_relay_url이 비어 있으면 지금처럼 APNs 직접 모드.
 
 환경변수
   HERDR_REMOTE_CONFIG  설정 파일(기본 ~/.config/herdr-remote/config.json). devices.json은 같은 폴더.
@@ -29,6 +32,7 @@ APNs 키: Apple Developer에서 받은 .p8을 ~/.config/herdr-remote/AuthKey.p8 
 import base64
 import hashlib
 import hmac
+import http.client
 import http.server
 import ipaddress
 import json
@@ -38,6 +42,7 @@ import os
 import re
 import secrets
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -45,6 +50,7 @@ import threading
 import time
 import unicodedata
 import urllib.parse
+import uuid
 
 DEFAULT_CONFIG_PATH = "~/.config/herdr-remote/config.json"
 DEFAULT_LOG_PATH = "~/Library/Logs/herdr-remote.log"
@@ -59,7 +65,11 @@ DEFAULTS = {
     "topic": "com.hyperfocuslab.sheltie",
     "apns_hosts": {"sandbox": "https://api.sandbox.push.apple.com",
                    "production": "https://api.push.apple.com"},
+    "push_relay_url": "",
 }
+
+DEFAULT_RELAY_URL = "https://sheltie-push-relay.cpubench.workers.dev"
+RELAY_OFF = "off"  # push_relay_url에 이 값을 넣으면 중계를 쓰지 않는다
 
 HC_TIMEOUT = 10
 MAX_BODY = 64 * 1024
@@ -67,9 +77,19 @@ POLL_INTERVAL = 15
 BIND_RETRY = 10
 EVENTS_MAX_BACKOFF = 30
 JWT_TTL = 50 * 60
+RELAY_TIMEOUT = 10
+RELAY_IDLE_MAX = 60  # 이보다 오래 쉰 연결은 NAT가 조용히 버렸을 수 있어 새로 맺는다
+RELAY_RETRY_WAIT = 1.0  # 중계 5xx 뒤 한 번 다시 보내기 전 쉬는 시간(초)
+REMINDER_AFTER_SEC = (300, 1800)  # 막힘 첫 알림 뒤 다시 알릴 시점(초). config reminder_after_sec로 바꾼다
+PUSH_STATUS_FILE = "push_status.json"
+PUSH_FAILING_WINDOW_MS = 24 * 3600 * 1000
+PUSH_LOG_MAX_DEVICES = 64
+PUSH_TEST_MIN_GAP = 10.0  # 같은 기기 시험 알림 최소 간격(초)
 
 ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 DEVICE_TOKEN_RE = re.compile(r"^[0-9a-fA-F]{32,200}$")
+RELAY_SIG_RE = re.compile(r"^v1\.[A-Za-z0-9_-]{43}$")
+DEVICE_ID_RE = re.compile(r"^[0-9a-f]{16}$")
 ALLOWED_KEYS = frozenset(["enter", "esc", "up", "down", "left", "right", "tab", "space"]
                          + [str(i) for i in range(1, 10)])
 MAX_KEYS = 10
@@ -121,10 +141,34 @@ def load_config(path=None):
     cfg["apns_hosts"] = hosts
     for k in ("hc_path", "apns_key_path"):
         cfg[k] = os.path.expanduser(cfg[k])
+    cfg["push_relay_url"] = resolve_relay_url(cfg.get("push_relay_url"), cfg["apns_key_path"])
     cfg["port"] = int(cfg["port"])
     cfg["_path"] = path
     cfg["_dir"] = os.path.dirname(path)
     return cfg
+
+
+def resolve_relay_url(url, apns_key_path):
+    """실제로 쓸 중계 주소. "off"면 "", 비었고 APNs 키 파일이 없으면 기본 중계, 아니면 check_relay_url."""
+    if url == RELAY_OFF:
+        return ""
+    if (url is None or url == "") and not os.path.isfile(apns_key_path or ""):
+        return DEFAULT_RELAY_URL
+    return check_relay_url(url)
+
+
+def check_relay_url(url):
+    """push_relay_url 검사. 비었으면 "", https만 허용(로컬 시험용 http://127.0.0.1·localhost 예외). 끝 슬래시는 뗀다."""
+    if url is None or url == "":
+        return ""
+    if not isinstance(url, str):
+        raise ValueError("push_relay_url은 문자열이어야 한다")
+    u = urllib.parse.urlsplit(url)
+    u.port  # 포트가 숫자가 아니면 ValueError
+    ok = u.hostname and (u.scheme == "https" or (u.scheme == "http" and u.hostname in ("127.0.0.1", "localhost")))
+    if not ok or u.username or u.password or u.query or u.fragment:
+        raise ValueError("push_relay_url 거부: https://만 허용(로컬 시험은 http://127.0.0.1·http://localhost): %r" % url)
+    return url.rstrip("/")
 
 
 def init_config(path=None, out=None):
@@ -217,6 +261,10 @@ class Hc:
         if prompt:
             argv += ["--", prompt]
         return self._json(argv)
+
+    def run_agent(self, cwd, argv):
+        """허용 목록 에이전트 터미널. argv는 agent_argv()가 만든 리스트만 온다(프롬프트는 `--` 뒤)."""
+        return self._json(["run", "--bg", "--json", "--cwd", cwd] + list(argv))
 
     def events_argv(self):
         return [self.path, "events"]
@@ -882,6 +930,12 @@ def _result_text(c):
     return ""
 
 
+def _strip_ansi(text):
+    """도구 출력(Bash 결과 등)의 터미널 제어 문자를 지운다. 화면 읽기와 같은 ANSI_RE + 남은 ESC·\r."""
+    text = re.sub(r"\x1b[()*+][0-9A-Za-z]", "", ANSI_RE.sub("", text))  # 문자 집합 지정(ESC ( B)
+    return text.replace("\x1b", "").replace("\r\n", "\n").replace("\r", "\n")
+
+
 def _hidden(text):
     return text.lstrip().startswith(HIDDEN_USER_PREFIXES)
 
@@ -922,7 +976,7 @@ def parse_transcript(lines, limit=50):
                     elif c.get("type") == "tool_result":
                         t = tools.get(c.get("tool_use_id"))
                         if t is not None:
-                            t["output"] = _cap(_result_text(c.get("content")))
+                            t["output"] = _cap(_strip_ansi(_result_text(c.get("content"))))
                             t["state"] = "error" if c.get("is_error") else "ok"
             if parts:
                 turns.append({"role": "user", "parts": parts})
@@ -1013,6 +1067,83 @@ def read_transcript(path, limit=50):
         size = 0
     turns, cut = parse_transcript(data.decode("utf-8", "replace").split("\n"), limit)
     return turns, cut or size > TRANSCRIPT_TAIL
+
+
+# ---------------------------------------------------------------- 목록 미리보기(마지막 응답)
+
+PREVIEW_MAX = 160
+PREVIEW_TAIL = 256 * 1024
+PREVIEW_SESSION_TTL = 30.0
+_preview_by_file = {}  # jsonl 경로 → ((mtime_ns, size), preview)
+_preview_by_pid = {}   # pid → (만료 시각, (sid, path))
+
+
+def preview_clean(text, limit=PREVIEW_MAX):
+    """마크다운 기호를 대충 걷고 공백을 한 칸으로 합쳐 limit자 안팎으로 자른다."""
+    t = re.sub(r"```[^\n]*", " ", text)
+    t = re.sub(r"`([^`]*)`", r"\1", t)
+    t = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", t)
+    t = re.sub(r"(?m)^\s{0,3}(#{1,6}|>|[-*+]|\d+[.)])\s+", "", t)
+    t = re.sub(r"(\*\*|__|~~)", "", t)
+    t = re.sub(r"(?m)^\s*([-*_]\s*){3,}$", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    if len(t) > limit:
+        t = t[:limit].rstrip() + "…"
+    return t or None
+
+
+def preview_from_lines(lines):
+    """jsonl 줄들에서 마지막 assistant 텍스트(thinking·tool 제외)."""
+    turns, _ = parse_transcript(lines, 0)
+    for turn in reversed(turns):
+        if turn["role"] != "assistant":
+            continue
+        texts = [p["text"] for p in turn["parts"] if p.get("kind") == "text"]
+        if texts:
+            return preview_clean(texts[-1])
+    return None
+
+
+def preview_for_path(path):
+    try:
+        st = os.stat(path, follow_symlinks=False)
+    except OSError:
+        return None
+    key = (st.st_mtime_ns, st.st_size)
+    hit = _preview_by_file.get(path)
+    if hit and hit[0] == key:
+        return hit[1]
+    try:
+        data = read_regular_file(path, PREVIEW_TAIL, tail=True)
+    except OSError:
+        return None
+    pv = preview_from_lines(data.decode("utf-8", "replace").split("\n"))
+    if len(_preview_by_file) > 200:
+        _preview_by_file.clear()
+    _preview_by_file[path] = (key, pv)
+    return pv
+
+
+def terminal_preview(info, home, runner=None, now=None):
+    """Claude 터미널 한 개의 미리보기. 실패하면 None(목록 전체에 영향 없음)."""
+    try:
+        pid = (info or {}).get("pid")
+        if not isinstance(pid, int):
+            fg = (info or {}).get("foreground")
+            pid = fg.get("pid") if isinstance(fg, dict) else None
+        now = time.monotonic() if now is None else now
+        hit = _preview_by_pid.get(pid) if isinstance(pid, int) else None
+        if hit and hit[0] > now:
+            sid, path = hit[1]
+        else:
+            sid, path = find_transcript(info, home, runner=runner)
+            if isinstance(pid, int):
+                if len(_preview_by_pid) > 200:
+                    _preview_by_pid.clear()
+                _preview_by_pid[pid] = (now + PREVIEW_SESSION_TTL, (sid, path))
+        return preview_for_path(path) if path else None
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------- 폴더
@@ -1488,11 +1619,32 @@ class DeviceStore:
         with self.lock:
             return self._load()
 
-    def add(self, token, env):
+    def add(self, token, env, relay_sig=None):
         with self.lock:
             devs = [d for d in self._load() if d["token"] != token]
-            devs.append({"token": token, "env": env, "added": int(time.time())})
+            dev = {"token": token, "env": env, "added": int(time.time())}
+            if relay_sig:
+                dev["relay_sig"] = relay_sig
+            devs.append(dev)
             write_private(self.path, devs)
+
+    def mark_relay_sig_bad(self, token, sig):
+        """중계가 서명을 거절했다: 서명을 지우고 relay_sig_bad를 남긴다(기기는 유지).
+        그 사이 새 서명으로 다시 등록됐으면(sig가 다르면) 건드리지 않는다."""
+        with self.lock:
+            devs = self._load()
+            for d in devs:
+                if d["token"] == token and d.get("relay_sig") == sig:
+                    d.pop("relay_sig", None)
+                    d["relay_sig_bad"] = True
+                    write_private(self.path, devs)
+                    return True
+            return False
+
+    def relay_resign(self):
+        """다시 등록이 필요한 기기들의 sha256(소문자 토큰) hex 앞 16자."""
+        return [hashlib.sha256(d["token"].lower().encode("ascii")).hexdigest()[:16]
+                for d in self.list() if d.get("relay_sig_bad")]
 
     def remove(self, token):
         with self.lock:
@@ -1504,15 +1656,117 @@ class DeviceStore:
             return False
 
 
+def device_id(token):
+    """기기 ID: sha256(소문자 토큰) hex 앞 16자. 앱과 relay_resign이 같은 값을 쓴다."""
+    return hashlib.sha256(token.lower().encode("ascii")).hexdigest()[:16]
+
+
+def _ms_or_none(v):
+    return v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else None
+
+
+class PushLog:
+    """발송 결과 기록(시각은 epoch ms). 토큰은 남기지 않고 기기 ID만 쓴다.
+    path가 있으면 발송마다 0600 파일로 저장해 재시작해도 남긴다. 저장 실패는 경고만 하고 발송을 막지 않는다."""
+
+    def __init__(self, path=None, wall=time.time):
+        self.path = path
+        self.wall = wall
+        self.lock = threading.Lock()
+        self.data = self._load()
+
+    @staticmethod
+    def _empty():
+        return {"last_success_at": None, "last_error_at": None, "relay_limited_at": None, "devices": {}}
+
+    def _load(self):
+        d = self._empty()
+        if not self.path:
+            return d
+        try:
+            with open(self.path) as f:
+                raw = json.load(f)
+        except FileNotFoundError:
+            return d
+        except (OSError, ValueError):
+            log.warning("%s 읽기 실패, 새로 시작한다", PUSH_STATUS_FILE)
+            return d
+        if not isinstance(raw, dict):
+            return d
+        for k in ("last_success_at", "last_error_at", "relay_limited_at"):
+            d[k] = _ms_or_none(raw.get(k))
+        devs = raw.get("devices")
+        if isinstance(devs, dict):
+            for did, e in devs.items():
+                if not (isinstance(did, str) and DEVICE_ID_RE.match(did) and isinstance(e, dict)):
+                    continue
+                err = e.get("last_error")
+                if isinstance(err, dict) and _ms_or_none(err.get("at")) is not None:
+                    code = err.get("code")
+                    err = {"at": err["at"], "code": code if isinstance(code, int) and not isinstance(code, bool) else 0,
+                           "reason": str(err.get("reason") or "")[:100]}
+                else:
+                    err = None
+                d["devices"][did] = {"last_success_at": _ms_or_none(e.get("last_success_at")),
+                                     "last_attempt_at": _ms_or_none(e.get("last_attempt_at")), "last_error": err}
+        return d
+
+    def now_ms(self):
+        return int(self.wall() * 1000)
+
+    def _save(self):  # self.lock 안에서
+        if not self.path:
+            return
+        try:
+            write_private(self.path, self.data)
+        except OSError as e:
+            log.warning("%s 저장 실패: %s", PUSH_STATUS_FILE, e.strerror or type(e).__name__)
+
+    def record(self, token, code, reason=""):
+        """한 기기 발송 결과. code 200이면 성공, 아니면 last_error를 바꾼다(성공해도 last_error는 남긴다)."""
+        now = self.now_ms()
+        did = device_id(token)
+        with self.lock:
+            devs = self.data["devices"]
+            e = devs.setdefault(did, {"last_success_at": None, "last_attempt_at": None, "last_error": None})
+            e["last_attempt_at"] = now
+            if code == 200:
+                e["last_success_at"] = now
+                self.data["last_success_at"] = now
+            else:
+                e["last_error"] = {"at": now, "code": code if isinstance(code, int) else 0,
+                                   "reason": str(reason or "")[:100]}
+                self.data["last_error_at"] = now
+            if len(devs) > PUSH_LOG_MAX_DEVICES:
+                for old in sorted(devs, key=lambda k: devs[k]["last_attempt_at"] or 0)[:len(devs) - PUSH_LOG_MAX_DEVICES]:
+                    del devs[old]
+            self._save()
+
+    def relay_limited(self):
+        with self.lock:
+            self.data["relay_limited_at"] = self.now_ms()
+            self._save()
+
+    def device(self, did):
+        with self.lock:
+            e = self.data["devices"].get(did)
+            return json.loads(json.dumps(e)) if e else None
+
+    def summary(self):
+        with self.lock:
+            return {k: self.data[k] for k in ("last_success_at", "last_error_at", "relay_limited_at")}
+
+
 class ApnsPusher:
 
-    def __init__(self, cfg, devices, runner=None, curl="/usr/bin/curl", openssl=None, clock=time.time):
+    def __init__(self, cfg, devices, runner=None, curl="/usr/bin/curl", openssl=None, clock=time.time, push_log=None):
         self.cfg = cfg
         self.devices = devices
         self.runner = runner or subprocess.run
         self.curl = curl
         self.openssl = openssl
         self.clock = clock
+        self.push_log = push_log if push_log is not None else PushLog()
         self._jwt = None
         self._jwt_at = 0
         self._lock = threading.Lock()
@@ -1572,20 +1826,153 @@ class ApnsPusher:
             return 0
         sent = 0
         for d in self.devices.list():
-            try:
-                code, reason = self.send_one(d, payload)
-            except Exception as e:  # noqa: BLE001 - 한 기기 실패가 다른 기기를 막지 않게
-                log.warning("푸시 실패 %s: %s", short_token(d.get("token")), type(e).__name__)
-                continue
+            code, _ = self._deliver(d, payload)
             if code == 200:
                 sent += 1
-                log.info("푸시 %s → %s 200", payload.get("terminal"), short_token(d["token"]))
-            elif code == 410 or reason in ("BadDeviceToken", "Unregistered"):
-                self.devices.remove(d["token"])
-                log.info("푸시 %s: %d %s, 기기 삭제", short_token(d["token"]), code, reason)
-            else:
-                log.warning("푸시 %s: %d %s", short_token(d["token"]), code, reason)
         return sent
+
+    def push_device(self, device, payload):
+        """기기 하나에만 보낸다(시험 알림). 반환: (http_code, reason). 예외는 (0, 예외 이름)."""
+        return self._deliver(device, payload)
+
+    def _deliver(self, d, payload):
+        """한 기기 발송 + 결과 처리(기기 삭제·서명 표시) + PushLog 기록. 반환: (http_code, reason)."""
+        try:
+            code, reason = self.send_one(d, payload)
+        except Exception as e:  # noqa: BLE001 - 한 기기 실패가 다른 기기를 막지 않게
+            log.warning("푸시 실패 %s: %s", short_token(d.get("token")), type(e).__name__)
+            self._record(d, 0, type(e).__name__)
+            return 0, type(e).__name__
+        self._record(d, code, reason)
+        if code == 200:
+            log.info("푸시 %s → %s 200", payload.get("terminal"), short_token(d["token"]))
+        elif code == 410 or reason in ("BadDeviceToken", "Unregistered"):
+            self.devices.remove(d["token"])
+            log.info("푸시 %s: %d %s, 기기 삭제", short_token(d["token"]), code, reason)
+        elif reason == "no_relay_sig":
+            pass  # send_one이 기기마다 한 번 경고했다
+        elif reason == "relay:bad_sig":
+            self.devices.mark_relay_sig_bad(d["token"], d.get("relay_sig"))
+            log.warning("푸시 %s: 중계가 서명을 거절, 서명을 지웠다(앱에서 다시 등록 필요)", short_token(d["token"]))
+        else:
+            log.warning("푸시 %s: %d %s", short_token(d["token"]), code, reason)
+        return code, reason
+
+    def _record(self, d, code, reason):
+        try:
+            self.push_log.record(d["token"], code, reason)
+        except Exception:  # noqa: BLE001 - 기록 실패가 발송을 막지 않게
+            log.exception("발송 기록 오류")
+
+
+class RelayPusher(ApnsPusher):
+    """키 없이 Sheltie 푸시 중계(POST <push_relay_url>/v1/push)로 보낸다. 연결은 keep-alive로 재사용한다."""
+
+    def __init__(self, cfg, devices, timeout=RELAY_TIMEOUT, clock=time.monotonic, sleep=time.sleep, push_log=None):
+        super().__init__(cfg, devices, clock=clock, push_log=push_log)
+        self.sleep = sleep
+        u = urllib.parse.urlsplit(cfg["push_relay_url"])
+        self._https = u.scheme == "https"
+        self._host = u.hostname
+        self._port = u.port
+        self._path = u.path.rstrip("/") + "/v1/push"
+        self._timeout = timeout
+        self._conn = None
+        self._conn_used = 0.0
+        self._conn_lock = threading.Lock()
+        self._no_sig_warned = set()
+        self._push_ctx = threading.local()
+
+    def available(self):
+        return bool(self.cfg.get("push_relay_url"))
+
+    def _new_conn(self):
+        cls = http.client.HTTPSConnection if self._https else http.client.HTTPConnection
+        return cls(self._host, self._port, timeout=self._timeout)
+
+    def _drop_conn(self):
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except OSError:
+                pass
+            self._conn = None
+
+    def _post(self, body):
+        """반환: (status, 본문 bytes). 연결 오류·끊긴 연결이면 새 연결로 한 번만 다시 보낸다.
+        시간 초과는 중계가 이미 받았을 수 있어(중복 알림) 다시 보내지 않는다."""
+        headers = {"Content-Type": "application/json", "Content-Length": str(len(body))}
+        with self._conn_lock:
+            if self._conn is not None and self.clock() - self._conn_used > RELAY_IDLE_MAX:
+                self._drop_conn()
+            for attempt in (0, 1):
+                if self._conn is None:
+                    self._conn = self._new_conn()
+                try:
+                    self._conn.request("POST", self._path, body=body, headers=headers)
+                    resp = self._conn.getresponse()
+                    data = resp.read()
+                    self._conn_used = self.clock()
+                    if resp.will_close:
+                        self._drop_conn()
+                    return resp.status, data
+                except socket.timeout:
+                    self._drop_conn()
+                    raise
+                except (http.client.HTTPException, OSError):
+                    self._drop_conn()
+                    if attempt:
+                        raise
+
+    def push(self, payload):
+        # 알림 하나에 collapse_id 하나: 중계가 apns-collapse-id로 넘겨 재시도 중복을 하나로 합친다.
+        self._push_ctx.collapse_id = uuid.uuid4().hex
+        try:
+            return super().push(payload)
+        finally:
+            self._push_ctx.collapse_id = None
+
+    def push_device(self, device, payload):
+        self._push_ctx.collapse_id = uuid.uuid4().hex
+        try:
+            return super().push_device(device, payload)
+        finally:
+            self._push_ctx.collapse_id = None
+
+    def send_one(self, device, payload):
+        """반환: (http_code, reason). 중계 자신의 거절은 reason "relay:<error>"."""
+        tok = device["token"]
+        sig = device.get("relay_sig")
+        if not sig:
+            if tok not in self._no_sig_warned:
+                self._no_sig_warned.add(tok)
+                log.warning("푸시 %s: relay_sig가 없어 건너뛴다(앱에서 다시 등록 필요)", short_token(tok))
+            return 0, "no_relay_sig"
+        env = device.get("env") if device.get("env") in ("sandbox", "production") else "sandbox"
+        cid = getattr(self._push_ctx, "collapse_id", None) or uuid.uuid4().hex
+        body = json.dumps({"device_token": tok, "env": env, "relay_sig": sig, "collapse_id": cid, "payload": payload},
+                          ensure_ascii=True, separators=(",", ":")).encode("ascii")
+        status, data = self._post(body)
+        if 500 <= status < 600:
+            # 중계·APNs 쪽 일시 오류: 같은 collapse_id로 한 번만 다시(중계가 apns-collapse-id로 중복을 합친다).
+            log.info("푸시 %s: 중계 %d, %g초 뒤 한 번 다시 보낸다", short_token(tok), status, RELAY_RETRY_WAIT)
+            self.sleep(RELAY_RETRY_WAIT)
+            status, data = self._post(body)
+        if status == 429:
+            self.push_log.relay_limited()  # 다시 보내지 않는다(한도에 더 부딪힌다)
+        reason = ""
+        try:
+            obj = json.loads(data.decode("utf-8")) if data else {}
+        except (ValueError, UnicodeDecodeError):
+            obj = None
+        if isinstance(obj, dict):
+            if isinstance(obj.get("error"), str):
+                reason = "relay:" + obj["error"][:50]
+            elif isinstance(obj.get("reason"), str):
+                reason = obj["reason"][:100]
+        elif status != 200:
+            reason = "relay:bad_response"
+        return status, reason
 
 
 # ---------------------------------------------------------------- 전이 판정
@@ -1598,9 +1985,10 @@ class Tracker:
     - done은 hc의 turn 번호당 한 번만 알린다(이벤트의 done과 폴링의 done이 겹쳐도 1건).
     """
 
-    def __init__(self, notify, prompt_for=None):
+    def __init__(self, notify, prompt_for=None, reminders=None):
         self.notify = notify
         self.prompt_for = prompt_for
+        self.reminders = reminders
         self.lock = threading.Lock()
         self.last = {}
         self.done_turn = {}
@@ -1615,6 +2003,9 @@ class Tracker:
             self.last[tid] = key
             if prev == key:
                 return None
+            if self.reminders is not None:
+                # 막힘이 풀렸거나 바뀌었다: 이전 막힘의 재알림 취소(새 막힘이면 아래에서 다시 잡는다)
+                self.reminders.cancel(tid)
             if state == "blocked":
                 pass
             elif state == "done":
@@ -1630,6 +2021,8 @@ class Tracker:
         if state == "blocked" and self.prompt_for:
             prompt = self.prompt_for(tid)
         payload = build_payload(tid, name, state, status, prompt=prompt)
+        if state == "blocked" and self.reminders is not None:
+            self.reminders.start(tid, key, name)  # 첫 알림 발송 성공 여부와 상관없이 일정을 잡는다
         self.notify(payload)
         return payload
 
@@ -1651,6 +2044,8 @@ class Tracker:
         with self.lock:
             self.last.pop(tid, None)
             self.done_turn.pop(tid, None)
+        if self.reminders is not None:
+            self.reminders.cancel(tid)
 
     def known(self):
         with self.lock:
@@ -1661,22 +2056,216 @@ class Tracker:
             return set(self.claude_seen)
 
 
+# ---------------------------------------------------------------- 미답 재알림
+
+def reminder_intervals(cfg):
+    """config reminder_after_sec: 양수 초 목록(빈 목록이면 재알림 끔). 형식이 틀리면 기본값."""
+    v = cfg.get("reminder_after_sec", list(REMINDER_AFTER_SEC))
+    if isinstance(v, list) and all(isinstance(x, (int, float)) and not isinstance(x, bool) and x > 0 for x in v):
+        return sorted(v)
+    log.warning("reminder_after_sec 형식이 틀려 기본값 %s를 쓴다", list(REMINDER_AFTER_SEC))
+    return list(REMINDER_AFTER_SEC)
+
+
+class Reminders:
+    """같은 막힘(터미널, (state, msg))이 계속되면 첫 알림 뒤 intervals초마다 한 번씩 다시 알릴 일정.
+    막힘이 풀리거나 바뀌거나 터미널이 사라지면(Tracker가 cancel) 지운다. 확인은 poll_loop 주기에서 due()로."""
+
+    def __init__(self, intervals, clock=time.monotonic):
+        self.intervals = list(intervals)
+        self.clock = clock
+        self.lock = threading.Lock()
+        self.items = {}
+
+    def start(self, tid, key, name):
+        if not self.intervals:
+            return
+        with self.lock:
+            self.items[tid] = {"key": key, "name": name, "t0": self.clock(), "sent": 0}
+
+    def cancel(self, tid):
+        with self.lock:
+            self.items.pop(tid, None)
+
+    def due(self):
+        """지금 보낼 재알림 [(tid, key, n, name)]. n은 1부터. 여러 시점을 한꺼번에 넘겼으면 마지막 것 하나만."""
+        now = self.clock()
+        out = []
+        with self.lock:
+            for tid, it in list(self.items.items()):
+                passed = sum(1 for s in self.intervals if now - it["t0"] >= s)
+                if passed > it["sent"]:
+                    it["sent"] = passed
+                    out.append((tid, it["key"], passed, it["name"]))
+                if it["sent"] >= len(self.intervals):
+                    del self.items[tid]
+        return out
+
+
+# ---------------------------------------------------------------- 막힘 시작 시각
+
+class BlockedSince:
+    """터미널별로 blocked가 시작된 시각(epoch ms)을 기억한다. hc의 status_ms는 의미가 확인되지 않아 쓰지 않는다.
+
+    blocked가 아닌 관측이 한 번이라도 있으면 지우고, 사라진 터미널도 지운다.
+    서버를 다시 켠 시점에 이미 막혀 있던 터미널은 그때부터 센다.
+    """
+
+    def __init__(self, wall=time.time):
+        self.wall = wall
+        self.lock = threading.Lock()
+        self.since = {}
+
+    def update(self, observed):
+        """observed: {tid: blocked 여부}. {tid: blocked_since(ms)|None}를 돌려준다."""
+        now_ms = int(self.wall() * 1000)
+        out = {}
+        with self.lock:
+            for tid in list(self.since):
+                if tid not in observed:
+                    del self.since[tid]
+            for tid, blocked in observed.items():
+                if blocked:
+                    out[tid] = self.since.setdefault(tid, now_ms)
+                else:
+                    self.since.pop(tid, None)
+                    out[tid] = None
+        return out
+
+
+# ---------------------------------------------------------------- 여러 PC(앱 목록·알림 구분)
+
+def server_tag(token):
+    """알림에 넣는 PC 표시. 앱은 저장한 토큰으로 같은 값을 계산해 알림을 보낸 PC를 고른다.
+    sha256("sheltie-server:" + 토큰) hex 앞 12자(토큰 자체는 드러나지 않는다)."""
+    return hashlib.sha256(("sheltie-server:" + (token or "")).encode()).hexdigest()[:12]
+
+
+def machine_name():
+    """/api/health가 주는 PC 이름(앱이 처음 추가할 때 기본 이름). 호스트 이름에서 .local을 뗀다."""
+    try:
+        name = socket.gethostname() or ""
+    except OSError:
+        return None
+    if name.lower().endswith(".local"):
+        name = name[:-6]
+    return name or None
+
+
+def git_branch(cwd, max_up=40):
+    """cwd가 속한 git 저장소의 현재 브랜치. 저장소가 아니면 None, 브랜치가 없으면(detached) 커밋 앞 7자.
+    git을 부르지 않고 .git/HEAD를 직접 읽는다(worktree의 `gitdir:` 파일도 따라간다).
+    일반 파일만 읽고(FIFO 등에서 멈추지 않게), 결과는 브랜치 이름 형식이나 커밋 hex일 때만 돌려준다
+    (심볼릭 링크가 저장소 밖 파일을 가리켜도 그 내용이 나가지 않게)."""
+    if not isinstance(cwd, str) or not cwd.startswith("/"):
+        return None
+
+    def read_regular(path):
+        # O_NONBLOCK: FIFO를 열 때 막히지 않는다. 연 뒤 fstat으로 일반 파일인지 본다(확인과 열기 사이 바꿔치기 방지).
+        if not os.path.isfile(path):
+            return None
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return None
+            return os.read(fd, 4096).decode("utf-8", "replace")
+        finally:
+            os.close(fd)
+
+    def safe_branch(name):
+        if re.fullmatch(r"[A-Za-z0-9._/-]{1,100}", name) and ".." not in name:
+            return name
+        return None
+    d = os.path.normpath(cwd)
+    for _ in range(max_up):
+        dot = os.path.join(d, ".git")
+        head = None
+        try:
+            if os.path.isdir(dot):
+                head = os.path.join(dot, "HEAD")
+            elif os.path.isfile(dot):
+                line = (read_regular(dot) or "").strip()
+                if line.startswith("gitdir:"):
+                    gd = line[len("gitdir:"):].strip()
+                    if not os.path.isabs(gd):
+                        gd = os.path.normpath(os.path.join(d, gd))
+                    head = os.path.join(gd, "HEAD")
+            if head:
+                ref = read_regular(head)
+                if ref is None:
+                    return None
+                ref = ref.strip()
+                if ref.startswith("ref:"):
+                    ref = ref[4:].strip()
+                    return safe_branch(ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else ref)
+                if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", ref):
+                    return ref[:7]
+                return None
+        except OSError:
+            return None
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+    return None
+
+
+class BranchCache:
+    """cwd별 브랜치를 잠깐 기억한다(목록은 5초마다 불린다)."""
+
+    def __init__(self, ttl=10.0, clock=time.monotonic, reader=git_branch):
+        self.ttl = ttl
+        self.clock = clock
+        self.reader = reader
+        self.lock = threading.Lock()
+        self.cache = {}
+
+    def get(self, cwd):
+        if not isinstance(cwd, str) or not cwd:
+            return None
+        now = self.clock()
+        with self.lock:
+            hit = self.cache.get(cwd)
+            if hit and now - hit[0] < self.ttl:
+                return hit[1]
+        try:
+            b = self.reader(cwd)
+        except Exception:  # noqa: BLE001 - 브랜치 실패가 목록을 막지 않게
+            b = None
+        with self.lock:
+            self.cache[cwd] = (now, b)
+            if len(self.cache) > 512:
+                self.cache.clear()
+        return b
+
+
 # ---------------------------------------------------------------- 앱
 
 PUSH_PROMPT_BUDGET = 0.3   # 푸시용 카드 읽기 상한(초). 넘으면 prompt_id 없이 보낸다(알림 속도 우선).
 
 
 class App:
-    def __init__(self, cfg, hc, devices, pusher, runner=None, clock=time.monotonic):
+    def __init__(self, cfg, hc, devices, pusher, runner=None, clock=time.monotonic, push_log=None):
         self.cfg = cfg
         self.hc = hc
         self.devices = devices
         self.pusher = pusher
         self.runner = runner or subprocess.run
         self.clock = clock
+        if push_log is None:
+            push_log = getattr(pusher, "push_log", None)
+        if push_log is None:
+            push_log = PushLog(os.path.join(cfg["_dir"], PUSH_STATUS_FILE) if cfg.get("_dir") else None)
+        self.push_log = push_log
+        self._test_push_at = {}
+        self._test_push_lock = threading.Lock()
         self.home = os.path.realpath(os.path.expanduser(cfg.get("home") or "~"))
         self.plan_reader = make_plan_reader(self.home)
-        self.tracker = Tracker(self._notify, prompt_for=self._prompt_for_push)
+        self.reminders = Reminders(reminder_intervals(cfg))
+        self.tracker = Tracker(self._notify, prompt_for=self._prompt_for_push, reminders=self.reminders)
+        self.blocked_since = BlockedSince()
+        self.branches = BranchCache()
+        self.agent_catalog = AgentCatalog(self.home)
         self._refresh_lock = threading.Lock()
         self._term_locks = {}
         self._term_locks_guard = threading.Lock()
@@ -1685,6 +2274,7 @@ class App:
         self.stop = threading.Event()
 
     def _notify(self, payload):
+        payload["server"] = server_tag(self.cfg.get("token"))
         # refresh 잠금 안에서 불리므로 모았다가 잠금 밖에서 보낸다. 감지 시각을 같이 둔다.
         self._pending.append((payload, self._detected if self._detected is not None else self.clock()))
 
@@ -1776,6 +2366,32 @@ class App:
         for tid in self.tracker.known_claude() - live:
             self.exited(tid)
 
+    def check_reminders(self):
+        """막힘이 계속된 터미널에 재알림. 카드는 그때 화면을 다시 읽어 새로 만든다."""
+        due = self.reminders.due()
+        if not due:
+            return
+        with self._refresh_lock:
+            for tid, key, n, name in due:
+                self._detected = self.clock()
+                try:
+                    info = self.hc.get(tid)
+                except HcError as e:
+                    log.warning("다시 알림 %s: hc get 실패: %s", tid, e)
+                    continue
+                st = status_of(info)
+                if (st.get("state"), st.get("msg")) != key:
+                    continue  # 그 사이 풀렸거나 바뀌었다: 다음 폴링이 판정한다
+                payload = build_payload(tid, info.get("name") or name, "blocked", st,
+                                        prompt=self._prompt_for_push(tid))
+                payload["reminder"] = n
+                alert = payload["aps"]["alert"]
+                alert["subtitle"] = "다시 알림 · " + alert["subtitle"]
+                log.info("다시 알림 %s %d번째", tid, n)
+                self._notify(payload)
+            self._detected = None
+        self._flush()
+
     def handle_event_line(self, line):
         t0 = self.clock()
         try:
@@ -1832,6 +2448,10 @@ class App:
                 self.poll()
             except Exception:  # noqa: BLE001
                 log.exception("폴링 오류")
+            try:
+                self.check_reminders()
+            except Exception:  # noqa: BLE001
+                log.exception("다시 알림 오류")
 
     # --- API
     def term_lock(self, tid):
@@ -1879,7 +2499,7 @@ class App:
                 continue
             item = {"id": tid, "name": t.get("name"), "cwd": t.get("cwd"), "agent": t.get("agent"),
                     "state": t.get("state"), "status": None, "status_ms": None, "title": None,
-                    "claude": is_claude(t)}
+                    "claude": is_claude(t), "preview": None, "blocked_since": None}
             try:
                 info = self.hc.get(tid)
             except HcError:
@@ -1892,7 +2512,14 @@ class App:
                 item["status_ms"] = info.get("status_ms")
                 item["title"] = info.get("title")
                 item["claude"] = is_claude(info)
+                if item["claude"]:
+                    item["preview"] = terminal_preview(info, self.home, self.runner)
             out.append(item)
+        since = self.blocked_since.update(
+            {i["id"]: (i["status"] or {}).get("state") == "blocked" for i in out})
+        for i in out:
+            i["blocked_since"] = since.get(i["id"])
+            i["branch"] = self.branches.get(i.get("cwd"))
         return {"terminals": out}
 
     def api_screen(self, tid, lines):
@@ -2085,15 +2712,27 @@ class App:
                 prompt = None
             else:
                 validate_text(prompt)
+        agent = body.get("agent")
+        if agent is None or agent == "claude":
+            agent_id = "claude"
+        else:
+            agent_id = agent
+            argv = self.agent_catalog.launch_argv(agent_id, prompt)  # 400: unknown_agent·not_installed·prompt_unsupported
         try:
-            r = self.hc.run_claude(p, prompt)
+            if agent_id == "claude":
+                r = self.hc.run_claude(p, prompt)
+            else:
+                r = self.hc.run_agent(p, argv)
         except HcError as e:
             raise ApiError(502, "hc_failed", detail=str(e)[:200])
         addr = (r or {}).get("address")
         if not isinstance(addr, str) or not ID_RE.match(addr):
             raise ApiError(502, "hc_failed")
-        log.info("새 에이전트 %s", addr)
+        log.info("새 에이전트 %s (%s)", addr, agent_id)
         return {"id": addr}
+
+    def api_agent_catalog(self):
+        return {"agents": self.agent_catalog.entries()}
 
     def api_keys(self, tid, body):
         keys = validate_keys(body.get("keys"))
@@ -2127,8 +2766,11 @@ class App:
             raise ApiError(400, "bad_token")
         if env not in ("sandbox", "production"):
             raise ApiError(400, "bad_env")
-        self.devices.add(tok.lower(), env)
-        log.info("기기 등록 %s %s", short_token(tok), env)
+        sig = body.get("relay_sig")
+        if sig is not None and (not isinstance(sig, str) or not RELAY_SIG_RE.match(sig)):
+            raise ApiError(400, "bad_relay_sig")
+        self.devices.add(tok.lower(), env, relay_sig=sig)
+        log.info("기기 등록 %s %s%s", short_token(tok), env, " (중계 서명 있음)" if sig else "")
         return {"ok": True}
 
     def api_delete_device(self, body):
@@ -2137,6 +2779,529 @@ class App:
             raise ApiError(400, "bad_token")
         removed = self.devices.remove(tok.lower())
         return {"ok": True, "removed": removed}
+
+    # --- 알림 상태(무음 실패 방지)
+    def push_mode(self):
+        if self.cfg.get("push_relay_url"):
+            return "relay"
+        if os.path.isfile(self.cfg.get("apns_key_path") or ""):
+            return "apns"
+        return "none"
+
+    def push_health(self, did=None):
+        """/api/health의 push. failing: 등록 기기가 있고 마지막 결과가 실패이며 그 실패가 24시간 안.
+        did(기기 ID)를 주면 그 기기 기록으로만 판정한다(다른 기기의 실패로 경고가 뜨지 않게)."""
+        s = self.push_log.summary()
+        err, ok = s["last_error_at"], s["last_success_at"]
+        if isinstance(did, str) and re.fullmatch(r"[0-9a-f]{16}", did):
+            e = self.push_log.device(did) or {}
+            err = (e.get("last_error") or {}).get("at")
+            ok = e.get("last_success_at")
+        failing = (err is not None and (ok is None or err > ok)
+                   and self.push_log.now_ms() - err <= PUSH_FAILING_WINDOW_MS and bool(self.devices.list()))
+        return {"last_success_at": ok, "relay_limited_at": s["relay_limited_at"], "failing": failing}
+
+    @staticmethod
+    def _device_id_arg(did):
+        if not isinstance(did, str) or not DEVICE_ID_RE.match(did.lower()):
+            raise ApiError(400, "bad_device")
+        return did.lower()
+
+    def api_push_status(self, did=None):
+        devs = self.devices.list()
+        s = self.push_log.summary()
+        res = {"mode": self.push_mode(), "devices": len(devs), "last_success_at": s["last_success_at"],
+               "relay_limited_at": s["relay_limited_at"], "reminder_after_sec": list(self.reminders.intervals),
+               "device": None}
+        if did is not None:
+            did = self._device_id_arg(did)
+            e = self.push_log.device(did) or {}
+            res["device"] = {"id": did, "registered": any(device_id(d["token"]) == did for d in devs),
+                             "last_success_at": e.get("last_success_at"), "last_attempt_at": e.get("last_attempt_at"),
+                             "last_error": e.get("last_error")}
+        return res
+
+    def test_payload(self):
+        return {
+            "aps": {
+                "alert": {"title": "Sheltie", "subtitle": "시험 알림", "body": "알림이 제대로 와요"},
+                "sound": "default",
+                "category": "HR_TEST",
+                "thread-id": "sheltie-test",
+            },
+            "terminal": None,
+            "state": "test",
+            "category": "HR_TEST",
+            "server": server_tag(self.cfg.get("token")),
+        }
+
+    def api_push_test(self, body):
+        """기기 하나에 시험 알림을 동기로 보낸다. 결과는 PushLog에도 남는다."""
+        did = self._device_id_arg(body.get("device"))
+        if self.push_mode() == "none":
+            raise ApiError(409, "push_unavailable")
+        dev = next((d for d in self.devices.list() if device_id(d["token"]) == did), None)
+        if dev is None:
+            raise ApiError(404, "device_not_registered")
+        now = self.clock()
+        with self._test_push_lock:
+            last = self._test_push_at.get(did)
+            if last is not None and now - last < PUSH_TEST_MIN_GAP:
+                raise ApiError(429, "too_soon")
+            self._test_push_at[did] = now
+        t0 = self.clock()
+        code, reason = self.pusher.push_device(dev, self.test_payload())
+        elapsed = int((self.clock() - t0) * 1000)
+        log.info("시험 알림 %s: %d %s %dms", did, code, reason, elapsed)
+        return {"ok": code == 200, "code": code, "reason": reason, "elapsed_ms": elapsed}
+
+
+# ---------------------------------------------------------------- 에이전트 목록 (새 작업에서 고르기)
+# 새 작업에 쓸 수 있는 에이전트는 이 허용 목록(AGENT_CATALOG)에 있는 것뿐이다. 설치 감지 방식은 Ovis(MIT)
+# server/agent-catalog-detect.ts를 따랐다: PATH에서 실행 파일을 찾고, 없으면 설치 프로그램이 흔히 쓰는 폴더도 본다.
+# 임의 명령 실행 경로는 없다: 요청의 id는 허용 목록 키로만 쓰고, 실행 프로그램 이름은 상수에서 온다.
+# prompt: 첫 지시를 `-- <지시>`로 넘기는 방식이 실제 --help로 확인된 것만 True(codex, gemini, grok).
+# 확인 못 한 에이전트는 지시 없이 시작만 허용한다(지시를 보내면 400 prompt_unsupported).
+
+AGENT_CATALOG = (
+    # (id, 표시 이름, 실행 파일, 첫 지시 전달)
+    ("claude", "Claude Code", "claude", True),
+    ("codex", "Codex", "codex", True),
+    ("gemini", "Gemini CLI", "gemini", True),
+    ("grok", "Grok Build", "grok", True),
+    ("cursor", "Cursor Agent", "cursor-agent", False),
+    ("opencode", "OpenCode", "opencode", False),
+    ("copilot", "GitHub Copilot", "copilot", False),
+    ("amp", "Amp", "amp", False),
+    ("qwen", "Qwen Code", "qwen", False),
+)
+AGENT_BY_ID = {a[0]: a for a in AGENT_CATALOG}
+AGENT_EXTRA_DIRS = ("~/.local/bin", "/opt/homebrew/bin", "/usr/local/bin", "~/.bun/bin", "~/.npm-global/bin",
+                    "~/.volta/bin", "~/.cargo/bin", "~/.opencode/bin", "~/.grok/bin", "~/.cursor/bin")
+AGENT_CATALOG_TTL = 30.0
+
+
+def find_executable(name, dirs):
+    for d in dirs:
+        if not d or not os.path.isabs(d):  # 상대 경로·빈 항목은 서버 작업 폴더의 파일을 실행하게 되므로 제외
+            continue
+        p = os.path.join(d, name)
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return None
+
+
+def agent_search_dirs(home, path_env=None, extra=AGENT_EXTRA_DIRS):
+    path_env = os.environ.get("PATH", "") if path_env is None else path_env
+    dirs = [d for d in path_env.split(os.pathsep) if d]
+    for d in extra:
+        d = os.path.join(home, d[2:]) if d.startswith("~/") else d
+        if d not in dirs:
+            dirs.append(d)
+    return dirs
+
+
+def agent_argv(agent_id, prompt=None):
+    """hc run 뒤에 붙일 argv. 프로그램 이름은 허용 목록 상수, 지시는 `--` 뒤라 옵션으로 읽히지 않는다."""
+    _id, _name, binary, takes_prompt = AGENT_BY_ID[agent_id]
+    argv = [binary]
+    if prompt:
+        if not takes_prompt:
+            raise ApiError(400, "prompt_unsupported")
+        argv += ["--", prompt]
+    return argv
+
+
+class AgentCatalog:
+    def __init__(self, home, path_env=None, clock=time.monotonic, ttl=AGENT_CATALOG_TTL, extra_dirs=AGENT_EXTRA_DIRS):
+        self.home = home
+        self.extra_dirs = extra_dirs
+        self.path_env = path_env
+        self.clock = clock
+        self.ttl = ttl
+        self._cache = None
+        self._at = 0.0
+        self._lock = threading.Lock()
+
+    def installed(self):
+        with self._lock:
+            now = self.clock()
+            if self._cache is None or now - self._at >= self.ttl:
+                dirs = agent_search_dirs(self.home, self.path_env, self.extra_dirs)
+                self._cache = {a[0]: find_executable(a[2], dirs) is not None for a in AGENT_CATALOG}
+                self._at = now
+            return dict(self._cache)
+
+    def entries(self):
+        inst = self.installed()
+        return [{"id": a[0], "name": a[1], "installed": inst[a[0]], "prompt": a[3]} for a in AGENT_CATALOG]
+
+    def launch_argv(self, agent_id, prompt=None):
+        if not isinstance(agent_id, str) or agent_id not in AGENT_BY_ID:
+            raise ApiError(400, "unknown_agent")
+        if not self.installed()[agent_id]:
+            raise ApiError(400, "not_installed")
+        return agent_argv(agent_id, prompt)
+
+
+# ---------------------------------------------------------------- 사용량 (Usage)
+# 한도(Claude OAuth usage API)와 토큰·비용(~/.claude/projects/**/*.jsonl 집계).
+# 한도 쪽 로직은 Ovis(MIT) server/usage.ts의 Claude 부분을 옮겼다. 토큰은 로그·응답에 넣지 않는다.
+
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+USAGE_USER_AGENT = "sheltie"
+USAGE_FRESH = 300.0         # 성공한 결과를 다시 쓰는 시간(초)
+USAGE_MIN_REFRESH = 30.0    # refresh=1이어도 이 안에서는 다시 묻지 않는다
+USAGE_RETRY = 60.0          # 실패한 뒤 다시 묻기까지
+USAGE_CMD_TIMEOUT = 5.0
+USAGE_MAX_READ = 1024 * 1024
+USAGE_RANGES = {"today": 1, "7d": 7, "30d": 30}
+
+# 가격 USD/MTok: (입력, 출력, 캐시 읽기, 캐시 쓰기(5분) = 입력의 1.25배). Anthropic 공식 API 가격
+# (claude-api 스킬 모델 표, 2026-11-03 기준). 모르는 모델은 비용 0.
+USAGE_PRICES = {
+    "fable_52": (8.0, 40.0, 0.20, 10.0),     # Fable/Mythos 5.2 이상
+    "fable_5": (10.0, 50.0, 1.0, 12.5),      # Fable/Mythos 5, 5.1
+    "opus_55": (4.0, 20.0, 0.20, 5.0),       # Opus 5.5 이상
+    "opus_new": (5.0, 25.0, 0.50, 6.25),     # Opus 4.5 ~ 5
+    "opus_old": (15.0, 75.0, 1.50, 18.75),   # Opus 3, 4, 4.1
+    "sonnet_55": (2.0, 10.0, 0.10, 2.5),     # Sonnet 5.5 이상
+    "sonnet_5": (2.0, 10.0, 0.20, 2.5),      # Sonnet 5
+    "sonnet": (3.0, 15.0, 0.30, 3.75),       # Sonnet 3.x ~ 4.6
+    "haiku_55": (0.10, 0.50, 0.01, 0.125),   # Haiku 5.5 이상(10만 토큰 이하 프롬프트 가격)
+    "haiku_45": (1.0, 5.0, 0.10, 1.25),      # Haiku 4.5
+    "haiku_35": (0.80, 4.0, 0.08, 1.0),
+    "haiku_3": (0.25, 1.25, 0.03, 0.30),
+}
+# 계열별 (이 버전 이상이면, 가격 키). 위에서부터 처음 맞는 것.
+_USAGE_TIERS = {
+    "fable": [((5, 2), "fable_52"), ((0, 0), "fable_5")],
+    "mythos": [((5, 2), "fable_52"), ((0, 0), "fable_5")],
+    "opus": [((5, 5), "opus_55"), ((4, 5), "opus_new"), ((0, 0), "opus_old")],
+    "sonnet": [((5, 5), "sonnet_55"), ((5, 0), "sonnet_5"), ((0, 0), "sonnet")],
+    "haiku": [((5, 5), "haiku_55"), ((4, 5), "haiku_45"), ((3, 5), "haiku_35"), ((0, 0), "haiku_3")],
+}
+_USAGE_NEW_RE = re.compile(r"(fable|mythos|opus|sonnet|haiku)-(\d{1,2})(?:-(\d{1,2}))?(?!\d)")
+_USAGE_OLD_RE = re.compile(r"claude-(\d)(?:-(\d))?-(opus|sonnet|haiku)")
+
+
+def usage_price_key(model):
+    m = (model or "").lower()
+    v = _USAGE_NEW_RE.search(m)
+    if v:
+        fam, ver = v.group(1), (int(v.group(2)), int(v.group(3) or 0))
+    else:
+        o = _USAGE_OLD_RE.search(m)
+        if not o:
+            return None
+        fam, ver = o.group(3), (int(o.group(1)), int(o.group(2) or 0))
+    for least, key in _USAGE_TIERS[fam]:
+        if ver >= least:
+            return key
+    return None
+
+
+def usage_cost(model, inp, out, cread, cwrite):
+    key = usage_price_key(model)
+    if key is None:
+        return 0.0
+    pi, po, pr, pw = USAGE_PRICES[key]
+    return (inp * pi + out * po + cread * pr + cwrite * pw) / 1e6
+
+
+def _usage_num(v):
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    return v
+
+
+def _usage_iso(v):
+    n = _usage_num(v)
+    if n is not None and n > 0:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(n / 1000 if n >= 1e12 else n))
+    if isinstance(v, str) and v.strip():
+        ts = _usage_parse_ts(v.strip())
+        if ts is not None:
+            return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+    return None
+
+
+def _usage_parse_ts(s):
+    """ISO 8601 문자열 -> epoch 초. 못 읽으면 None."""
+    import datetime
+    try:
+        t = s[:-1] + "+00:00" if s.endswith("Z") else s
+        d = datetime.datetime.fromisoformat(t)
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=datetime.timezone.utc)
+        return d.timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+# ---- 한도: Claude OAuth
+
+def _usage_sign_in(source):
+    """키체인 값 또는 .credentials.json 본문 -> {token, expires_at(ms), plan} 또는 None."""
+    try:
+        oauth = (json.loads(source) or {}).get("claudeAiOauth") or {}
+    except (ValueError, TypeError, AttributeError):
+        return None
+    if not isinstance(oauth, dict):
+        return None
+    tok = oauth.get("accessToken")
+    if not isinstance(tok, str) or not tok.strip():
+        return None
+    plan = oauth.get("subscriptionType")
+    return {"token": tok.strip(), "expires_at": _usage_num(oauth.get("expiresAt")),
+            "plan": plan.strip() if isinstance(plan, str) and plan.strip() else None}
+
+
+def _usage_keychain_read(service, account=None):
+    """('found', 값) | ('missing', None) | ('locked', None). launchd 로그인 세션 우회는 옮기지 않았다."""
+    argv = ["security", "find-generic-password", "-s", service] + (["-a", account] if account else []) + ["-w"]
+    try:
+        r = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, timeout=USAGE_CMD_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return ("locked", None)  # 접근 허용 창이 떠서 멈춘 경우
+    except (OSError, ValueError):
+        return ("missing", None)
+    if r.returncode == 0:
+        return ("found", r.stdout.decode("utf-8", "replace").strip())
+    if r.returncode == 44:  # errSecItemNotFound
+        return ("missing", None)
+    return ("locked", None)
+
+
+def usage_find_credentials():
+    """(sign_in 또는 None, 에러 코드 또는 None). 키체인과 파일 중 만료가 더 늦은 쪽."""
+    home = os.path.expanduser("~")
+    item, locked = None, False
+    if sys.platform == "darwin":
+        user = os.environ.get("USER")
+        for acct in ([user, None] if user else [None]):
+            st_, val = _usage_keychain_read("Claude Code-credentials", acct)
+            if st_ == "locked":
+                locked = True
+                break
+            if st_ == "found":
+                item = _usage_sign_in(val)
+                if item:
+                    break
+    file_si = None
+    try:
+        with open(os.path.join(home, ".claude", ".credentials.json"), "rb") as f:
+            raw = f.read(USAGE_MAX_READ + 1)
+        if len(raw) <= USAGE_MAX_READ:
+            file_si = _usage_sign_in(raw.decode("utf-8", "replace"))
+    except OSError:
+        pass
+    file_later = bool(file_si and item and file_si["expires_at"] is not None
+                      and item["expires_at"] is not None and file_si["expires_at"] > item["expires_at"])
+    if item and not file_later:
+        return item, None
+    if file_si:
+        return file_si, None
+    return None, ("keychain_locked" if locked else "no_credentials")
+
+
+def _usage_window(value, kind, scope):
+    if not isinstance(value, dict):
+        return None
+    used = _usage_num(value.get("utilization"))
+    if used is None:
+        return None
+    return {"kind": kind, "scope": scope, "used_percent": round(min(100.0, max(0.0, float(used))), 1),
+            "resets_at": _usage_iso(value.get("resets_at"))}
+
+
+def usage_parse_oauth(body):
+    wins = [_usage_window(body.get("five_hour"), "session", None),
+            _usage_window(body.get("seven_day"), "week", None),
+            _usage_window(body.get("seven_day_opus"), "week", "Opus"),
+            _usage_window(body.get("seven_day_sonnet"), "week", "Sonnet")]
+    return [w for w in wins if w]
+
+
+def usage_fetch_oauth(token):
+    """OAuth usage API 호출 -> body(dict). 실패는 ApiError 대신 (None, 에러 코드)."""
+    import urllib.request
+    import urllib.error
+    req = urllib.request.Request(USAGE_URL, headers={
+        "authorization": "Bearer " + token, "accept": "application/json",
+        "anthropic-beta": "oauth-2025-04-20", "user-agent": USAGE_USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            raw = resp.read(USAGE_MAX_READ + 1)
+    except urllib.error.HTTPError as e:
+        e.close()
+        return None, "http_%d" % e.code
+    except (urllib.error.URLError, OSError, ValueError):
+        return None, "network"
+    if len(raw) > USAGE_MAX_READ:
+        return None, "network"
+    try:
+        body = json.loads(raw.decode("utf-8", "replace"))
+    except ValueError:
+        return None, "http_200"
+    return (body, None) if isinstance(body, dict) else (None, "http_200")
+
+
+_usage_limits_cache = {"at": 0.0, "next": 0.0, "value": None}
+_usage_limits_lock = threading.Lock()
+
+
+def usage_limits(refresh=False, now=None):
+    now = time.time() if now is None else now
+    with _usage_limits_lock:
+        c = _usage_limits_cache
+        if c["value"] is not None:
+            if refresh and now - c["at"] >= USAGE_MIN_REFRESH:
+                pass
+            elif now < c["next"]:
+                return c["value"]
+        si, err = usage_find_credentials()
+        result = {"plan": None, "windows": [], "error": None}
+        ok = False
+        if si is None:
+            result["error"] = err
+        else:
+            result["plan"] = si["plan"]
+            if si["expires_at"] is not None and si["expires_at"] <= now * 1000:
+                result["error"] = "expired"
+            else:
+                body, e = usage_fetch_oauth(si["token"])
+                if body is None:
+                    result["error"] = e
+                else:
+                    result["windows"] = usage_parse_oauth(body)
+                    ok = True
+        c["at"], c["value"] = now, result
+        c["next"] = now + (USAGE_FRESH if ok else USAGE_RETRY)
+        return result
+
+
+# ---- 토큰·비용: ~/.claude/projects/**/*.jsonl
+
+_usage_file_cache = {}  # path -> ((mtime_ns, size), [레코드])
+_usage_file_lock = threading.Lock()
+
+
+def _usage_int(v):
+    n = _usage_num(v)
+    return int(n) if n is not None and n > 0 else 0
+
+
+def usage_parse_file(path):
+    """assistant 줄 -> [(dedupe키 또는 None, epoch, model, in, out, cache_read, cache_write)]"""
+    recs = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if '"assistant"' not in line or '"usage"' not in line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(d, dict) or d.get("type") != "assistant":
+                    continue
+                msg = d.get("message")
+                if not isinstance(msg, dict):
+                    continue
+                usage = msg.get("usage")
+                model = msg.get("model")
+                if not isinstance(usage, dict) or not isinstance(model, str) or model.startswith("<"):
+                    continue
+                ts = _usage_parse_ts(d["timestamp"]) if isinstance(d.get("timestamp"), str) else None
+                if ts is None:
+                    continue
+                mid, rid = msg.get("id"), d.get("requestId")
+                key = (mid, rid) if isinstance(mid, str) and isinstance(rid, str) else None
+                recs.append((key, ts, model, _usage_int(usage.get("input_tokens")),
+                             _usage_int(usage.get("output_tokens")),
+                             _usage_int(usage.get("cache_read_input_tokens")),
+                             _usage_int(usage.get("cache_creation_input_tokens"))))
+    except OSError:
+        return None
+    return recs
+
+
+def _usage_files(root):
+    for dp, _dn, fns in os.walk(root):
+        for fn in fns:
+            if fn.endswith(".jsonl"):
+                yield os.path.join(dp, fn)
+
+
+def usage_totals(range_name, now=None):
+    import datetime
+    days = USAGE_RANGES[range_name]
+    now = time.time() if now is None else now
+    today = datetime.datetime.fromtimestamp(now).date()
+    first = today - datetime.timedelta(days=days - 1)
+    start_ts = datetime.datetime.combine(first, datetime.time.min).timestamp()
+    root = os.path.join(os.path.expanduser("~"), ".claude", "projects")
+    seen = set()
+    by_model = {}
+    by_day = {(first + datetime.timedelta(days=i)).isoformat(): [0.0, 0] for i in range(days)}
+    live = set()
+    for path in sorted(_usage_files(root)):
+        try:
+            stt = os.stat(path)
+        except OSError:
+            continue
+        live.add(path)
+        if stt.st_mtime < start_ts:
+            continue
+        sig = (stt.st_mtime_ns, stt.st_size)
+        with _usage_file_lock:
+            hit = _usage_file_cache.get(path)
+        if hit and hit[0] == sig:
+            recs = hit[1]
+        else:
+            recs = usage_parse_file(path)
+            if recs is None:
+                continue
+            with _usage_file_lock:
+                _usage_file_cache[path] = (sig, recs)
+        for key, ts, model, i, o, cr, cw in recs:
+            if ts < start_ts:
+                continue
+            date = datetime.datetime.fromtimestamp(ts).date().isoformat()
+            if date not in by_day:  # 미래 시각 등
+                continue
+            if key is not None:
+                if key in seen:
+                    continue
+                seen.add(key)
+            cost = usage_cost(model, i, o, cr, cw)
+            m = by_model.setdefault(model, [0, 0, 0, 0, 0.0])
+            m[0] += i; m[1] += o; m[2] += cr; m[3] += cw; m[4] += cost
+            by_day[date][0] += cost
+            by_day[date][1] += i + o + cr + cw
+    with _usage_file_lock:  # 지워진 파일 캐시 정리
+        for p in [p for p in _usage_file_cache if p not in live]:
+            del _usage_file_cache[p]
+    models = [{"model": k, "input": v[0], "output": v[1], "cache_read": v[2], "cache_write": v[3],
+               "cost_usd": round(v[4], 6)} for k, v in by_model.items()]
+    models.sort(key=lambda r: (-r["cost_usd"], r["model"]))
+    totals = {"input": sum(r["input"] for r in models), "output": sum(r["output"] for r in models),
+              "cache_read": sum(r["cache_read"] for r in models), "cache_write": sum(r["cache_write"] for r in models),
+              "cost_usd": round(sum(r["cost_usd"] for r in models), 6)}
+    days_out = [{"date": d, "cost_usd": round(v[0], 6), "tokens": v[1]} for d, v in sorted(by_day.items())]
+    return totals, models, days_out
+
+
+def api_usage(query):
+    """GET /api/usage?range=today|7d|30d&refresh=1"""
+    rng = (query.get("range") or ["7d"])[0]
+    if rng not in USAGE_RANGES:
+        raise ApiError(400, "bad_range")
+    refresh = (query.get("refresh") or [""])[0] == "1"
+    totals, models, days = usage_totals(rng)
+    return {"limits": usage_limits(refresh), "range": rng, "totals": totals,
+            "by_model": models, "by_day": days}
 
 
 # ---------------------------------------------------------------- HTTP
@@ -2150,11 +3315,15 @@ ROUTES = [
     ("POST", re.compile(r"^/api/terminals/([^/]+)/prompt/answer$"), "prompt_answer"),
     ("GET", re.compile(r"^/api/terminals/([^/]+)/transcript$"), "transcript"),
     ("GET", re.compile(r"^/api/folders$"), "folders"),
+    ("GET", re.compile(r"^/api/agents/catalog$"), "agent_catalog"),
     ("POST", re.compile(r"^/api/agents$"), "agents"),
     ("POST", re.compile(r"^/api/terminals/([^/]+)/keys$"), "keys"),
     ("POST", re.compile(r"^/api/terminals/([^/]+)/send$"), "send"),
     ("POST", re.compile(r"^/api/devices$"), "add_device"),
     ("DELETE", re.compile(r"^/api/devices$"), "delete_device"),
+    ("GET", re.compile(r"^/api/usage$"), "usage"),
+    ("GET", re.compile(r"^/api/push/status$"), "push_status"),
+    ("POST", re.compile(r"^/api/push/test$"), "push_test"),
 ]
 
 
@@ -2225,7 +3394,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 body = self._body() if method in ("POST", "DELETE") else {}
                 tid = urllib.parse.unquote(mt.group(1)) if mt.groups() else None
                 if name == "health":
-                    res = {"ok": True}
+                    res = {"ok": True, "name": machine_name()}
+                    if app.cfg.get("push_relay_url"):
+                        res["push_relay_url"] = app.cfg["push_relay_url"]
+                        res["relay_resign"] = app.devices.relay_resign()
+                    res["push"] = app.push_health((query.get("device") or [None])[0])
                 elif name == "terminals":
                     res = app.api_terminals()
                 elif name == "screen":
@@ -2240,6 +3413,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     res = app.api_transcript(tid, (query.get("limit") or [None])[0])
                 elif name == "folders":
                     res = app.api_folders((query.get("path") or [""])[0])
+                elif name == "agent_catalog":
+                    res = app.api_agent_catalog()
                 elif name == "agents":
                     res = app.api_agents(body)
                 elif name == "keys":
@@ -2248,6 +3423,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     res = app.api_send(tid, body)
                 elif name == "add_device":
                     res = app.api_add_device(body)
+                elif name == "usage":
+                    res = api_usage(query)
+                elif name == "push_status":
+                    res = app.api_push_status((query.get("device") or [None])[0])
+                elif name == "push_test":
+                    res = app.api_push_test(body)
                 else:
                     res = app.api_delete_device(body)
                 return self._reply(200, res)
@@ -2314,12 +3495,21 @@ def make_server_retry(app, bind, port, sleep=time.sleep, attempts=None):
 
 def build_app(cfg):
     devices = DeviceStore(os.path.join(cfg["_dir"], "devices.json"))
-    pusher = ApnsPusher(cfg, devices)
-    return App(cfg, Hc(cfg["hc_path"]), devices, pusher)
+    push_log = PushLog(os.path.join(cfg["_dir"], PUSH_STATUS_FILE))
+    if cfg.get("push_relay_url"):
+        pusher = RelayPusher(cfg, devices, push_log=push_log)
+    else:
+        pusher = ApnsPusher(cfg, devices, push_log=push_log)
+    return App(cfg, Hc(cfg["hc_path"]), devices, pusher, push_log=push_log)
 
 
 def cmd_serve():
-    cfg = load_config()
+    try:
+        cfg = load_config()
+    except ValueError as e:
+        log.error("설정 오류: %s", e)
+        print("설정 오류: %s" % e, file=sys.stderr)
+        return 2
     if not cfg.get("token") or len(cfg["token"]) < 20:
         log.error("토큰이 없거나 짧다. init을 먼저 돌려라")
         print("토큰이 없거나 짧다. init을 먼저 돌려라", file=sys.stderr)
@@ -2333,7 +3523,7 @@ def cmd_serve():
     app = build_app(cfg)
     app.pusher.available()
     srv = make_server_retry(app, cfg["bind"], cfg["port"])
-    log.info("시작 %s:%d", cfg["bind"], cfg["port"])
+    log.info("시작 %s:%d (푸시: %s)", cfg["bind"], cfg["port"], "중계" if cfg.get("push_relay_url") else "직접")
     app.poll(initial=True)
     threading.Thread(target=app.events_loop, name="events", daemon=True).start()
     threading.Thread(target=app.poll_loop, name="poll", daemon=True).start()
@@ -2345,10 +3535,17 @@ def cmd_serve():
 
 
 def cmd_test_push():
-    cfg = load_config()
+    try:
+        cfg = load_config()
+    except ValueError as e:
+        print("설정 오류: %s" % e, file=sys.stderr)
+        return 2
     app = build_app(cfg)
     if not app.pusher.available():
-        print("APNs 키 파일이 없다: %s" % cfg["apns_key_path"], file=sys.stderr)
+        if cfg.get("push_relay_url"):
+            print("푸시 중계를 쓸 수 없다: %s" % cfg["push_relay_url"], file=sys.stderr)
+        else:
+            print("APNs 키 파일이 없다: %s (또는 설정에 push_relay_url)" % cfg["apns_key_path"], file=sys.stderr)
         return 1
     devs = app.devices.list()
     payload = build_payload("test", "herdr-remote", "done", {"msg": "시험 알림"})

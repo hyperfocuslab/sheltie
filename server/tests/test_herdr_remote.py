@@ -1,4 +1,6 @@
 import base64
+import hashlib
+import http.server
 import io
 import json
 import logging
@@ -487,6 +489,302 @@ class ApnsTests(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ---------------------------------------------------------------- 푸시 중계
+
+SIG = "v1." + "A" * 40 + "-_z"
+
+
+class FakeRelay:
+    """127.0.0.1 임의 포트의 가짜 중계. 요청과 TCP 연결 수를 기록하고, 준비한 응답을 차례로 돌려준다."""
+
+    def __init__(self):
+        self.requests = []
+        self.connections = 0
+        self.responses = []  # (code, body dict, 응답 뒤 연결 끊기)
+        relay = self
+
+        class H(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def setup(self):
+                relay.connections += 1
+                super().setup()
+
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                relay.requests.append((self.path, self.headers.get("Content-Type"), json.loads(raw)))
+                code, body, drop = relay.responses.pop(0) if relay.responses else (200, {"ok": True}, False)
+                data = json.dumps(body).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                if drop:  # Connection: close 없이 끊는다(유휴 연결을 서버가 닫은 것처럼)
+                    self.close_connection = True
+
+        self.srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.srv.daemon_threads = True
+        self.url = "http://127.0.0.1:%d" % self.srv.server_address[1]
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+
+
+class RelayTests(unittest.TestCase):
+    def setUp(self):
+        self.relay = FakeRelay()
+        self.tmp = tempfile.mkdtemp()
+        self.cfg = dict(hr.DEFAULTS, push_relay_url=self.relay.url + "/",
+                        apns_key_path=os.path.join(self.tmp, "missing.p8"), _dir=self.tmp)
+        self.devices = hr.DeviceStore(os.path.join(self.tmp, "devices.json"))
+        self.sleeps = []
+        self.p = hr.RelayPusher(dict(self.cfg), self.devices, sleep=self.sleeps.append)
+
+    def tearDown(self):
+        self.p._drop_conn()
+        self.relay.close()
+
+    def test_request_shape(self):
+        self.devices.add("aa" * 32, "production", relay_sig=SIG)
+        payload = hr.build_payload("t1", "n", "done", {"msg": "끝"})
+        self.assertTrue(self.p.available())
+        self.assertEqual(self.p.push(payload), 1)
+        path, ctype, body = self.relay.requests[0]
+        self.assertEqual(path, "/v1/push")
+        self.assertEqual(ctype, "application/json")
+        self.assertRegex(body.pop("collapse_id"), r"^[0-9a-f]{32}$")
+        self.assertEqual(body, {"device_token": "aa" * 32, "env": "production", "relay_sig": SIG, "payload": payload})
+
+    def test_collapse_id_per_push_and_same_on_retry(self):
+        self.devices.add("aa" * 32, "sandbox", relay_sig=SIG)
+        self.devices.add("bb" * 32, "sandbox", relay_sig=SIG)
+        payload = hr.build_payload("t1", "n", "done", {})
+        self.relay.responses = [(200, {"ok": True}, False), (200, {"ok": True}, True)]
+        self.assertEqual(self.p.push(payload), 2)  # 두 번째 응답 뒤 서버가 연결을 끊는다
+        self.assertEqual(self.p.push(payload), 2)  # 첫 요청은 끊긴 연결 → 재시도
+        ids = [r[2]["collapse_id"] for r in self.relay.requests]
+        self.assertEqual(len(ids), 4)
+        self.assertEqual(ids[0], ids[1])
+        self.assertEqual(ids[2], ids[3])
+        self.assertNotEqual(ids[0], ids[2])
+        # 재시도는 같은 본문(같은 collapse_id)을 다시 보낸다
+        sent = []
+        orig = self.p._new_conn
+
+        def new_conn():
+            c = orig()
+            real = c.request
+
+            def request(method, url, body=None, headers=None):
+                sent.append(json.loads(body)["collapse_id"])
+                if len(sent) == 1:
+                    raise ConnectionResetError("simulated")
+                return real(method, url, body=body, headers=headers)
+            c.request = request
+            return c
+
+        self.p._drop_conn()
+        self.p._new_conn = new_conn
+        self.devices.remove("bb" * 32)
+        self.assertEqual(self.p.push(payload), 1)
+        self.assertEqual(len(sent), 2)
+        self.assertEqual(sent[0], sent[1])
+        self.assertEqual(self.relay.requests[-1][2]["collapse_id"], sent[0])
+
+    def test_idle_connection_replaced(self):
+        now = [1000.0]
+        self.p = hr.RelayPusher(dict(self.cfg), self.devices, clock=lambda: now[0])
+        self.devices.add("aa" * 32, "sandbox", relay_sig=SIG)
+        payload = hr.build_payload("t1", "n", "done", {})
+        self.assertEqual(self.p.push(payload), 1)
+        now[0] += 59
+        self.assertEqual(self.p.push(payload), 1)
+        self.assertEqual(self.relay.connections, 1)
+        now[0] += 60  # 마지막 사용 후 60초 이하 → 재사용
+        self.assertEqual(self.p.push(payload), 1)
+        self.assertEqual(self.relay.connections, 1)
+        now[0] += 61  # 60초 넘게 쉼 → 닫고 새로
+        old = self.p._conn
+        self.assertEqual(self.p.push(payload), 1)
+        self.assertEqual(self.relay.connections, 2)
+        self.assertIsNot(self.p._conn, old)
+
+    def test_bad_sig_clears_sig_and_flags_device(self):
+        self.devices.add("aa" * 32, "sandbox", relay_sig=SIG)
+        self.devices.add("bb" * 32, "sandbox", relay_sig=SIG)
+        self.relay.responses = [(403, {"error": "bad_sig"}, False), (200, {"ok": True}, False)]
+        self.assertEqual(self.p.push(hr.build_payload("t1", "n", "done", {})), 1)
+        a, b = self.devices.list()
+        self.assertNotIn("relay_sig", a)
+        self.assertTrue(a["relay_sig_bad"])
+        self.assertEqual(b["relay_sig"], SIG)
+        self.assertNotIn("relay_sig_bad", b)
+        self.assertEqual(self.devices.relay_resign(),
+                         [hashlib.sha256(("aa" * 32).encode()).hexdigest()[:16]])
+        # 다음 푸시: 서명 없는 기기는 요청 없이 건너뛴다
+        n = len(self.relay.requests)
+        self.assertEqual(self.p.push(hr.build_payload("t1", "n", "done", {})), 1)
+        self.assertEqual([r[2]["device_token"] for r in self.relay.requests[n:]], ["bb" * 32])
+        # 새 서명으로 다시 등록되면 플래그가 사라진다
+        sig2 = "v1." + "B" * 43
+        self.devices.add("aa" * 32, "sandbox", relay_sig=sig2)
+        self.assertEqual(self.devices.relay_resign(), [])
+        # 그 사이 다시 등록돼 서명이 바뀌었으면 거절 표시가 새 서명을 지우지 않는다
+        self.assertFalse(self.devices.mark_relay_sig_bad("aa" * 32, SIG))
+        self.assertEqual(self.devices.list()[1]["relay_sig"], sig2)
+
+    def test_connection_reused_and_retry_after_close(self):
+        self.devices.add("aa" * 32, "sandbox", relay_sig=SIG)
+        payload = hr.build_payload("t1", "n", "done", {})
+        for _ in range(3):
+            self.assertEqual(self.p.push(payload), 1)
+        self.assertEqual(self.relay.connections, 1)
+        self.relay.responses = [(200, {"ok": True}, True)]
+        self.assertEqual(self.p.push(payload), 1)  # 이 응답 뒤 서버가 끊는다
+        self.assertEqual(self.p.push(payload), 1)  # 끊긴 연결 → 새 연결로 재시도
+        self.assertEqual(self.relay.connections, 2)
+        self.assertEqual(len(self.relay.requests), 5)
+
+    def test_connection_refused_raises_inside_push(self):
+        self.relay.close()
+        self.devices.add("aa" * 32, "sandbox", relay_sig=SIG)
+        self.assertEqual(self.p.push(hr.build_payload("t1", "n", "done", {})), 0)
+        self.assertEqual(len(self.devices.list()), 1)
+
+    def test_status_handling(self):
+        cases = [("aa", (410, {"ok": False, "reason": "Unregistered"}, False), False),
+                 ("bb", (400, {"ok": False, "reason": "BadDeviceToken"}, False), False),
+                 ("cc", (403, {"error": "bad_sig"}, False), True),
+                 ("dd", (429, {"error": "rate_limited", "scope": "device"}, False), True),
+                 ("ee", (502, {"error": "upstream_failed"}, False), True),
+                 ("ff", (400, {"error": "bad_request"}, False), True)]
+        for t, _, _ in cases:
+            self.devices.add(t * 32, "sandbox", relay_sig=SIG)
+        # 5xx는 한 번 다시 보낸다(같은 응답을 한 번 더 준비)
+        self.relay.responses = [r for c in cases for r in ([c[1]] * (2 if c[1][0] >= 500 else 1))]
+        self.assertEqual(self.p.push(hr.build_payload("t1", "n", "done", {})), 0)
+        devs = self.devices.list()
+        self.assertEqual([d["token"] for d in devs], [t * 32 for t, _, keep in cases if keep])
+        self.assertEqual([d.get("relay_sig") for d in devs], [None, SIG, SIG, SIG])  # bad_sig만 서명을 지운다
+
+    def test_send_one_reasons(self):
+        dev = {"token": "aa" * 32, "env": "sandbox", "relay_sig": SIG}
+        self.relay.responses = [(403, {"error": "bad_sig"}, False), (410, {"ok": False, "reason": "Unregistered"}, False),
+                                (200, {"ok": True, "apns_id": "x"}, False)]
+        self.assertEqual(self.p.send_one(dev, {}), (403, "relay:bad_sig"))
+        self.assertEqual(self.p.send_one(dev, {}), (410, "Unregistered"))
+        self.assertEqual(self.p.send_one(dev, {}), (200, ""))
+
+    def test_device_without_sig_skipped(self):
+        self.devices.add("aa" * 32, "sandbox")
+        self.devices.add("bb" * 32, "sandbox", relay_sig=SIG)
+        with self.assertLogs(hr.log, "WARNING") as cm:
+            self.assertEqual(self.p.push(hr.build_payload("t1", "n", "done", {})), 1)
+            self.assertEqual(self.p.push(hr.build_payload("t1", "n", "done", {})), 1)
+            hr.log.warning("marker")
+        self.assertEqual([r[2]["device_token"] for r in self.relay.requests], ["bb" * 32] * 2)
+        self.assertEqual(sum("relay_sig" in m for m in cm.output), 1)  # 기기마다 한 번
+        self.assertEqual(len(self.devices.list()), 2)
+
+    def test_logs_hide_token_sig_and_body(self):
+        self.devices.add("aa" * 32, "sandbox", relay_sig=SIG)
+        self.relay.responses = [(403, {"error": "bad_sig"}, False)]
+        with self.assertLogs(hr.log, "INFO") as cm:
+            self.p.push(hr.build_payload("t1", "n", "done", {"msg": "비밀 본문"}))
+        joined = "\n".join(cm.output)
+        self.assertNotIn("aa" * 32, joined)
+        self.assertNotIn(SIG, joined)
+        self.assertNotIn("비밀 본문", joined)
+        self.assertIn("다시 등록", joined)
+
+    def test_load_config_relay_url(self):
+        path = os.path.join(self.tmp, "config.json")
+        key = os.path.join(self.tmp, "AuthKey.p8")
+        with open(key, "w") as f:
+            f.write("k")
+        for url, want in (("https://relay.example.com/", "https://relay.example.com"),
+                          ("https://relay.example.com/base", "https://relay.example.com/base"),
+                          ("http://127.0.0.1:8787", "http://127.0.0.1:8787"),
+                          ("http://localhost:8787/", "http://localhost:8787"),
+                          ("", "")):
+            with open(path, "w") as f:
+                json.dump({"token": "x", "push_relay_url": url, "apns_key_path": key}, f)
+            self.assertEqual(hr.load_config(path)["push_relay_url"], want)
+        with open(path, "w") as f:
+            json.dump({"token": "x", "apns_key_path": key}, f)
+        self.assertEqual(hr.load_config(path)["push_relay_url"], "")
+        for bad in ("http://example.com", "ftp://relay.example.com", "https://", "relay.example.com",
+                    "https://u:p@relay.example.com", "https://relay.example.com?x=1", "http://127.0.0.2",
+                    "https://relay.example.com:abc", 5):
+            with open(path, "w") as f:
+                json.dump({"token": "x", "push_relay_url": bad}, f)
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                hr.load_config(path)
+
+    def test_build_app_picks_pusher(self):
+        cfg = dict(self.cfg, hc_path="/nonexistent/hc")
+        self.assertIsInstance(hr.build_app(cfg).pusher, hr.RelayPusher)
+        cfg["push_relay_url"] = ""
+        app = hr.build_app(cfg)
+        self.assertIs(type(app.pusher), hr.ApnsPusher)
+
+
+class RelayHttpTests(unittest.TestCase):
+    def start(self, relay_url):
+        self.tmp = tempfile.mkdtemp()
+        self.app, _, _ = make_app(self.tmp)
+        self.app.cfg["push_relay_url"] = relay_url
+        self.srv = hr.make_server(self.app, "127.0.0.1", 0)
+        self.port = self.srv.server_address[1]
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.addCleanup(self.srv.server_close)
+        self.addCleanup(self.srv.shutdown)
+
+    def req(self, *a, **k):
+        return HttpTests.req(self, *a, **k)
+
+    def test_health_includes_relay_url(self):
+        self.start("https://relay.example.com")
+        self.assertEqual(self.req("GET", "/api/health"),
+                         (200, {"ok": True, "name": hr.machine_name(), "push_relay_url": "https://relay.example.com", "relay_resign": [],
+                                "push": {"last_success_at": None, "relay_limited_at": None, "failing": False}}))
+        self.app.devices.add("ab" * 32, "sandbox", relay_sig=SIG)
+        self.app.devices.add("cd" * 32, "sandbox", relay_sig=SIG)
+        self.app.devices.mark_relay_sig_bad("cd" * 32, SIG)
+        want = hashlib.sha256(("cd" * 32).encode()).hexdigest()[:16]
+        self.assertEqual(self.req("GET", "/api/health")[1]["relay_resign"], [want])
+
+    def test_health_without_relay_url(self):
+        self.start("")
+        self.assertEqual(self.req("GET", "/api/health"), (200, {"ok": True, "name": hr.machine_name(),
+                                                               "push": {"last_success_at": None, "relay_limited_at": None, "failing": False}}))
+
+    def test_add_device_relay_sig(self):
+        self.start("https://relay.example.com")
+        tok = "AB" * 32
+        with self.assertLogs(hr.log, "INFO") as cm:
+            self.assertEqual(self.req("POST", "/api/devices", {"token": tok, "env": "sandbox", "relay_sig": SIG}),
+                             (200, {"ok": True}))
+        self.assertNotIn(SIG, "\n".join(cm.output))
+        self.assertEqual([(d["token"], d["relay_sig"]) for d in self.app.devices.list()], [(tok.lower(), SIG)])
+        for bad in ("v1." + "A" * 42, "v1." + "A" * 44, "v2." + "A" * 43, "v1." + "A" * 42 + "=", 7, ""):
+            self.assertEqual(self.req("POST", "/api/devices", {"token": tok, "env": "sandbox", "relay_sig": bad}),
+                             (400, {"error": "bad_relay_sig"}), bad)
+        self.assertEqual(self.app.devices.list()[0]["relay_sig"], SIG)  # 거절된 요청은 기존 항목을 안 건드린다
+        # relay_sig 없이 재등록하면 기존처럼 교체(서명 없음)
+        self.assertEqual(self.req("POST", "/api/devices", {"token": tok, "env": "production"}), (200, {"ok": True}))
+        devs = self.app.devices.list()
+        self.assertEqual(len(devs), 1)
+        self.assertEqual(devs[0]["env"], "production")
+        self.assertNotIn("relay_sig", devs[0])
+
+
 # ---------------------------------------------------------------- HTTP end-to-end
 
 class HttpTests(unittest.TestCase):
@@ -525,7 +823,8 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(self.req("GET", "/api/health", token="wrong")[0], 401)
         self.assertEqual(self.req("POST", "/api/terminals/t12/keys", {"keys": ["1"]}, token="x")[0], 401)
         self.assertEqual(self.hc.keys_calls, [])
-        self.assertEqual(self.req("GET", "/api/health"), (200, {"ok": True}))
+        self.assertEqual(self.req("GET", "/api/health"), (200, {"ok": True, "name": hr.machine_name(),
+                                                               "push": {"last_success_at": None, "relay_limited_at": None, "failing": False}}))
 
     def test_terminals_and_screen(self):
         code, body = self.req("GET", "/api/terminals")
@@ -915,6 +1214,17 @@ class TranscriptTests(unittest.TestCase):
         self.assertEqual(len(parts[0]["text"]), 8000)
         self.assertEqual(len(parts[1]["input"]["content"]), 8000)
         self.assertEqual(len(parts[1]["output"]), 8000)
+
+    def test_tool_output_strips_ansi(self):
+        use = json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "b", "name": "Bash", "input": {"command": "npm test"}}]}})
+        out = "\x1b[32m✓ ok\x1b[0m\r\n\x1b]0;title\x07\x1b[1;31mFAIL\x1b[0m a\x1b(B\rb\x1b[2K"
+        res = json.dumps({"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "b",
+             "content": [{"type": "text", "text": out}]}]}})
+        turns, _ = hr.parse_transcript([use, res], 50)
+        self.assertEqual(turns[0]["parts"][0]["output"], "✓ ok\nFAIL a\nb")
+        self.assertNotIn("\x1b", turns[0]["parts"][0]["output"])
 
     def _home(self, proc_start="Fri Nov 20 10:01:38 2026", kind="interactive"):
         home = tempfile.mkdtemp()
@@ -1435,6 +1745,54 @@ class HiddenSymlinkTests(unittest.TestCase):
         self.assertEqual(hr.resolve_home_path("proj", home), os.path.join(home, "proj"))
         app, hc, _ = make_app(home=home)
         self.assertEqual(app.api_folders("")["dirs"], ["proj"])
+
+
+class DefaultRelayTests(unittest.TestCase):
+    """키 없는 설치(App Store판)는 기본 중계, 키 있는 기존 설치는 APNs 직접, "off"는 끔."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.path = os.path.join(self.tmp, "config.json")
+        self.key = os.path.join(self.tmp, "AuthKey.p8")
+
+    def load(self, extra, key=False):
+        if key:
+            with open(self.key, "w") as f:
+                f.write("k")
+        with open(self.path, "w") as f:
+            json.dump(dict({"token": "x" * 32, "hc_path": "/nonexistent/hc", "apns_key_path": self.key}, **extra), f)
+        cfg = hr.load_config(self.path)
+        return cfg, hr.build_app(cfg)
+
+    def test_no_key_empty_setting_uses_default_relay(self):
+        for extra in ({}, {"push_relay_url": ""}):
+            cfg, app = self.load(extra)
+            self.assertEqual(cfg["push_relay_url"], hr.DEFAULT_RELAY_URL)
+            self.assertEqual(app.push_mode(), "relay")
+            self.assertIsInstance(app.pusher, hr.RelayPusher)
+
+    def test_key_without_setting_stays_apns(self):
+        cfg, app = self.load({}, key=True)
+        self.assertEqual(cfg["push_relay_url"], "")
+        self.assertEqual(app.push_mode(), "apns")
+        self.assertNotIsInstance(app.pusher, hr.RelayPusher)
+
+    def test_explicit_url_wins(self):
+        for key in (False, True):
+            cfg, app = self.load({"push_relay_url": "https://relay.example.com/"}, key=key)
+            self.assertEqual(cfg["push_relay_url"], "https://relay.example.com")
+            self.assertEqual(app.push_mode(), "relay")
+
+    def test_off_disables_relay(self):
+        cfg, app = self.load({"push_relay_url": "off"})
+        self.assertEqual(cfg["push_relay_url"], "")
+        self.assertEqual(app.push_mode(), "none")
+        cfg, app = self.load({"push_relay_url": "off"}, key=True)
+        self.assertEqual(app.push_mode(), "apns")
+
+    def test_default_relay_url_is_valid(self):
+        self.assertEqual(hr.check_relay_url(hr.DEFAULT_RELAY_URL), hr.DEFAULT_RELAY_URL)
 
 
 if __name__ == "__main__":
