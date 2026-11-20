@@ -250,7 +250,8 @@ class ReminderTests(unittest.TestCase):
         r = self.at(300)
         self.assertEqual(len(r), 1)
         self.assertEqual(r[0]["reminder"], 1)
-        self.assertEqual(r[0]["aps"]["alert"]["subtitle"], "다시 알림 · 허락 필요")
+        self.assertEqual(r[0]["aps"]["alert"]["subtitle"], "Reminder · Needs permission")
+        self.assertEqual(r[0]["aps"]["alert"]["subtitle-loc-key"], "push.subtitle.reminder.permission")
         self.assertEqual(r[0]["aps"]["thread-id"], "t1")
         self.assertEqual(r[0]["aps"]["alert"]["title"], "hrtest")
         self.assertEqual(r[0]["server"], hr.server_tag(TOKEN))
@@ -282,6 +283,12 @@ class ReminderTests(unittest.TestCase):
         self.hc.set_status("t1", base.st("working"))  # 폴링 전에 풀렸다
         self.app.check_reminders()
         self.assertEqual([p for p in self.pusher.payloads if "reminder" in p], [])
+
+    def test_blocked_reminder_loc_key(self):
+        self.block({"app": "claude-code", "kind": "question", "msg": "which one?", "state": "blocked"})
+        r = self.at(300)
+        a = r[0]["aps"]["alert"]
+        self.assertEqual((a["subtitle"], a["subtitle-loc-key"]), ("Reminder · Needs reply", "push.subtitle.reminder.blocked"))
 
     def test_msg_change_restarts(self):
         self.block()
@@ -403,7 +410,8 @@ class PushHttpTests(unittest.TestCase):
         self.assertEqual(sent["device_token"], TOK_A)
         self.assertEqual(sent["env"], "production")
         p = sent["payload"]
-        self.assertEqual(p["aps"], {"alert": {"title": "Sheltie", "subtitle": "시험 알림", "body": "알림이 제대로 와요"},
+        self.assertEqual(p["aps"], {"alert": {"title": "Sheltie", "subtitle": "Test notification", "body": "Notifications are working",
+                                              "subtitle-loc-key": "push.subtitle.test", "loc-key": "push.body.test"},
                                     "sound": "default", "category": "HR_TEST", "thread-id": "sheltie-test"})
         self.assertEqual((p["state"], p["terminal"], p["server"]), ("test", None, hr.server_tag(TOKEN)))
         # 기록

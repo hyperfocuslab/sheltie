@@ -1558,8 +1558,21 @@ def push_category(state, status, prompt=None):
     return "HR_BLOCKED"
 
 
-SUBTITLES = {"HR_PERMISSION": "허락 필요", "HR_PERMISSION_ALWAYS": "허락 필요", "HR_BLOCKED": "답 필요",
-             "HR_DONE": "끝남", "HR_EXITED": "종료"}
+# 알림 문구는 앱의 String Catalog 키(loc-key)로 보내 기기 언어로 보이게 한다.
+# 평문 subtitle/body(영어)는 키를 모르는 구버전 앱과 로그용이다.
+SUBTITLES = {"HR_PERMISSION": "Needs permission", "HR_PERMISSION_ALWAYS": "Needs permission",
+             "HR_BLOCKED": "Needs reply", "HR_DONE": "Done", "HR_EXITED": "Exited"}
+SUBTITLE_KEYS = {"HR_PERMISSION": "push.subtitle.permission", "HR_PERMISSION_ALWAYS": "push.subtitle.permission",
+                 "HR_BLOCKED": "push.subtitle.blocked", "HR_DONE": "push.subtitle.done",
+                 "HR_EXITED": "push.subtitle.exited"}
+REMINDER_SUBTITLE_KEYS = {"HR_PERMISSION": "push.subtitle.reminder.permission",
+                          "HR_PERMISSION_ALWAYS": "push.subtitle.reminder.permission",
+                          "HR_BLOCKED": "push.subtitle.reminder.blocked"}
+
+
+def test_alert():
+    return {"title": "Sheltie", "subtitle": "Test notification", "body": "Notifications are working",
+            "subtitle-loc-key": "push.subtitle.test", "loc-key": "push.body.test"}
 
 
 def build_payload(tid, name, state, status, prompt=None, exit_code=None):
@@ -1567,17 +1580,30 @@ def build_payload(tid, name, state, status, prompt=None, exit_code=None):
     status = status or {}
     msg = status.get("msg")
     cat = push_category(state, status, prompt)
+    loc_key, loc_args = None, None
     if state == "done":
-        body = msg or "작업이 끝났어"
+        body = msg or "Task finished"
+        loc_key = None if msg else "push.body.done"
     elif state == "exited":
         msg = None
-        body = "터미널이 끝났어" + ("" if exit_code is None else " (exit %s)" % exit_code)
+        if exit_code is None:
+            body, loc_key = "Terminal exited", "push.body.exited"
+        else:
+            body, loc_key = "Terminal exited (exit %s)" % exit_code, "push.body.exited.code"
+            loc_args = [str(exit_code)]
     else:
-        body = msg or "답이 필요해"
+        body = msg or "Needs your reply"
+        loc_key = None if msg else "push.body.blocked"
     body = body[:200]
+    alert = {"title": name or tid, "subtitle": SUBTITLES[cat], "body": body,
+             "subtitle-loc-key": SUBTITLE_KEYS[cat]}
+    if loc_key:
+        alert["loc-key"] = loc_key
+        if loc_args:
+            alert["loc-args"] = loc_args
     payload = {
         "aps": {
-            "alert": {"title": name or tid, "subtitle": SUBTITLES[cat], "body": body},
+            "alert": alert,
             "sound": "default",
             "category": cat,
             "thread-id": tid,
@@ -2386,7 +2412,8 @@ class App:
                                         prompt=self._prompt_for_push(tid))
                 payload["reminder"] = n
                 alert = payload["aps"]["alert"]
-                alert["subtitle"] = "다시 알림 · " + alert["subtitle"]
+                alert["subtitle"] = "Reminder · " + alert["subtitle"]
+                alert["subtitle-loc-key"] = REMINDER_SUBTITLE_KEYS[payload["aps"]["category"]]
                 log.info("다시 알림 %s %d번째", tid, n)
                 self._notify(payload)
             self._detected = None
@@ -2824,7 +2851,7 @@ class App:
     def test_payload(self):
         return {
             "aps": {
-                "alert": {"title": "Sheltie", "subtitle": "시험 알림", "body": "알림이 제대로 와요"},
+                "alert": test_alert(),
                 "sound": "default",
                 "category": "HR_TEST",
                 "thread-id": "sheltie-test",
@@ -3548,7 +3575,8 @@ def cmd_test_push():
             print("APNs 키 파일이 없다: %s (또는 설정에 push_relay_url)" % cfg["apns_key_path"], file=sys.stderr)
         return 1
     devs = app.devices.list()
-    payload = build_payload("test", "herdr-remote", "done", {"msg": "시험 알림"})
+    payload = build_payload("test", "herdr-remote", "done", {})
+    payload["aps"]["alert"] = test_alert()
     sent = app.pusher.push(payload)
     print("시험 푸시: 기기 %d대 중 %d대 성공" % (len(devs), sent))
     return 0 if sent == len(devs) and devs else 1

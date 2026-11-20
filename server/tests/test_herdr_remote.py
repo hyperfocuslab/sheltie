@@ -167,7 +167,7 @@ class TransitionTests(unittest.TestCase):
         self.hc.set_status("t1", st("idle"))
         self.app.handle_event_line(status_ev("t1", st("done")))
         self.assertEqual([p["aps"]["category"] for p in self.pusher.payloads], ["HR_DONE"])
-        self.assertEqual(self.pusher.payloads[0]["aps"]["alert"]["body"], "작업이 끝났어")
+        self.assertEqual(self.pusher.payloads[0]["aps"]["alert"]["body"], "Task finished")
         # 같은 turn의 done이 다시 와도(이벤트 중복, turn 이벤트) 추가 알림 없음
         self.app.handle_event_line(status_ev("t1", st("done")))
         self.app.handle_event_line(ev("t1", "turn", {"state": "done", "turn": 1}))
@@ -349,6 +349,35 @@ class ApnsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             hr.der_to_raw(der + b"\x00")
 
+    def test_payload_loc_keys(self):
+        def alert(*a, **k):
+            return hr.build_payload("t1", "n", *a, **k)["aps"]["alert"]
+        a = alert("blocked", {"kind": "question"})
+        self.assertEqual((a["subtitle-loc-key"], a["loc-key"]), ("push.subtitle.blocked", "push.body.blocked"))
+        self.assertEqual(alert("blocked", PERM)["subtitle-loc-key"], "push.subtitle.permission")
+        a = alert("done", {})
+        self.assertEqual((a["subtitle-loc-key"], a["loc-key"], a["body"]),
+                         ("push.subtitle.done", "push.body.done", "Task finished"))
+        a = alert("done", {"msg": "빌드 완료"})
+        self.assertEqual((a["body"], a["subtitle-loc-key"]), ("빌드 완료", "push.subtitle.done"))
+        self.assertNotIn("loc-key", a)
+        a = alert("exited", None)
+        self.assertEqual((a["subtitle-loc-key"], a["loc-key"]), ("push.subtitle.exited", "push.body.exited"))
+        self.assertNotIn("loc-args", a)
+        a = alert("exited", None, exit_code=2)
+        self.assertEqual((a["loc-key"], a["loc-args"], a["body"]),
+                         ("push.body.exited.code", ["2"], "Terminal exited (exit 2)"))
+
+    def test_plain_fallback_has_no_hangul(self):
+        import re
+        for args, kw in [(("done", {}), {}), (("blocked", PERM), {}), (("blocked", {}), {}),
+                         (("exited", None), {"exit_code": 1})]:
+            a = hr.build_payload("t1", "n", *args, **kw)["aps"]["alert"]
+            self.assertIsNone(re.search("[가-힣]", a["subtitle"] + a["body"]), a)
+        t = hr.test_alert()
+        self.assertIsNone(re.search("[가-힣]", t["subtitle"] + t["body"]))
+        self.assertEqual((t["subtitle-loc-key"], t["loc-key"]), ("push.subtitle.test", "push.body.test"))
+
     def test_category_and_payload(self):
         self.assertEqual(hr.push_category("blocked", PERM), "HR_PERMISSION")
         self.assertEqual(hr.push_category("blocked", TRUST), "HR_PERMISSION")
@@ -357,7 +386,9 @@ class ApnsTests(unittest.TestCase):
         self.assertEqual(hr.push_category("done", {}), "HR_DONE")
         p = hr.build_payload("t12", "hrtest", "blocked", dict(PERM, msg="approve " + "x" * 500))
         self.assertEqual(p["aps"]["alert"]["title"], "hrtest")
-        self.assertEqual(p["aps"]["alert"]["subtitle"], "허락 필요")
+        self.assertEqual(p["aps"]["alert"]["subtitle"], "Needs permission")
+        self.assertEqual(p["aps"]["alert"]["subtitle-loc-key"], "push.subtitle.permission")
+        self.assertNotIn("loc-key", p["aps"]["alert"])  # 에이전트가 쓴 msg는 번역하지 않는다
         self.assertEqual(len(p["aps"]["alert"]["body"]), 200)
         self.assertEqual(p["aps"]["thread-id"], "t12")
         self.assertEqual(p["aps"]["sound"], "default")
