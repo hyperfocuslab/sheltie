@@ -1,0 +1,119 @@
+
+  main ~/work/demo                                                                                                                                                 15 / 128K │ [Dashboard]
+
+
+     ❯ ask multi                                                                                                                                                                             4:51 PM
+
+
+     ◆ Ask 2 questions
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+                                                                                                                                                                                                       █
+
+    ◆ Waiting on answers for 2 questions                                                                                                                                               1.6s ⇣15 [stop]
+
+  ┃
+  ┃  Which features to include?
+  ┃
+  ┃
+  ┃  1 [ ] Tests  Add unit tests                                                                                                                                                                     █
+  ┃  2 [ ] CI     GitHub Actions                                                                                                                                                                     █
+  ┃  3 [ ] Docs   README section                                                                                                                                                                     █
+  ┃  z [ ] Type your answer here
+  ┃
+  ┃  [1/2] ↑/↓ navigate · ←/→ question · y copy                                                                                                                                       Enter:select
+  ┃
+
+  Tab:next answer  │  Esc:scrollback  │  Shift+x:dismiss

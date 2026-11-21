@@ -1,0 +1,14 @@
+     ❯ use printf instead                                                                                                                                                                    4:46 PM
+     ◆ Running append bye to notes.txt
+    ◆ Append bye to notes.txt… 15s                                                                                                                                                   29s ⇣15 [↓][stop]
+  ┃
+  ┃  ›  Append bye to notes.txt
+  ┃  │ echo bye >> notes.txt
+  ┃  ← → narrow scope
+  ┃
+  ┃  1 (○) Yes, and don't ask again for anything (always-approve mode)
+  ┃  2 (●) Yes, proceed
+  ┃  3 (○) No, reject (type to add feedback)
+  ┃  4 (○) Never allow: echo
+  ┃
+  Tab/Space:permission  │  Ctrl+e:collapse thinking  │  Ctrl+c:cancel  │  Ctrl+b:send to bg  │  Ctrl+.:shortcuts

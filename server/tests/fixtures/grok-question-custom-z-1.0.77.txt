@@ -1,0 +1,10 @@
+  ┃  Which language should the demo use?
+  ┃
+  ┃
+  ┃  1 (○) Python  Simple script, no build step                                                                                                                                                      █
+  ┃  2 (○) Go      Single static binary                                                                                                                                                              █
+  ┃  z (●) ❯
+  ┃
+  ┃  ↑/↓ navigate · y copy                                                                                                                                                              Enter:edit
+  ┃
+  Enter:submit  │  Esc:back

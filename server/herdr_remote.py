@@ -1707,6 +1707,272 @@ def _reject_keys_opencode(p):
     return ["esc", "esc"] if p["kind"] == "approval" and p["title"] == OPENCODE_ALWAYS_HEAD[2:] else ["esc"]
 
 
+# ---- Grok Build 대화 상자. 실측: grok 1.0.77, 200열(tests/fixtures/grok-*-1.0.77.txt).
+# 승인·질문은 화면 끝 힌트 줄 바로 위 `┃` 줄들(왼쪽 막대)에 그려진다. 메뉴 줄은 `1 (●) Yes, proceed`(질문 직접 입력 `z`).
+# 승인 힌트 `1/N:select │ … │ Esc:scrollback`의 N이 항목 수다. 항목 수·번호가 명령마다 달라(4개 또는 5개, Yes가 2번 또는 3번)
+# 라벨로 맞춘다. 숫자 키가 그 항목을 바로 고르고 제출한다. Esc는 거절이 아니라 포커스를 스크롤백으로 옮긴다(그때 힌트가
+# `Tab/Space:permission`으로 바뀌고 숫자 키를 무시한다: 카드 없음). always-approve 모드 항목은 $GROK_HOME/config.toml에
+# 전역 영구 저장, "Always allow:"·"Never allow:"는 그 폴더 권한 파일에 영구 저장, "allow all edits during this session"만
+# 세션 한정(파일 변화 없음). 계획 검토는 숫자 메뉴 없이 a 승인 / s 수정 요청(입력창으로) / q 계획 포기.
+# 폴더 신뢰는 화면 가운데 y/n 글자 키. 여러 질문·복수 선택은 카드 없음.
+GROK_GUTTER = "┃"
+GROK_ROW_RE = re.compile(r"^([1-9z]) (\([○●]\)|\[[ xX✓]\]) ?(.*)$")
+GROK_APPROVAL_HINT_RE = re.compile(r"^1/(\d+):select │ .*│ Esc:scrollback$")
+GROK_SCOPE_RE = re.compile(r"^← → narrow scope(?: · e edit pattern)?$")
+GROK_EDIT_Q_RE = re.compile(r"^Allow Edit to (.+)\?$")
+GROK_EDIT_STATUS_RE = re.compile(r"^◆ Running (?:Write|Edit) `")
+GROK_EDIT_HEAD_RE = re.compile(r"^◆ (?:Creating|Edit) (\S.*)$")
+GROK_ALWAYS_APPROVE = "Yes, and don't ask again for anything (always-approve mode)"
+GROK_SESSION_EDITS = "Yes, allow all edits during this session"
+GROK_REJECT = "No, reject"
+GROK_REJECT_SUFFIX = " (type to add feedback)"
+GROK_RULE_PREFIXES = ("Always allow: ", "Never allow: ")
+GROK_EDIT_LABELS = (GROK_ALWAYS_APPROVE, GROK_SESSION_EDITS, "Yes", GROK_REJECT)
+GROK_Q_HINT = "Tab:next answer │ Esc:scrollback │ Shift+x:dismiss"
+GROK_Q_NAV_RE = re.compile(r"^↑/↓ navigate · y copy Enter:(submit|edit)$")
+GROK_FREE = "Type your answer here"
+GROK_PLAN_HINT = "c:comment │ y:copy plan │ a:approve │ q:quit plan │ v:select │ Tab:prompt"
+GROK_PLAN_MENU = "a approve | s request changes | c comment | y copy plan | q quit plan"
+GROK_PLAN_WAIT = "◆ Waiting on plan approval"
+GROK_PLAN_TOP = "╭─ plan.md"
+GROK_PLAN_Q = "Review the plan"
+GROK_PLAN_LINE_RE = re.compile(r"^\s*(\d+)(?: (.*))?$")
+GROK_TRUST_Q = "Do you trust the contents of this directory?"
+GROK_TRUST_ROW_RE = re.compile(r"^(Yes, proceed|No, quit)\s{2,}([yn])$")
+GROK_FOOTER_RE = re.compile(r"^Grok Build\s+\d+\.\d+\.\d+\S*$")
+# 번호 없는 항목의 글자 키(계획 검토 a/q, 폴더 신뢰 y/n). "Request changes"는 직접 입력(s → 붙여넣기)
+GROK_LETTER_KEYS = {("plan", "Approve"): "a", ("plan", "Quit plan"): "q",
+                    ("approval", "Yes, proceed"): "y", ("approval", "No, quit"): "n"}
+
+
+def _grok_gutter(lines):
+    """화면 끝 힌트 줄 바로 위의 `┃` 줄들 → (힌트(공백 정리), 안쪽 줄들, 첫 `┃` 줄 index) 또는 None.
+    오른쪽 끝 스크롤 막대(█)는 뗀다."""
+    nz = [i for i, ln in enumerate(lines) if ln.strip()]
+    if not nz:
+        return None
+    end = nz[-1]
+    i = end - 1
+    while i >= 0 and not lines[i].strip():
+        i -= 1
+    inner = []
+    while i >= 0 and lines[i].lstrip().startswith(GROK_GUTTER):
+        s = lines[i].lstrip()[1:]
+        s = s[2:] if s.startswith("  ") else s.lstrip()
+        inner.append(s.rstrip().rstrip("█").rstrip())
+        i -= 1
+    if not inner:
+        return None
+    inner.reverse()
+    return _norm(lines[end]), inner, i + 1
+
+
+def _grok_rows(inner, stop=None):
+    """메뉴 줄(이어진 줄만) → [{line, key, mark, text}] 또는 None."""
+    rows = []
+    for k, s in enumerate(inner[:stop]):
+        m = GROK_ROW_RE.match(s)
+        if m:
+            rows.append({"line": k, "key": m.group(1), "mark": m.group(2), "text": m.group(3)})
+    if not rows or rows[-1]["line"] - rows[0]["line"] != len(rows) - 1:
+        return None
+    return rows
+
+
+def _grok_edit_preview(lines, top, path):
+    """파일 승인 위 대화 영역의 미리보기(`◆ Creating <파일>`/`◆ Edit <파일>` 아래 줄들). 승인 상자 바로 위 상태 줄
+    (`◆ Running Write|Edit …`) 위의 마지막 `◆` 줄이 같은 파일일 때만. 없으면 None."""
+    st = next((i for i in range(top - 1, -1, -1) if lines[i].strip()), -1)
+    if st < 0 or not GROK_EDIT_STATUS_RE.match(lines[st].strip()):
+        return None
+    head = next((i for i in range(st - 1, -1, -1) if lines[i].strip().startswith("◆ ")), -1)
+    m = GROK_EDIT_HEAD_RE.match(lines[head].strip()) if head >= 0 else None
+    if not m or m.group(1).rsplit("/", 1)[-1] != path.rsplit("/", 1)[-1]:
+        return None
+    return _dedent_block([ln.rstrip("█").rstrip() for ln in lines[head + 1:st]])
+
+
+def _parse_grok_approval(hint, inner, lines, top):
+    m = GROK_APPROVAL_HINT_RE.match(hint)
+    rows = _grok_rows(inner) if m else None
+    if not rows:
+        return None
+    n = int(m.group(1))
+    if len(rows) != n or [r["key"] for r in rows] != [str(k) for k in range(1, n + 1)] \
+            or any(r["mark"] not in ("(○)", "(●)") for r in rows) or sum(r["mark"] == "(●)" for r in rows) != 1 \
+            or any(s.strip() for s in inner[rows[-1]["line"] + 1:]):
+        return None
+    head = [s for s in inner[:rows[0]["line"]] if s.strip()]
+    if not head or not head[0].startswith("›"):
+        return None
+    question = head[0][1:].strip()
+    cmd, rest = [], head[1:]
+    while rest and rest[0].startswith("│"):
+        s = rest.pop(0)
+        cmd.append(s[2:] if s.startswith("│ ") else s[1:])
+    if rest and GROK_SCOPE_RE.match(_norm(rest[0])):
+        rest.pop(0)
+    if rest or not question:
+        return None
+    labels = []
+    for r in rows:
+        lb = _norm(r["text"])
+        labels.append(lb[:-len(GROK_REJECT_SUFFIX)] if lb.endswith(GROK_REJECT_SUFFIX) else lb)
+    if cmd:
+        # 셸 명령(run_terminal_command): 질문은 모델이 준 description(hc status msg와 같다)
+        if "Yes, proceed" not in labels or GROK_REJECT not in labels or labels[0] != GROK_ALWAYS_APPROVE \
+                or any(lb not in (GROK_ALWAYS_APPROVE, "Yes, proceed", GROK_REJECT)
+                       and not lb.startswith(GROK_RULE_PREFIXES) for lb in labels):
+            return None
+        title, body, approve, always = "Shell", "\n".join(cmd), labels.index("Yes, proceed"), None
+    else:
+        em = GROK_EDIT_Q_RE.match(question)
+        if not em or tuple(labels) != GROK_EDIT_LABELS:
+            return None  # 캡처하지 않은 승인
+        path = em.group(1)
+        pv = _grok_edit_preview(lines, top, path)
+        title, body = "Edit", path + ("\n\n" + pv if pv else "")
+        approve, always = 2, 1  # 2번 "allow all edits during this session"은 메모리만(실측: 파일 변화 없음)
+    opts = [(lb, None, int(r["key"])) for lb, r in zip(labels, rows)]
+    # 거절 줄은 입력 항목이다(글자를 치면 그 줄이 입력 칸이 된다): 거절 버튼은 그 번호(reject_keys),
+    # 이 줄을 고르면 직접 입력으로 메모와 함께 거절(턴이 이어지고 메모가 새 사용자 메시지로 간다, 실측)
+    p = _finish("approval", title, question, body, opts,
+                selected=next(k for k, r in enumerate(rows) if r["mark"] == "(●)"),
+                always_index=always, free_text_index=labels.index(GROK_REJECT), persist_index=0)
+    p["approve_index"] = approve
+    return p
+
+
+def _parse_grok_question(hint, inner):
+    if hint != GROK_Q_HINT:
+        return None
+    nz = [k for k, s in enumerate(inner) if s.strip()]
+    nav = GROK_Q_NAV_RE.match(_norm(inner[nz[-1]])) if nz else None
+    if not nav:
+        return None  # 여러 질문은 `[1/2] … ←/→ question`, 직접 입력 중에는 힌트가 다르다
+    rows = _grok_rows(inner, nz[-1])
+    if not rows or any(r["mark"] not in ("(○)", "(●)") for r in rows):
+        return None  # 복수 선택([ ])
+    keys = [r["key"] for r in rows]
+    if keys[-1] != "z" or keys[:-1] != [str(k) for k in range(1, len(rows))] or rows[-1]["text"] != GROK_FREE \
+            or any(inner[k].strip() for k in range(rows[-1]["line"] + 1, nz[-1])):
+        return None  # z 줄에 입력 칸이 열린 상태(`z (●) ❯`) 등
+    if (nav.group(1) == "edit") != (len(rows) == 1):
+        return None  # 옵션 없는 질문만 Enter:edit(커서가 이미 z 줄)
+    q = [inner[k].strip() for k in nz if k < rows[0]["line"]]
+    if not q:
+        return None
+    opts = []
+    for r in rows[:-1]:
+        parts = re.split(r"\s{2,}", r["text"].strip(), maxsplit=1)
+        opts.append((parts[0], parts[1] if len(parts) > 1 else None, int(r["key"])))
+    opts.append((GROK_FREE, None, None))
+    sel = next((k for k, r in enumerate(rows) if r["mark"] == "(●)"), None)
+    return _finish("question", None, _norm(" ".join(q)), None, opts, selected=sel, free_text_index=len(opts) - 1)
+
+
+def _parse_grok_plan(lines):
+    nz = [i for i, ln in enumerate(lines) if ln.strip()]
+    if len(nz) < 6 or _norm(lines[nz[-1]]) != GROK_PLAN_HINT:
+        return None
+    wait = next((i for i in reversed(nz[-20:-1]) if lines[i].strip() == GROK_PLAN_WAIT), -1)
+    if wait < 0:
+        return None
+    above = [i for i in nz if i < wait]
+    if len(above) < 4 or not lines[above[-1]].strip().startswith("╰"):
+        return None
+    menu, sep = above[-2], above[-3]
+    if _norm(lines[menu].strip().lstrip("│").rstrip("│")) != GROK_PLAN_MENU \
+            or not lines[sep].strip().startswith("│─"):
+        return None
+    top = next((i for i in range(sep - 1, -1, -1) if lines[i].strip().startswith(GROK_PLAN_TOP)), -1)
+    if top < 0:
+        return None
+    out = []
+    for ln in lines[top + 1:sep]:
+        s = ln.strip()
+        if not s.startswith("│"):
+            return None
+        s = s[1:].rstrip("│█ ")
+        m = GROK_PLAN_LINE_RE.match(s)
+        if m:
+            out.append(m.group(2) or "")
+        elif s.strip():
+            out.append(s.strip())  # 줄 번호 없는 줄(긴 줄이 접힌 것)
+    body = "\n".join(out).strip()
+    if not body:
+        return None
+    opts = [("Approve", None, None), ("Request changes", None, None), ("Quit plan", None, None)]
+    # q는 계획을 버리고 plan 모드를 끈다(실측). 실행은 안 된다. 계획을 이어 가려면 수정 요청(직접 입력)
+    return _finish("plan", "plan.md", GROK_PLAN_Q, body[:MAX_PROMPT_BODY], opts, free_text_index=1, reject_index=2)
+
+
+def _parse_grok_trust(lines):
+    nz = [i for i, ln in enumerate(lines) if ln.strip()]
+    if len(nz) < 4 or not GROK_FOOTER_RE.match(lines[nz[-1]].strip()):
+        return None
+    r1, r2 = (GROK_TRUST_ROW_RE.match(lines[i].strip()) for i in nz[-3:-1])
+    if not r1 or not r2 or (r1.group(1), r1.group(2), r2.group(1), r2.group(2)) != ("Yes, proceed", "y", "No, quit", "n"):
+        return None
+    q = next((i for i in reversed(nz[:-3]) if lines[i].strip() == GROK_TRUST_Q), -1)
+    if q < 0 or nz.index(q) < len(nz) - 10:
+        return None
+    mid = [lines[i].strip() for i in nz if q < i < nz[-3]]
+    if not mid:
+        return None
+    body = mid[0] + ("\n\n" + " ".join(mid[1:]) if mid[1:] else "")
+    p = _finish("approval", None, GROK_TRUST_Q, body, [("Yes, proceed", None, None), ("No, quit", None, None)],
+                reject_index=1)
+    p["approve_index"] = 0  # $GROK_HOME/trusted_folders.toml에 저장되지만 신뢰 화면의 기본 답이다. n은 grok을 끝낸다
+    return p
+
+
+def _parse_grok_lines(lines, plan_reader=None):
+    p = None
+    g = _grok_gutter(lines)
+    if g:
+        hint, inner, top = g
+        p = _parse_grok_approval(hint, inner, lines, top) or _parse_grok_question(hint, inner)
+    if p is None:
+        p = _parse_grok_plan(lines) or _parse_grok_trust(lines)
+    if p:
+        p["agent"] = "grok"
+    return p
+
+
+def _pick_grok(p, option_index):
+    """번호 없는 항목(계획 검토 a/q, 폴더 신뢰 y/n)은 글자 키. 번호 있는 항목은 기본(숫자 키 = 고르고 제출)."""
+    o = p["options"][option_index]
+    if o.get("number") is not None:
+        return None
+    k = GROK_LETTER_KEYS.get((p["kind"], o["label"]))
+    return [("keys", [k])] if k else None
+
+
+def _reject_keys_grok(p):
+    """승인 카드의 거절 버튼: "No, reject" 번호(숫자 키 = 고르고 제출, 턴이 끝난다. 실측). Esc는 거절이 아니다."""
+    row = next((o for o in p["options"] if o["label"] == GROK_REJECT and o.get("number")), None)
+    if p["kind"] != "approval" or row is None:
+        raise ApiError(409, "needs_manual", prompt=p)
+    return [str(row["number"])]
+
+
+def _free_text_grok(p, num, text):
+    """Grok(실측 1.0.77): 승인 거절 메모는 커서를 "No, reject" 줄로 옮기고 글자 하나(x)로 입력 칸을 연 뒤 지우고
+    붙여넣기+enter. 계획 수정 요청은 s(입력창으로) → 붙여넣기+enter. 옵션 있는 질문은 z(입력 칸으로, 글자로 안
+    들어감) → 붙여넣기+enter. 옵션 없는 질문은 커서가 이미 z 줄이라 z가 글자로 들어간다: enter(편집 시작) → 붙여넣기+enter."""
+    if p["kind"] == "approval":
+        keys = nav_keys(None if p.get("selected") is None else num(p["selected"]), num(p["free_text_index"]))
+        if keys is None:
+            raise ApiError(409, "no_cursor")
+        return [("keys", keys + ["x", "backspace"]), ("text", text)]
+    if p["kind"] == "plan":
+        return [("keys", ["s"]), ("text", text)]
+    if p["kind"] == "question":
+        return [("keys", ["enter" if len(p["options"]) == 1 else "z"]), ("text", text)]
+    raise ApiError(400, "no_free_text")
+
+
 def _parse_codex_lines(lines, plan_reader=None):
     return _parse_codex_approval(lines) or _parse_codex_question(lines) or _parse_codex_plan(lines)
 
@@ -2217,9 +2483,85 @@ def _parse_qwen_transcript(recs, limit):
     return turns[-limit:] if limit else turns, cut
 
 
+def _is_grok_record(rec):
+    """Grok updates.jsonl 줄: ACP `session/update`(또는 `_x.ai/session/update`) 알림 그대로. 다른 기록에는 method가 없다."""
+    return rec.get("method") in ("session/update", "_x.ai/session/update") and isinstance(rec.get("params"), dict)
+
+
+def _grok_tool_output(u):
+    raw = u.get("rawOutput")
+    if isinstance(raw, dict) and isinstance(raw.get("output_for_prompt"), str):
+        return raw["output_for_prompt"]
+    texts = []
+    for c in u.get("content") if isinstance(u.get("content"), list) else []:
+        inner = c.get("content") if isinstance(c, dict) and c.get("type") == "content" else None
+        if isinstance(inner, dict) and isinstance(inner.get("text"), str) and inner["text"]:
+            texts.append(inner["text"])
+    if texts:
+        return "\n".join(texts)
+    if raw is not None and not isinstance(raw, str):
+        return json.dumps(raw, ensure_ascii=False)
+    return raw
+
+
+def _parse_grok_transcript(recs, limit):
+    """Grok updates.jsonl(실측 1.0.77): user_message_chunk·agent_message_chunk·agent_thought_chunk(조각을 이어 붙인다),
+    tool_call(title=도구 이름, rawInput), tool_call_update(status completed|failed, rawOutput·content).
+    turn_completed·current_mode_update 등은 글을 끊기만 한다."""
+    turns, tools = [], {}
+    open_ = None  # (role, kind, 묶음 키), 이어 붙일 part
+
+    for rec in recs:
+        u = rec["params"].get("update")
+        if not isinstance(u, dict):
+            continue
+        su = u.get("sessionUpdate")
+        if su in ("user_message_chunk", "agent_message_chunk", "agent_thought_chunk"):
+            c = u.get("content")
+            t = c.get("text") if isinstance(c, dict) and c.get("type") == "text" else None
+            if not isinstance(t, str) or not t:
+                continue
+            role = "user" if su == "user_message_chunk" else "assistant"
+            kind = "thinking" if su == "agent_thought_chunk" else "text"
+            meta = u.get("_meta") if isinstance(u.get("_meta"), dict) else {}
+            key = (role, kind, meta.get("promptIndex") if role == "user" else None)
+            if open_ and open_[0] == key:
+                open_[1]["text"] = _cap(open_[1]["text"] + t)
+                continue
+            part = {"kind": kind, "text": _cap(t)}
+            _codex_add(turns, role, [part])
+            open_ = (key, part)
+            continue
+        open_ = None
+        tid = u.get("toolCallId")
+        if su == "tool_call":
+            name = u.get("title") if isinstance(u.get("title"), str) else "?"
+            inp = u.get("rawInput") if isinstance(u.get("rawInput"), dict) else {}
+            t = {"kind": "tool", "name": name, "summary": _tool_summary(name, inp), "input": _cap_obj(inp),
+                 "output": None, "state": "pending"}
+            if isinstance(tid, str):
+                tools[tid] = t
+            _codex_add(turns, "assistant", [t])
+        elif su == "tool_call_update" and u.get("status") in ("completed", "failed"):
+            t = tools.get(tid)
+            if t is None:
+                continue
+            v = _grok_tool_output(u)
+            t["output"] = _cap(_strip_ansi(v)) if isinstance(v, str) else None
+            raw = u.get("rawOutput") if isinstance(u.get("rawOutput"), dict) else {}
+            code = raw.get("exit_code")
+            bad = u["status"] == "failed" or (isinstance(code, int) and not isinstance(code, bool) and code != 0)
+            t["state"] = "error" if bad else "ok"
+    for turn in turns:
+        turn["parts"] = [p for p in turn["parts"] if p["kind"] == "tool" or p["text"].strip()]
+    turns = [t for t in turns if t["parts"]]
+    cut = len(turns) > limit
+    return turns[-limit:] if limit else turns, cut
+
+
 def parse_transcript(lines, limit=50):
     """Claude Code 세션 jsonl(또는 Codex rollout jsonl, Gemini chats jsonl, Copilot events.jsonl,
-    Qwen chats jsonl) 줄들 → (turns, 잘렸는지)."""
+    Qwen chats jsonl, Grok updates.jsonl) 줄들 → (turns, 잘렸는지)."""
     recs = []
     for line in lines:
         line = line.strip()
@@ -2231,6 +2573,8 @@ def parse_transcript(lines, limit=50):
             continue
         if isinstance(rec, dict):
             recs.append(rec)
+    if any(_is_grok_record(r) for r in recs[:50]):
+        return _parse_grok_transcript([r for r in recs if _is_grok_record(r)], limit)
     if any(_is_gemini_record(r) for r in recs[:50]):
         return _parse_gemini_transcript(recs, limit)
     if any(_is_copilot_record(r) for r in recs[:50]):
@@ -2867,6 +3211,115 @@ def opencode_preview(path, sid):
         _opencode_preview_cache.clear()
     _opencode_preview_cache[(path, sid)] = (key, pv)
     return pv
+
+
+def grok_dir(home):
+    env = os.environ.get("GROK_HOME")
+    return os.path.expanduser(env) if env else os.path.join(home, ".grok")
+
+
+def _grok_cwd_dirs(base, cwd):
+    """그 폴더의 세션 폴더들: $GROK_HOME/sessions/<URL 인코딩 cwd>(실측 1.0.77: `%2FUsers%2Fme%2Fwork%2Fdemo`).
+    인코딩이 조금 달라도 맞게 이름을 풀어 비교하고, 255바이트가 넘는 이름(slug+hash)은 안의 `.cwd` 파일로 맞춘다."""
+    want = {cwd, os.path.realpath(cwd)}
+    root = os.path.join(base, "sessions")
+    out = []
+    for c in want:
+        d = os.path.join(root, urllib.parse.quote(c, safe=""))
+        if d not in out and os.path.isdir(d) and not os.path.islink(d):
+            out.append(d)
+    if out:
+        return out
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return out
+    for name in names:
+        d = os.path.join(root, name)
+        if not os.path.isdir(d) or os.path.islink(d):
+            continue
+        if urllib.parse.unquote(name) in want:
+            out.append(d)
+            continue
+        try:
+            if read_regular_file(os.path.join(d, ".cwd"), 8192).decode("utf-8", "replace").strip() in want:
+                out.append(d)
+        except OSError:
+            continue
+    return out
+
+
+def _grok_updates(d):
+    """세션 폴더 → (session_id, updates.jsonl 경로) 또는 None."""
+    sid = os.path.basename(d)
+    path = os.path.join(d, "updates.jsonl")
+    if not SESSION_ID_RE.match(sid):
+        return None
+    try:
+        if not stat.S_ISREG(os.stat(path, follow_symlinks=False).st_mode):
+            return None
+    except OSError:
+        return None
+    return sid, path
+
+
+def _lsof_grok(pid, base, runner):
+    """grok이 세션 동안 열어 두는 `sessions/<cwd>/<id>/events.jsonl`(실측 1.0.77) → 그 세션의 updates.jsonl."""
+    exe = next((p for p in ("/usr/sbin/lsof", "/usr/bin/lsof") if os.path.exists(p)), None)
+    if not exe:
+        return None
+    try:
+        r = runner([exe, "-a", "-p", str(int(pid)), "-Fn"], capture_output=True, text=True,
+                   timeout=HC_TIMEOUT, shell=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    root = os.path.realpath(os.path.join(base, "sessions"))
+    for ln in (r.stdout or "").splitlines():
+        if not ln.startswith("n") or os.path.basename(ln[1:]) != "events.jsonl":
+            continue
+        d = os.path.dirname(ln[1:])
+        if os.path.realpath(os.path.dirname(os.path.dirname(d))) != root:
+            continue
+        hit = _grok_updates(d)
+        if hit:
+            return hit
+    return None
+
+
+def find_grok_transcript(info, home, runner=None):
+    """Grok 터미널 → (session_id, updates.jsonl 경로). 실측 1.0.77: $GROK_HOME(기본 ~/.grok)/sessions/<URL 인코딩 cwd>/
+    <세션 id>/updates.jsonl(ACP 알림 기록). 지금 세션은 grok이 열어 둔 events.jsonl(lsof)로, 못 보면 그 폴더의 최근 기록."""
+    info = info or {}
+    runner = runner or subprocess.run
+    base = grok_dir(home)
+    fg = info.get("foreground")
+    pids = [v for v in (info.get("pid"), fg.get("pid") if isinstance(fg, dict) else None)
+            if isinstance(v, int) and not isinstance(v, bool) and v > 0]
+    if not IS_WINDOWS:
+        for pid in dict.fromkeys(pids):
+            hit = _lsof_grok(pid, base, runner)
+            if hit:
+                return hit
+    cwd = live_cwd(info)
+    if not cwd:
+        return None, None
+    best = None
+    for cd in _grok_cwd_dirs(base, cwd):
+        try:
+            names = os.listdir(cd)
+        except OSError:
+            continue
+        for name in names:
+            hit = _grok_updates(os.path.join(cd, name))
+            if not hit:
+                continue
+            try:
+                mt = os.stat(hit[1], follow_symlinks=False).st_mtime
+            except OSError:
+                continue
+            if best is None or mt > best[0]:
+                best = (mt, hit)
+    return best[1] if best else (None, None)
 
 
 def find_agent_transcript(info, home, runner=None):
@@ -4644,6 +5097,7 @@ QWEN_PUSH_PROMPT_WAIT = 1.0
 #   pick(p, i)             (선택) 그 항목을 고르는 키 단계. None을 주면 숫자·커서 이동 기본 방식
 #   reject_keys(p)         (선택) reject_index가 없는 카드의 거절 키(기본 esc)
 #   approve_keys           (선택) 카드 없이(prompt_id 없이) 승인할 때 "1" 대신 보낼 키
+#   reject_status_keys     (선택) 카드 없이 거절할 때 esc 대신 보낼 키. None이면 거절을 앱에서 직접(409 needs_manual)
 #   read(path, sid, n)     (선택) 기록이 jsonl이 아닐 때 (turns, 잘렸는지). preview(path, sid)는 목록 미리보기
 AGENTS = {
     "claude": {"match": is_claude, "parse": _parse_claude_lines, "free_text": _free_text_digit,
@@ -4685,8 +5139,15 @@ AGENTS = {
                  "dialog_re": OPENCODE_DIALOG_RE, "pick": _pick_opencode, "reject_keys": _reject_keys_opencode,
                  "approve_keys": ["enter"],
                  "send_guard": True},
+    # Grok Build는 OSC 7501로 승인·계획·폴더 신뢰(permission)·질문(question)을 다 보낸다(실측 1.0.77): 덧씌우기 없음.
+    # 메뉴는 blocked 감지 직후(≤0.25초) 이미 다 그려져 있다. Esc는 거절이 아니라 포커스 이동(그 뒤 숫자 키 무시)이라
+    # 카드 없는 거절에 esc를 보내지 않는다.
+    "grok": {"match": _named("grok"), "parse": _parse_grok_lines, "free_text": _free_text_grok,
+             "transcript": lambda info, home, runner=None: find_grok_transcript(info, home, runner=runner),
+             "push_wait": lambda: PUSH_PROMPT_BUDGET, "retry": False, "screen": None,
+             "pick": _pick_grok, "reject_keys": _reject_keys_grok, "reject_status_keys": None, "send_guard": True},
 }
-AGENT_ORDER = ("claude", "codex", "gemini", "copilot", "qwen", "opencode")
+AGENT_ORDER = ("claude", "codex", "gemini", "copilot", "qwen", "opencode", "grok")
 SCREEN_POLL_INTERVAL = 3.0  # "full" 에이전트 화면 판정 주기(초). 제목 이벤트가 먼저 오면 그때 바로 본다
 SCREEN_SETTLE = 0.6  # 제목은 막힘인데 메뉴를 못 읽었을 때 다시 볼 때까지(초)
 PROMPT_STATUS_KINDS = {"approval": "permission", "confirm": "permission", "question": "question", "plan": "plan"}
@@ -5426,6 +5887,12 @@ class App:
         with self.term_lock(tid):
             info = self.require_claude(tid)
             keys = decide_answer(self.effective_info(tid, info), action, expect)
+            spec = agent_spec(agent_kind(info))
+            if action == "reject" and "reject_status_keys" in spec:
+                keys = spec["reject_status_keys"]  # esc가 거절이 아닌 에이전트(Grok: 포커스만 옮긴다)
+                if not keys:
+                    raise ApiError(409, "needs_manual", msg=status_of(self.effective_info(tid, info)).get("msg"))
+                keys = list(keys)
             if keys == ["1"]:
                 keys = list(agent_spec(agent_kind(info)).get("approve_keys") or keys)  # 숫자 키를 무시하는 승인 메뉴
             self._keys(tid, keys)
