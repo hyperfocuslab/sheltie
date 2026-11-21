@@ -5150,9 +5150,14 @@ def terminal_preview(info, home, runner=None, now=None):
 
 # ---------------------------------------------------------------- 폴더
 
-# 홈 바로 아래에서 폴더 목록에 안 보이는 것(Finder도 숨긴다. 에이전트를 여기서 시작할 일이 없다)
+# 홈 바로 아래에서 폴더 목록에 안 보이는 것(Finder도 숨긴다. 에이전트를 여기서 시작할 일이 없다).
+# Library는 macOS, AppData는 Windows에만 있는 시스템 폴더다. 리눅스에서는 같은 이름의 사용자 폴더일 수 있다.
 def hidden_home_dirs():
-    return frozenset({"Library", "AppData"}) if IS_WINDOWS else frozenset({"Library"})
+    if IS_WINDOWS:
+        return frozenset({"AppData"})
+    if sys.platform == "darwin":
+        return frozenset({"Library"})
+    return frozenset()
 
 
 HIDDEN_HOME_DIRS = hidden_home_dirs()
@@ -5205,11 +5210,12 @@ def rel_to_home(p, home):
 # ---------------------------------------------------------------- 파일 보기·첨부
 #
 # 파일 보기(GET /api/files, /api/files/raw)는 폴더 고르기(/api/folders)와 같은 경로 검사에 더해
-# 홈 바로 아래 Library(Windows는 AppData도)를 통째로 막는다. 키체인·메일·메시지·브라우저 프로필이 거기 있다.
+# 홈 바로 아래 Library(macOS)·AppData(Windows)를 통째로 막는다. 키체인·메일·메시지·브라우저 프로필이 거기 있다.
 # 맥 기본 파일 시스템은 대소문자를 가리지 않으므로 "library"도 막는다.
 # 첨부(POST /api/uploads)는 ~/.sheltie/uploads/<날짜>/에만 쓴다(점 폴더라 파일 보기로는 안 보인다).
 
 FILE_MAX = 32 * 1024 * 1024
+FILE_IO_TIMEOUT = 60  # 업로드·다운로드 소켓: 이만큼 진전이 없으면 끊는다(초)
 FILES_LIST_MAX = 1000
 UPLOAD_NAME_MAX = 80
 
@@ -5321,8 +5327,60 @@ def upload_dir(home, day):
     return d
 
 
+UPLOAD_KEEP_DAYS = 7
+_UPLOAD_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_last_prune_day = None
+_prune_lock = threading.Lock()
+
+
+def prune_uploads(home, now=None, keep_days=UPLOAD_KEEP_DAYS):
+    """~/.sheltie/uploads/ 아래 keep_days일 지난 날짜 폴더를 지운다. 링크는 따라가지도 지우지도 않는다."""
+    now = time.time() if now is None else now
+    cutoff = time.strftime("%Y-%m-%d", time.localtime(now - keep_days * 86400))
+    d = home
+    for part in (".sheltie", "uploads"):
+        d = os.path.join(d, part)
+        try:
+            st_ = os.lstat(d)
+        except OSError:
+            return
+        if not stat.S_ISDIR(st_.st_mode) or (IS_WINDOWS and is_reparse_point(d)):
+            return
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return
+    for name in names:
+        if not _UPLOAD_DAY_RE.match(name) or name >= cutoff:
+            continue
+        p = os.path.join(d, name)
+        try:
+            st_ = os.lstat(p)
+        except OSError:
+            continue
+        if not stat.S_ISDIR(st_.st_mode) or (IS_WINDOWS and is_reparse_point(p)):
+            continue
+        # rmtree는 안쪽 링크를 따라가지 않고 링크만 지운다
+        shutil.rmtree(p, ignore_errors=True)
+
+
+def _prune_uploads_daily(home):
+    """업로드 때 하루 한 번만 정리한다. 정리 실패는 업로드를 막지 않는다."""
+    global _last_prune_day
+    today = time.strftime("%Y-%m-%d")
+    with _prune_lock:
+        if _last_prune_day == today:
+            return
+        _last_prune_day = today
+    try:
+        prune_uploads(home)
+    except Exception:  # noqa: BLE001
+        log.exception("첨부 폴더 정리 실패")
+
+
 def save_upload(home, name, length, rfile, day=None):
     """POST /api/uploads 본문 length 바이트를 새 파일에 쓴다. 덜 오면 지우고 400."""
+    _prune_uploads_daily(home)
     safe = sanitize_upload_name(name)
     d = upload_dir(home, day or time.strftime("%Y-%m-%d"))
     path = os.path.join(d, "%s-%s" % (secrets.token_hex(4), safe))
@@ -9234,27 +9292,44 @@ class Handler(http.server.BaseHTTPRequestHandler):
             raise ApiError(400, "bad_json")
         return body
 
+    def _io_timeout(self):
+        """업로드·다운로드 동안 소켓 timeout(진전 없는 시간). 이전 값을 돌려준다."""
+        prev = self.connection.gettimeout()
+        self.connection.settimeout(FILE_IO_TIMEOUT)
+        return prev
+
     def _reply_file(self, fd, size, real):
-        """파일 바이트를 그대로. 여는 사이 파일이 줄면 연결을 끊어 앱이 덜 받은 것을 알게 한다."""
+        """파일 바이트를 그대로. 여는 사이 파일이 줄면 연결을 끊어 앱이 덜 받은 것을 알게 한다.
+        헤더를 보낸 뒤의 오류(timeout·읽기 오류·앱이 닫음)는 JSON을 덧붙이지 않고 연결만 닫는다."""
         ctype = mimetypes.guess_type(os.path.basename(real))[0] or "application/octet-stream"
-        with os.fdopen(fd, "rb") as f:
-            self.send_response(200)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(size))
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("X-Content-Type-Options", "nosniff")
-            self.end_headers()
-            left = size
+        prev = self._io_timeout()
+        try:
+            with os.fdopen(fd, "rb") as f:
+                self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(size))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                left = size
+                try:
+                    while left > 0:
+                        b = f.read(min(left, 1 << 20))
+                        if not b:
+                            self.close_connection = True
+                            break
+                        self.wfile.write(b)
+                        left -= len(b)
+                except (BrokenPipeError, ConnectionResetError):  # 앱이 받다가 닫음(미리보기 취소)
+                    self.close_connection = True
+                except Exception:  # noqa: BLE001  timeout·읽기 오류: 이미 200을 보냈으니 끊기만
+                    log.warning("파일 전송 중단: %s", os.path.basename(real), exc_info=True)
+                    self.close_connection = True
+        finally:
             try:
-                while left > 0:
-                    b = f.read(min(left, 1 << 20))
-                    if not b:
-                        self.close_connection = True
-                        break
-                    self.wfile.write(b)
-                    left -= len(b)
-            except (BrokenPipeError, ConnectionResetError):  # 앱이 받다가 닫음(미리보기 취소)
-                self.close_connection = True
+                self.connection.settimeout(prev)
+            except OSError:
+                pass
 
     def _upload(self, app, query):
         """POST /api/uploads?name=: 본문이 파일 바이트. Content-Length 필수, FILE_MAX까지."""
@@ -9272,9 +9347,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 raise ApiError(400, "empty")
             if n > FILE_MAX:
                 raise ApiError(413, "too_large", max=FILE_MAX)
-            res = app.api_upload((query.get("name") or [""])[0], n, self.rfile)
-        except ApiError:
-            self.close_connection = True  # 안 읽은 본문이 다음 요청으로 읽히지 않게
+            prev = self._io_timeout()
+            try:
+                res = app.api_upload((query.get("name") or [""])[0], n, self.rfile)
+            finally:
+                try:
+                    self.connection.settimeout(prev)
+                except OSError:
+                    pass
+        except BaseException:
+            # 안 읽은 본문이 다음 요청으로 읽히지 않게(ApiError·timeout·OSError 모두). 부분 파일은 save_upload가 지운다.
+            self.close_connection = True
             raise
         return self._reply(200, res)
 

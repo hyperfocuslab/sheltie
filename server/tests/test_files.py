@@ -255,5 +255,150 @@ class FilesHttpTests(unittest.TestCase):
         self.assertEqual(sorted(os.listdir(self.outside)), ["passwd"])
 
 
+    # --- 보안 리뷰 6~10
+    def _raw_conn(self):
+        import socket
+        c = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        self.addCleanup(c.close)
+        return c
+
+    def _read_all(self, c, limit=5.0):
+        import socket
+        c.settimeout(limit)
+        out = b""
+        try:
+            while True:
+                b = c.recv(65536)
+                if not b:
+                    break
+                out += b
+        except socket.timeout:
+            pass
+        return out
+
+    def _upload_dir(self):
+        return os.path.join(self.home, ".sheltie", "uploads", time.strftime("%Y-%m-%d"))
+
+    def test_stalled_upload_times_out_and_removes_partial(self):
+        """6: 본문이 멈춘 업로드는 timeout 뒤 부분 파일을 지우고 연결을 닫는다."""
+        with mock.patch.object(hr, "FILE_IO_TIMEOUT", 0.5):
+            c = self._raw_conn()
+            c.sendall(b"POST /api/uploads?name=a.bin HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer " + TOKEN.encode()
+                      + b"\r\nContent-Length: 100\r\n\r\n" + b"x" * 10)
+            deadline = time.time() + 3
+            d = self._upload_dir()
+            while time.time() < deadline:
+                if os.path.isdir(d) and not os.listdir(d):
+                    break
+                time.sleep(0.05)
+            self.assertTrue(os.path.isdir(d))
+            self.assertEqual(os.listdir(d), [])
+            data = self._read_all(c, 3)
+            self.assertLessEqual(data.count(b"HTTP/1.1 "), 1)
+
+    def test_stalled_download_times_out(self):
+        """6: 받지 않는 다운로드는 timeout 뒤 연결을 끊는다(스레드가 영원히 붙잡히지 않게)."""
+        import socket
+        size = 24 * 1024 * 1024
+        with open(os.path.join(self.home, "proj", "big.bin"), "wb") as f:
+            f.write(b"\0" * size)
+        with mock.patch.object(hr, "FILE_IO_TIMEOUT", 0.3):
+            c = socket.socket()
+            self.addCleanup(c.close)
+            c.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+            c.connect(("127.0.0.1", self.port))
+            c.sendall(b"GET /api/files/raw?path=proj/big.bin HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer "
+                      + TOKEN.encode() + b"\r\n\r\n")
+            time.sleep(2)
+            data = self._read_all(c, 3)
+        head, _, body = data.partition(b"\r\n\r\n")
+        self.assertIn(b"200", head.split(b"\r\n")[0])
+        self.assertLess(len(body), size)
+
+    def test_upload_os_error_closes_connection(self):
+        """8: 업로드 중 OSError면 남은 본문이 다음 요청으로 읽히지 않게 연결을 닫는다."""
+        def boom(*a, **k):
+            raise OSError("disk")
+        with mock.patch.object(hr, "upload_dir", boom):
+            c = self._raw_conn()
+            c.sendall(b"POST /api/uploads?name=a.bin HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer " + TOKEN.encode()
+                      + b"\r\nContent-Length: 20\r\n\r\n" + b"GARBAGE-GARBAGE-12\r\n")
+            data = self._read_all(c, 3)
+        self.assertEqual(data.count(b"HTTP/1.1 "), 1, data)
+        self.assertIn(b"500", data.split(b"\r\n")[0])
+
+    def test_raw_error_after_headers_just_closes(self):
+        """9: 헤더를 보낸 뒤 읽기 오류면 JSON 500을 덧붙이지 않고 연결만 닫는다."""
+        self.write("proj/mid.bin", b"A" * (3 << 20))
+        real = os.fdopen
+
+        class Bad:
+            def __init__(self, f):
+                self.f, self.n = f, 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                self.f.close()
+
+            def read(self, k):
+                self.n += 1
+                if self.n > 1:
+                    raise OSError("io")
+                return self.f.read(k)
+
+        def fake_fdopen(fd, *a, **k):
+            return Bad(real(fd, *a, **k))
+        with mock.patch.object(hr.os, "fdopen", fake_fdopen):
+            c = self._raw_conn()
+            c.sendall(b"GET /api/files/raw?path=proj/mid.bin HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer "
+                      + TOKEN.encode() + b"\r\n\r\n")
+            data = self._read_all(c, 3)
+        self.assertEqual(data.count(b"HTTP/1.1 "), 1)
+        self.assertNotIn(b"internal", data)
+        self.assertLess(len(data.partition(b"\r\n\r\n")[2]), 3 << 20)
+
+    def test_prune_uploads_removes_old_day_dirs_only(self):
+        """7: 7일 지난 날짜 폴더만 지운다. 링크는 따라가지 않는다."""
+        base = os.path.join(self.home, ".sheltie", "uploads")
+        for day in ("2026-11-01", "2026-11-13", "2026-11-14", "2026-11-21", "notes"):
+            os.makedirs(os.path.join(base, day))
+            with open(os.path.join(base, day, "f"), "wb") as f:
+                f.write(b"x")
+        # 오래된 날짜 이름의 링크: 링크만 처리하고 대상은 건드리지 않는다
+        os.symlink(self.outside, os.path.join(base, "2026-10-01"))
+        # 오래된 폴더 안 링크도 따라가지 않는다
+        os.symlink(self.outside, os.path.join(base, "2026-11-01", "out"))
+        now = time.mktime((2026, 11, 21, 12, 0, 0, 0, 0, -1))
+        hr.prune_uploads(self.home, now=now)
+        self.assertEqual(sorted(os.listdir(base)), ["2026-10-01", "2026-11-14", "2026-11-21", "notes"]
+                         if os.path.islink(os.path.join(base, "2026-10-01")) else
+                         ["2026-11-14", "2026-11-21", "notes"])
+        self.assertEqual(sorted(os.listdir(self.outside)), ["passwd"])
+
+    def test_prune_uploads_skips_symlinked_base(self):
+        os.makedirs(os.path.join(self.outside, "uploads", "2020-01-01"))
+        os.makedirs(os.path.join(self.home, ".sheltie"))
+        os.symlink(os.path.join(self.outside, "uploads"), os.path.join(self.home, ".sheltie", "uploads"))
+        hr.prune_uploads(self.home)
+        self.assertTrue(os.path.isdir(os.path.join(self.outside, "uploads", "2020-01-01")))
+
+    def test_upload_prunes_old_days(self):
+        old = os.path.join(self.home, ".sheltie", "uploads", "2000-01-01")
+        os.makedirs(old)
+        hr._last_prune_day = None
+        self.assertEqual(self.upload("a.txt", b"x")[0], 200)
+        self.assertFalse(os.path.exists(old))
+
+    def test_hidden_home_dirs_per_platform(self):
+        """10: Library는 macOS에서만, AppData는 Windows에서만 막는다."""
+        cases = [(False, "darwin", {"Library"}), (True, "win32", {"AppData"}), (False, "linux", set())]
+        for win, plat, want in cases:
+            with self.subTest(plat=plat), mock.patch.object(hr, "IS_WINDOWS", win), \
+                    mock.patch.object(hr.sys, "platform", plat):
+                self.assertEqual(set(hr.hidden_home_dirs()), want)
+
+
 if __name__ == "__main__":
     unittest.main()
