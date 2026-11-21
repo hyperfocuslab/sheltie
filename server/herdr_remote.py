@@ -137,6 +137,12 @@ PUSH_STATUS_FILE = "push_status.json"
 PUSH_FAILING_WINDOW_MS = 24 * 3600 * 1000
 PUSH_LOG_MAX_DEVICES = 64
 PUSH_TEST_MIN_GAP = 10.0  # 같은 기기 시험 알림 최소 간격(초)
+LIVE_ACTIVITY_FILE = "live_activity.json"
+LIVE_ACTIVITY_MIN_GAP = 5.0  # 같은 기기 Live Activity 푸시 최소 간격(초). 그 안의 변화는 한 번으로 합친다
+LIVE_ACTIVITY_START_WAIT = 60.0  # start를 보낸 뒤 앱이 Activity 토큰을 올릴 때까지 다시 start하지 않는 시간(초)
+LIVE_ACTIVITY_ATTRIBUTES_TYPE = "SheltieActivityAttributes"  # 앱 확장의 ActivityAttributes 타입 이름
+LIVE_ACTIVITY_TTL = 3600  # 갱신 푸시 유효기간(초)
+LIVE_ACTIVITY_END_LINGER = 5  # 끝(end) 뒤 잠금화면에 남기는 시간(초)
 
 ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 DEVICE_TOKEN_RE = re.compile(r"^[0-9a-fA-F]{32,200}$")
@@ -5850,20 +5856,28 @@ class ApnsPusher:
     def send_one(self, device, payload, ttl=None):
         """반환: (http_code, reason). 토큰·JWT는 argv가 아니라 stdin의 curl 설정으로 넘긴다.
         ttl(초)을 안 주면 알림 종류로 정한다(push_ttl)."""
+        if ttl is None:
+            ttl = push_ttl(payload)
+        return self._apns_post(device, device["token"], payload, ttl, self.cfg["topic"], "alert", 10)
+
+    def send_live_activity(self, device, token, payload, priority=10, ttl=LIVE_ACTIVITY_TTL):
+        """Live Activity 푸시. token은 Activity 푸시 토큰 또는 push-to-start 토큰, device는 앱의 일반 기기 항목.
+        topic은 번들 ID + ".push-type.liveactivity"로 고정. 반환: (http_code, reason)."""
+        return self._apns_post(device, token, payload, ttl, self.cfg["topic"] + ".push-type.liveactivity",
+                               "liveactivity", priority)
+
+    def _apns_post(self, device, tok, payload, ttl, topic, push_type, priority):
         hosts = self.cfg.get("apns_hosts") or DEFAULTS["apns_hosts"]
         env = device.get("env") if device.get("env") in ("sandbox", "production") else "sandbox"
         base = (hosts.get(env) or DEFAULTS["apns_hosts"][env]).rstrip("/")
         if not base.startswith("https://"):
             raise ValueError("apns host must be https")
-        tok = device["token"]
-        if ttl is None:
-            ttl = push_ttl(payload)
         body = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
         conf = "\n".join([
             "url = " + _curl_quote("%s/3/device/%s" % (base, tok)),
-            "header = " + _curl_quote("apns-topic: %s" % self.cfg["topic"]),
-            "header = " + _curl_quote("apns-push-type: alert"),
-            "header = " + _curl_quote("apns-priority: 10"),
+            "header = " + _curl_quote("apns-topic: %s" % topic),
+            "header = " + _curl_quote("apns-push-type: %s" % push_type),
+            "header = " + _curl_quote("apns-priority: %d" % priority),
             "header = " + _curl_quote("apns-expiration: %d" % (int(self.clock()) + ttl)),
             "header = " + _curl_quote("authorization: bearer %s" % self.jwt()),
             "data = " + _curl_quote(body),
@@ -6056,6 +6070,20 @@ class RelayPusher(ApnsPusher):
             ttl = push_ttl(payload)
         body = json.dumps({"device_token": tok, "env": env, "relay_sig": sig, "collapse_id": cid, "ttl": int(ttl),
                            "payload": payload}, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+        return self._post_with_retry(tok, body)
+
+    def send_live_activity(self, device, token, payload, priority=10, ttl=LIVE_ACTIVITY_TTL):
+        """Live Activity 푸시를 중계로. 서명은 token이 아니라 앱의 일반 기기 토큰(auth_token)용이다."""
+        sig = device.get("relay_sig")
+        if not sig:
+            return 0, "no_relay_sig"
+        env = device.get("env") if device.get("env") in APNS_ENVS else "sandbox"
+        body = json.dumps({"push_type": "liveactivity", "device_token": token, "auth_token": device["token"],
+                           "env": env, "relay_sig": sig, "priority": int(priority), "ttl": int(ttl),
+                           "payload": payload}, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+        return self._post_with_retry(token, body)
+
+    def _post_with_retry(self, tok, body):
         status, data = self._post(body)
         if 500 <= status < 600:
             # 중계·APNs 쪽 일시 오류: 같은 collapse_id로 한 번만 다시(중계가 apns-collapse-id로 중복을 합친다).
@@ -6097,6 +6125,7 @@ class Tracker:
         self.last = {}
         self.done_turn = {}
         self.claude_seen = {}
+        self.names = {}
 
     def observe(self, tid, status, turn=None, name=None, initial=False):
         status = status or {}
@@ -6105,6 +6134,8 @@ class Tracker:
         with self.lock:
             prev = self.last.get(tid)
             self.last[tid] = key
+            if name:
+                self.names[tid] = name
             if prev == key:
                 return None
             if self.reminders is not None:
@@ -6144,9 +6175,15 @@ class Tracker:
         self.notify(payload)
         return payload
 
+    def blocked_items(self):
+        """지금 막힌 터미널 [(tid, 이름, 막힘 msg)]."""
+        with self.lock:
+            return [(tid, self.names.get(tid), key[1]) for tid, key in self.last.items() if key[0] == "blocked"]
+
     def forget(self, tid):
         with self.lock:
             self.last.pop(tid, None)
+            self.names.pop(tid, None)
             self.done_turn.pop(tid, None)
         if self.reminders is not None:
             self.reminders.cancel(tid)
@@ -6946,6 +6983,223 @@ def _card_status(p):
     return {"state": "blocked", "kind": PROMPT_STATUS_KINDS.get(p["kind"], "question"), "msg": msg[:200] if msg else None}
 
 
+# ---------------------------------------------------------------- Live Activity
+
+class LiveActivityStore:
+    """기기별 Live Activity 토큰. 키는 앱의 일반 APNs 기기 토큰(DeviceStore와 같은 값).
+    start_token: iOS 17.2+ push-to-start 토큰(앱이 꺼져 있어도 Activity를 시작시킨다).
+    activity_token: 돌고 있는 Activity의 푸시 토큰(없으면 Activity가 없다)."""
+
+    def __init__(self, path=None):
+        self.path = path
+        self.lock = threading.Lock()
+        self.data = self._load()
+
+    def _load(self):
+        if not self.path:
+            return {}
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                raw = json.load(f)
+            return {k: v for k, v in raw.items() if isinstance(v, dict)} if isinstance(raw, dict) else {}
+        except (FileNotFoundError, ValueError):
+            return {}
+
+    def _save(self):
+        if self.path:
+            write_private(self.path, self.data)
+
+    def get(self, device):
+        with self.lock:
+            e = self.data.get(device)
+            return dict(e) if e else None
+
+    def items(self):
+        with self.lock:
+            return [(k, dict(v)) for k, v in self.data.items()]
+
+    def set(self, device, **fields):
+        """start_token·activity_token을 정한다. 값이 None이면 지운다. 둘 다 없어지면 항목을 지운다."""
+        with self.lock:
+            e = self.data.setdefault(device, {})
+            for k in ("start_token", "activity_token"):
+                if k in fields:
+                    if fields[k] is None:
+                        e.pop(k, None)
+                    elif e.get(k) != fields[k]:
+                        e[k] = fields[k]
+                        if k == "activity_token":
+                            e.pop("started_at", None)
+            if not e.get("start_token") and not e.get("activity_token"):
+                self.data.pop(device, None)
+            self._save()
+
+    def mark_started(self, device, wall):
+        with self.lock:
+            if device in self.data:
+                self.data[device]["started_at"] = wall
+                self._save()
+
+    def remove_device(self, device):
+        with self.lock:
+            if self.data.pop(device, None) is not None:
+                self._save()
+                return True
+            return False
+
+
+def live_activity_state(blocked, now_s):
+    """막힘 목록 [(tid, 이름, msg, since_ms)]에서 content-state. 가장 오래 막힌 것이 대표.
+    키 이름은 앱 확장의 SheltieActivityAttributes.ContentState와 같아야 한다(Date가 아니라 정수 초·ms)."""
+    state = {"blockedCount": len(blocked), "oldestTerminal": "", "oldestName": "", "oldestSummary": "",
+             "oldestSinceMs": 0, "updatedAt": int(now_s)}
+    if blocked:
+        tid, name, msg, since = min(blocked, key=lambda b: b[3])
+        state.update(oldestTerminal=tid, oldestName=(name or tid)[:60], oldestSummary=(msg or "")[:120],
+                     oldestSinceMs=int(since))
+    return state
+
+
+def live_activity_signature(state):
+    """바뀌었는지 판단하는 값. updatedAt은 뺀다."""
+    return (state["blockedCount"], state["oldestTerminal"], state["oldestName"], state["oldestSummary"])
+
+
+def live_activity_action(entry, state, last_sig, last_at, now, min_gap=LIVE_ACTIVITY_MIN_GAP,
+                         start_wait=LIVE_ACTIVITY_START_WAIT):
+    """이 기기에 지금 무엇을 보낼지. "start" | "update" | "end" | "wait"(최소 간격 때문에 미룸) | None(할 일 없음).
+    now·last_at·entry["started_at"]은 같은 시계(초)."""
+    n = state["blockedCount"]
+    if entry.get("activity_token"):
+        if n == 0:
+            action = "end"
+        elif live_activity_signature(state) != last_sig:
+            action = "update"
+        else:
+            return None
+    elif n > 0 and entry.get("start_token") and now - entry.get("started_at", -1e18) >= start_wait:
+        action = "start"
+    else:
+        return None
+    if last_at is not None and now - last_at < min_gap:
+        return "wait"
+    return action
+
+
+def live_activity_payload(action, state, now_s, pc_name=None, server=None):
+    aps = {"timestamp": int(now_s), "event": action, "content-state": state}
+    if action == "start":
+        aps["attributes-type"] = LIVE_ACTIVITY_ATTRIBUTES_TYPE
+        aps["attributes"] = {"pcName": pc_name or "", "serverTag": server or ""}
+        aps["alert"] = {"title": pc_name or "Sheltie", "body": state["oldestName"] or "Input needed"}
+    elif action == "end":
+        aps["dismissal-date"] = int(now_s) + LIVE_ACTIVITY_END_LINGER
+    return {"aps": aps}
+
+
+class LiveActivityManager:
+    """막힘 수가 바뀌면 등록된 Live Activity에 start/update/end를 APNs(또는 중계)로 보낸다.
+    기기마다 최소 간격(5초) 안의 변화는 하나로 합치고, 간격이 지나면 그때 상태로 한 번 더 확인한다."""
+
+    def __init__(self, tracker, store, devices, pusher, pc_name=None, server=None, wall=time.time,
+                 later=None, min_gap=LIVE_ACTIVITY_MIN_GAP):
+        self.tracker = tracker
+        self.store = store
+        self.devices = devices
+        self.pusher = pusher
+        self.pc_name = pc_name
+        self.server = server
+        self.wall = wall
+        self.later = later or (lambda sec, fn: threading.Timer(sec, fn).start())
+        self.min_gap = min_gap
+        self.lock = threading.RLock()
+        self.since = {}  # tid → 막힘이 처음 보인 시각(ms)
+        self.sent = {}  # 기기 → (signature, 보낸 시각(초))
+        self.timer_set = False
+
+    def _blocked(self, now):
+        now_ms = int(now * 1000)
+        items = self.tracker.blocked_items()
+        live = {i[0] for i in items}
+        for tid in list(self.since):
+            if tid not in live:
+                del self.since[tid]
+        return [(tid, name, msg, self.since.setdefault(tid, now_ms)) for tid, name, msg in items]
+
+    def forget_device(self, dev):
+        with self.lock:
+            self.sent.pop(dev, None)
+
+    def sync(self):
+        """보낸 [(기기 짧은 id, action)]를 돌려준다(시험용)."""
+        sent = []
+        wait = None
+        with self.lock:
+            entries = self.store.items()
+            now = self.wall()
+            if not entries:
+                self.sent.clear()
+                self.since.clear()
+                return sent
+            state = live_activity_state(self._blocked(now), now)
+            known = {d["token"]: d for d in self.devices.list()}
+            for dev, entry in entries:
+                d = known.get(dev)
+                if d is None or d.get("env") not in APNS_ENVS:
+                    self.store.remove_device(dev)
+                    self.sent.pop(dev, None)
+                    continue
+                prev = self.sent.get(dev)
+                act = live_activity_action(entry, state, prev[0] if prev else None, prev[1] if prev else None,
+                                           now, min_gap=self.min_gap)
+                if act == "wait":
+                    left = self.min_gap - (now - prev[1]) + 0.05
+                    wait = left if wait is None else max(wait, left)
+                    continue
+                if act is None:
+                    continue
+                self._send(dev, d, entry, act, state, now)
+                sent.append((short_token(dev), act))
+            if wait is not None and not self.timer_set:
+                self.timer_set = True
+                self.later(wait, self._trailing)
+        return sent
+
+    def _trailing(self):
+        with self.lock:
+            self.timer_set = False
+        try:
+            self.sync()
+        except Exception:  # noqa: BLE001
+            log.exception("Live Activity 합치기 발송 오류")
+
+    def _send(self, dev, d, entry, act, state, now):
+        token = entry["start_token"] if act == "start" else entry["activity_token"]
+        payload = live_activity_payload(act, state, now, self.pc_name, self.server)
+        send = getattr(self.pusher, "send_live_activity", None)
+        if send is None:
+            return
+        self.sent[dev] = (live_activity_signature(state), now)  # 실패해도 최소 간격은 지킨다
+        try:
+            code, reason = send(d, token, payload, 10)
+        except Exception as e:  # noqa: BLE001 - 한 기기 실패가 다른 기기를 막지 않게
+            log.warning("Live Activity %s %s 실패: %s", short_token(dev), act, type(e).__name__)
+            return
+        if code == 200:
+            log.info("Live Activity %s %s 200", short_token(dev), act)
+            if act == "start":
+                self.store.mark_started(dev, now)
+            elif act == "end":
+                self.store.set(dev, activity_token=None)
+        elif code == 410 or reason in ("BadDeviceToken", "Unregistered", "ExpiredToken"):
+            self.store.set(dev, **({"start_token": None} if act == "start" else {"activity_token": None}))
+            log.info("Live Activity %s: %d %s, 토큰 삭제", short_token(dev), code, reason)
+        elif reason == "relay:bad_sig":
+            self.devices.mark_relay_sig_bad(d["token"], d.get("relay_sig"))
+        else:
+            log.warning("Live Activity %s %s: %d %s", short_token(dev), act, code, reason)
+
+
 class App:
     def __init__(self, cfg, hc, devices, pusher, runner=None, clock=time.monotonic, push_log=None):
         self.cfg = cfg
@@ -6980,6 +7234,11 @@ class App:
         self._card_states = {}  # card_status 에이전트: tid → 이번 막힘에서 마지막으로 읽은 카드 status
         self.tracker = Tracker(self._notify, prompt_for=self._prompt_for_push, reminders=self.reminders)
         self.blocked_since = BlockedSince()
+        self.live_activity = LiveActivityStore(
+            os.path.join(cfg["_dir"], LIVE_ACTIVITY_FILE) if cfg.get("_dir") else None)
+        self.live_activity_mgr = LiveActivityManager(
+            self.tracker, self.live_activity, devices, pusher, pc_name=machine_name(),
+            server=server_tag(cfg.get("token")), later=lambda sec, fn: self._later(sec, fn))
         self.branches = BranchCache()
         self.agent_catalog = AgentCatalog(self.home)
         self._refresh_lock = threading.Lock()
@@ -6996,6 +7255,12 @@ class App:
         # refresh 잠금 안에서 불리므로 모았다가 잠금 밖에서 보낸다. 감지 시각을 같이 둔다.
         self._pending.append((payload, self._detected if self._detected is not None else self.clock()))
 
+    def sync_live_activity(self):
+        try:
+            self.live_activity_mgr.sync()
+        except Exception:  # noqa: BLE001
+            log.exception("Live Activity 오류")
+
     def _flush(self):
         pending, self._pending = self._pending, []
         for p, t0 in pending:
@@ -7005,6 +7270,7 @@ class App:
                 log.exception("푸시 오류")
             log.info("알림 %s %s %s 감지→발송 %dms", p["terminal"], p["state"], p["aps"]["category"],
                      int((self.clock() - t0) * 1000))
+        self.sync_live_activity()
 
     def parse_screen(self, text, agent=None, tid=None, info=None):
         reader = self.plan_reader
@@ -7306,6 +7572,7 @@ class App:
             self._card_states.pop(tid, None)
         for tid in self.tracker.known_claude() - live:
             self.exited(tid)
+        self.sync_live_activity()  # 사라진 터미널로 막힘 수가 줄었을 수 있다
 
     def check_reminders(self):
         """막힘이 계속된 터미널에 재알림. 카드는 그때 화면을 다시 읽어 새로 만든다."""
@@ -8089,7 +8356,56 @@ class App:
             raise ApiError(400, "bad_token")
         # APNs 토큰은 소문자로, FCM 토큰은 그대로 저장돼 있다.
         removed = self.devices.remove(tok) or self.devices.remove(tok.lower())
+        self.live_activity.remove_device(tok.lower())
         return {"ok": True, "removed": removed}
+
+    def api_live_activity(self, body):
+        """앱이 Live Activity 토큰을 올린다. device: 앱의 일반 APNs 기기 토큰(먼저 /api/devices로 등록돼 있어야 한다),
+        start_token: push-to-start 토큰, activity_token: 돌고 있는 Activity의 푸시 토큰. 키가 있고 null이면 지운다."""
+        dev = body.get("device")
+        if not isinstance(dev, str) or not DEVICE_TOKEN_RE.match(dev):
+            raise ApiError(400, "bad_token")
+        dev = dev.lower()
+        fields = {}
+        for k in ("start_token", "activity_token"):
+            if k not in body:
+                continue
+            v = body[k]
+            if v is None:
+                fields[k] = None
+            elif isinstance(v, str) and DEVICE_TOKEN_RE.match(v):
+                fields[k] = v.lower()
+            else:
+                raise ApiError(400, "bad_token")
+        if not fields:
+            raise ApiError(400, "bad_request")
+        d = next((x for x in self.devices.list() if x["token"] == dev), None)
+        if d is None or d.get("env") not in APNS_ENVS:
+            raise ApiError(404, "unknown_device")
+        self.live_activity.set(dev, **fields)
+        log.info("Live Activity 등록 %s %s", short_token(dev), ",".join(sorted(fields)))
+        if fields.get("activity_token"):
+            # 새 Activity가 바로 현재 상태를 보이게 한다(최소 간격 안이면 합쳐진다).
+            self.live_activity_mgr.forget_device(dev)
+        self.sync_live_activity()
+        return {"ok": True}
+
+    def api_delete_live_activity(self, body):
+        """device만 주면 그 기기의 Live Activity 토큰을 모두, activity_token도 주면 그 Activity 토큰만 지운다."""
+        dev = body.get("device")
+        if not isinstance(dev, str) or not DEVICE_TOKEN_RE.match(dev):
+            raise ApiError(400, "bad_token")
+        dev = dev.lower()
+        act = body.get("activity_token")
+        if act is None:
+            return {"ok": True, "removed": self.live_activity.remove_device(dev)}
+        if not isinstance(act, str) or not DEVICE_TOKEN_RE.match(act):
+            raise ApiError(400, "bad_token")
+        e = self.live_activity.get(dev)
+        if e is None or e.get("activity_token") != act.lower():
+            return {"ok": True, "removed": False}
+        self.live_activity.set(dev, activity_token=None)
+        return {"ok": True, "removed": True}
 
     # --- 알림 상태(무음 실패 방지)
     def push_mode(self):
@@ -8665,6 +8981,8 @@ ROUTES = [
     ("POST", re.compile(r"^/api/terminals/([^/]+)/send$"), "send"),
     ("POST", re.compile(r"^/api/devices$"), "add_device"),
     ("DELETE", re.compile(r"^/api/devices$"), "delete_device"),
+    ("POST", re.compile(r"^/api/live-activity$"), "live_activity"),
+    ("DELETE", re.compile(r"^/api/live-activity$"), "delete_live_activity"),
     ("GET", re.compile(r"^/api/usage$"), "usage"),
     ("GET", re.compile(r"^/api/push/status$"), "push_status"),
     ("POST", re.compile(r"^/api/push/test$"), "push_test"),
@@ -8802,6 +9120,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     res = app.api_send(tid, body)
                 elif name == "add_device":
                     res = app.api_add_device(body)
+                elif name == "live_activity":
+                    res = app.api_live_activity(body)
+                elif name == "delete_live_activity":
+                    res = app.api_delete_live_activity(body)
                 elif name == "usage":
                     res = api_usage(query)
                 elif name == "push_status":
