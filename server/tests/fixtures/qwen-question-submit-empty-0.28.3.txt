@@ -1,0 +1,47 @@
+
+   ▄▄▄▄▄▄  ▄▄     ▄▄ ▄▄▄▄▄▄▄ ▄▄▄    ▄▄   ┌──────────────────────────────────────────────────────────┐
+  ██╔═══██╗██║    ██║██╔════╝████╗  ██║  │ >_ Qwen Code (v0.28.3)                                   │
+  ██║   ██║██║ █╗ ██║█████╗  ██╔██╗ ██║  │                                                          │
+  ██║▄▄ ██║██║███╗██║██╔══╝  ██║╚██╗██║  │ API Key | mock-model (/model to change)                  │
+  ╚██████╔╝╚███╔███╔╝███████╗██║ ╚████║  │ ~/work/demo   │
+   ╚══▀▀═╝  ╚══╝╚══╝ ╚══════╝╚═╝  ╚═══╝  └──────────────────────────────────────────────────────────┘
+
+  Tips: You can run any shell commands from Qwen Code using ! (e.g. !ls).
+  ● Read context files: ~/.qwen/output-language.md
+
+  > ask multi
+  ✓ AskUserQuestion Ask user 2 questions
+    User has provided the following answers:
+
+    **Features**: Export, Auth
+    **Deploy**: Render 2
+
+  ◆ Got it.
+
+  > ask one multi
+  ✓ AskUserQuestion Ask user 1 question
+    User has provided the following answers:
+
+    **Langs**: Swift, Go
+
+  ◆ Noted.
+
+  > ask multi again
+  ? AskUserQuestion Ask user 2 questions ←
+
+     Features   Deploy ▸ Submit
+
+   Your answers:
+     Features: (not answered)
+     Deploy: (not answered)
+
+
+   Ready to submit your answers?
+
+   ❯ 1. Submit answers
+     2. Cancel
+
+   ↑/↓: Navigate | ←/→: Switch tabs | Enter: Select
+
+
+  ⠏ Waiting for user confirmation...

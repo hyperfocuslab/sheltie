@@ -117,13 +117,14 @@ class QwenParseTests(unittest.TestCase):
         self.assertEqual((p["selected"], p["free_text_index"], p["multi_select"]), (0, 3, False))
 
     def test_unknown_screens_have_no_card(self):
-        # PC에서 직접 입력 칸을 연 상태, 여러 질문(탭)·복수 선택·제출 탭, 평소 화면, 작업 중, 피드백 줄
-        for name in ("question-other", "question-multi", "question-multi-tab2", "question-submit", "idle",
+        # PC에서 직접 입력 칸을 연 상태(질문 하나, 여러 질문의 단일 선택 탭), 평소 화면, 작업 중, 피드백 줄
+        for name in ("question-other", "question-multi-tab2-other", "idle",
                      "idle-auto", "working", "enterplan", "feedback"):
             self.assertIsNone(card(name), name)
 
     def test_parsers_do_not_cross(self):
-        for name in ("exec", "write", "edit", "trust", "question", "plan"):
+        for name in ("exec", "write", "edit", "trust", "question", "plan", "question-multi", "question-multi-checked",
+                     "question-multi-one", "question-multi-tab2", "question-submit", "question-submit-empty"):
             for agent in (None, "codex", "gemini", "copilot"):
                 self.assertIsNone(hr.parse_prompt(qw(name), agent=agent), (name, agent))
         for f in ("codex-exec-0.171.0.txt", "codex-plan-0.171.0.txt", "claude-bash-2.1.329.txt",
@@ -145,6 +146,90 @@ class QwenParseTests(unittest.TestCase):
         with self.assertRaises(hr.ApiError):
             hr.answer_steps(card("question"), option_index=3)  # 직접 입력 줄은 글이 있어야 한다
         self.assertEqual(hr.answer_steps(card("trust"), option_index=0), [("keys", ["1"])])
+
+
+class QwenMultiQuestionTests(unittest.TestCase):
+    """여러 질문(탭)·복수 선택·Submit 탭. 실측 0.28.3: 복수 선택은 숫자 키가 커서만 옮기고 space가 토글, enter가 확정.
+    단일 선택 탭은 숫자 키 = 고르고 다음 탭. Submit 탭은 숫자 키가 커서만 옮겨 숫자 + enter."""
+
+    def test_multi_tab_card(self):
+        p = card("question-multi")
+        self.assertEqual((p["kind"], p["title"], p["question"], p["multi_select"]),
+                         ("question", None, "Which features do you want?", True))
+        self.assertEqual(p["tabs"], [{"label": "Features", "answered": False}, {"label": "Deploy", "answered": False}])
+        self.assertEqual(labels(p), ["Auth", "Search", "Export"])  # 복수 선택의 Type something...은 뺀다
+        self.assertEqual([o["description"] for o in p["options"]], ["Login and signup", "Full-text search", "CSV export"])
+        self.assertEqual([o["number"] for o in p["options"]], [1, 2, 3])
+        self.assertEqual((p["checked"], p["selected"], p["free_text_index"]), ([], 0, None))
+        c = card("question-multi-checked")  # PC에서 1·3 체크: 탭 뒤 ✓, 체크는 id에 안 들어간다
+        self.assertEqual((c["checked"], c["selected"], c["tabs"][0]), ([0, 2], 0, {"label": "Features", "answered": True}))
+        self.assertEqual(c["id"], p["id"])
+
+    def test_multi_single_question_card(self):
+        p = card("question-multi-one")  # 질문 하나 복수 선택: 탭 막대 없이 머리글, enter가 바로 제출
+        self.assertEqual((p["kind"], p["title"], p["question"], p["multi_select"], p["tabs"]),
+                         ("question", "Langs", "Which languages?", True, None))
+        self.assertEqual(labels(p), ["Python", "Go", "Rust", "Swift"])
+        self.assertEqual((p["checked"], p["free_text_index"]), ([], None))
+
+    def test_single_tab_card(self):
+        p = card("question-multi-tab2")
+        self.assertEqual((p["kind"], p["title"], p["question"], p["multi_select"]),
+                         ("question", None, "Which deploy target?", False))
+        self.assertEqual(p["tabs"], [{"label": "Features", "answered": True}, {"label": "Deploy", "answered": False}])
+        self.assertEqual(labels(p), ["Fly.io", "Vercel", "Type something..."])
+        self.assertEqual((p["selected"], p["free_text_index"]), (0, 2))
+
+    def test_submit_tab_card(self):
+        p = card("question-submit")
+        self.assertEqual((p["kind"], p["title"], p["question"]), ("submit", None, "Ready to submit your answers?"))
+        self.assertEqual(p["body"], "Your answers:\nFeatures: Export, Auth\nDeploy: Vercel")
+        self.assertEqual(labels(p), ["Submit answers", "Cancel"])
+        self.assertEqual(p["tabs"], [{"label": "Features", "answered": True}, {"label": "Deploy", "answered": True}])
+        e = card("question-submit-empty")
+        self.assertEqual(e["body"], "Your answers:\nFeatures: (not answered)\nDeploy: (not answered)")
+        self.assertEqual([t["answered"] for t in e["tabs"]], [False, False])
+        self.assertNotEqual(e["id"], p["id"])
+
+    def test_broken_screens_have_no_card(self):
+        multi = qw("question-multi")
+        for bad in (multi.replace("▸ Features   Deploy  Submit", "▸ Features   Deploy"),  # Submit 탭 없음
+                    multi.replace("Ask user 2 questions", "Ask user 3 questions"),  # 탭 수가 다름
+                    multi.replace("▸ Features", "  Features"),  # 지금 탭 표시 없음
+                    multi.replace(" | Space: Toggle | Enter: Confirm", " | Enter: Select"),  # 힌트와 줄 모양이 다름
+                    multi.replace("[ ] 4. Type something...", "[✓] 4. Type something..."),  # PC에서 직접 입력 체크
+                    multi.replace("❯ [ ] 1. Auth", "  [ ] 1. Auth")):  # 커서 없음
+            self.assertIsNone(hr.parse_prompt(bad, agent="qwen"))
+        sub = qw("question-submit")
+        for bad in (sub.replace("2. Cancel", "2. Back"), sub.replace("Your answers:", "Answers:"),
+                    sub.replace("Ready to submit your answers?", "Submit?")):
+            self.assertIsNone(hr.parse_prompt(bad, agent="qwen"))
+
+    def test_answer_steps(self):
+        m = card("question-multi")
+        self.assertEqual(hr.answer_steps(m, option_indices=[2, 0]), [("keys", ["1", "space", "3", "space", "enter"])])
+        c = card("question-multi-checked")  # 지금 [0, 2] → 원하는 [1, 2]: 1·2 토글 후 enter
+        self.assertEqual(hr.answer_steps(c, option_indices=[1, 2]), [("keys", ["1", "space", "2", "space", "enter"])])
+        self.assertEqual(hr.answer_steps(c, option_indices=[0, 2]), [("keys", ["enter"])])  # 이미 그대로
+        for bad in ([], [3]):
+            with self.assertRaises(hr.ApiError):
+                hr.answer_steps(c, option_indices=bad)  # 아무것도 안 고르면 enter가 무시된다(실측)
+        with self.assertRaises(hr.ApiError):
+            hr.answer_steps(m, option_index=0)
+        with self.assertRaises(hr.ApiError):
+            hr.answer_steps(m, text="x")
+        one = card("question-multi-one")
+        self.assertEqual(hr.answer_steps(one, option_indices=[3, 1]), [("keys", ["2", "space", "4", "space", "enter"])])
+        t = card("question-multi-tab2")  # 단일 선택 탭: 숫자 = 고르고 다음 탭, 직접 입력은 숫자 → 붙여넣기+enter
+        self.assertEqual(hr.answer_steps(t, option_index=1), [("keys", ["2"])])
+        self.assertEqual(hr.answer_steps(t, text="Render"), [("keys", ["3"]), ("text", "Render")])
+        with self.assertRaises(hr.ApiError):
+            hr.answer_steps(t, option_indices=[0])
+        s = card("question-submit")
+        self.assertEqual(hr.answer_steps(s, option_index=0), [("keys", ["1", "enter"])])
+        self.assertEqual(hr.answer_steps(s, option_index=1), [("keys", ["2", "enter"])])
+        with self.assertRaises(hr.ApiError):
+            hr.answer_steps(s, text="x")
 
 
 class QwenApiTests(unittest.TestCase):
@@ -219,8 +304,44 @@ class QwenApiTests(unittest.TestCase):
         self.assertIsNone(self.app.api_prompt("q1")["prompt"])
         self.assertEqual(self.err(self.app.api_prompt_answer, "q1", {"prompt_id": p["id"], "option_index": 0}),
                          (409, "prompt_changed"))
-        self.hc.screens["q1"] = qw("question-multi")  # 여러 질문: 막힘이지만 카드 없음
+        self.hc.screens["q1"] = qw("question-multi-tab2-other")  # 여러 질문 탭에서 PC가 직접 입력 칸을 열었다
         self.assertIsNone(self.app.api_prompt("q1")["prompt"])
+
+    def test_multi_question_cards(self):
+        self.set(QUESTION, qw("question-multi"))
+        p = self.app.api_prompt("q1")["prompt"]
+        self.assertEqual([(x["category"], x["kind"], x["prompt_id"]) for x in self.pusher.payloads],
+                         [("HR_BLOCKED", "question", p["id"])])
+        self.assertTrue(p["multi_select"])
+        self.assertEqual(self.err(self.app.api_prompt_answer, "q1", {"prompt_id": p["id"], "option_index": 0}),
+                         (400, "use_option_indices"))
+        self.assertEqual(self.err(self.app.api_prompt_answer, "q1", {"prompt_id": p["id"], "text": "x"}),
+                         (400, "no_free_text"))
+        self.assertEqual(self.err(self.app.api_prompt_answer, "q1", {"prompt_id": p["id"], "option_indices": []}),
+                         (400, "bad_option"))
+        self.assertEqual(self.err(self.app.api_answer, "q1", {"action": "approve", "prompt_id": p["id"]}),
+                         (409, "needs_manual"))
+        self.hc.screens["q1"] = qw("question-multi-checked")  # PC에서 1·3을 체크: 같은 카드, 지금 체크로 계산
+        self.app.api_prompt_answer("q1", {"prompt_id": p["id"], "option_indices": [2]})
+        self.assertEqual(self.hc.keys_calls, [("q1", ["1", "space", "enter"])])
+        # 다음 탭(단일 선택): 새 카드. 옛 카드 id로 답하면 prompt_changed
+        self.hc.screens["q1"] = qw("question-multi-tab2")
+        t = self.app.api_prompt("q1")["prompt"]
+        self.assertNotEqual(t["id"], p["id"])
+        self.assertEqual(self.err(self.app.api_prompt_answer, "q1", {"prompt_id": p["id"], "option_indices": [0]}),
+                         (409, "prompt_changed"))
+        self.app.api_prompt_answer("q1", {"prompt_id": t["id"], "text": "Render 2"})
+        self.assertEqual(self.hc.keys_calls[-1], ("q1", ["3"]))
+        self.assertEqual(self.hc.send_calls, [("q1", "Render 2", "force")])
+        # Submit 탭: 확인 카드, 숫자 + enter
+        self.hc.screens["q1"] = qw("question-submit")
+        s = self.app.api_prompt("q1")["prompt"]
+        self.assertEqual(s["kind"], "submit")
+        self.app.api_prompt_answer("q1", {"prompt_id": s["id"], "option_index": 0})
+        self.assertEqual(self.hc.keys_calls[-1], ("q1", ["1", "enter"]))
+        self.hc.screens["q1"] = qw("question-submit-empty")  # 요약이 바뀌면 다른 카드
+        self.assertEqual(self.err(self.app.api_prompt_answer, "q1", {"prompt_id": s["id"], "option_index": 0}),
+                         (409, "prompt_changed"))
 
     def test_plan_card(self):
         self.set(PERM_PLAN, qw("plan"))

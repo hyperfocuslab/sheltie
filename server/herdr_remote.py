@@ -1414,8 +1414,12 @@ def _copilot_overlay_card(p):
 # 승인·계획·질문은 상자 없이 `? <도구 표시명> <요약> ←` 줄 아래에 본문, 질문 줄, 번호 메뉴(커서 승인 `›`, 질문 `❯`)가
 # 그려지고 화면 끝은 `⠏ Waiting for user confirmation...`이다. 숫자 키가 그 항목을 바로 고르고 제출한다.
 # "No, suggest changes (esc)"·"No, keep planning (esc)"는 esc와 같다(입력 칸 없이 턴이 끝난다).
-# 질문은 하나·단일 선택만 카드(숫자 키 제출). "Type something..."은 숫자 → 붙여넣기+enter.
-# 여러 질문(탭)·복수 선택은 카드 없음. 폴더 신뢰는 화면 끝 ╭…╰ 상자(Qwen이 permission "Approval needed"를 보낸다).
+# 질문 하나·단일 선택은 숫자 키가 고르고 제출. "Type something..."은 숫자 → 붙여넣기+enter.
+# 여러 질문은 맨 위 탭 막대(`▸ Features   Deploy  Submit`, 답한 탭 뒤 ✓)가 있고 카드는 지금 탭 하나만 담는다.
+# 단일 선택 탭은 숫자 키 = 고르고 다음 탭, 직접 입력도 숫자 → 붙여넣기+enter(실측). 복수 선택(`❯ [✓] 1. Auth`)은
+# 숫자 키가 커서만 옮기고 space가 토글, enter가 확정(질문 하나면 제출, 여럿이면 다음 탭). 아무것도 안 고르면 enter가
+# 무시된다. Submit 탭(`Ready to submit your answers?` 1 Submit answers / 2 Cancel)도 숫자는 커서만 옮겨 숫자+enter.
+# Cancel은 도구를 취소하고 턴이 끝난다. 폴더 신뢰는 화면 끝 ╭…╰ 상자(Qwen이 permission "Approval needed"를 보낸다).
 QWEN_WAIT_RE = re.compile(r"^\S Waiting for user confirmation\.\.\.$")
 QWEN_HEAD_RE = re.compile(r"^\? (\S+)(?: (.*?))? ←$")
 QWEN_ESC_SUFFIX = " (esc)"
@@ -1431,7 +1435,19 @@ QWEN_PLAN_LABELS = ("Yes, and auto-accept edits", "Yes, and manually approve edi
 QWEN_PLAN_RESTORE = "Yes, restore previous mode ("
 QWEN_Q_TOOL = "AskUserQuestion"
 QWEN_Q_SUMMARY = "Ask user 1 question"
+QWEN_Q_SUMMARY_RE = re.compile(r"^Ask user (\d+) questions$")
 QWEN_Q_HINT = "↑/↓: Navigate | Enter: Select | Esc: Cancel"
+QWEN_Q_HINT_MULTI = "↑/↓: Navigate | Space: Toggle | Enter: Confirm | Esc: Cancel"
+QWEN_Q_HINT_TAB = "↑/↓: Navigate | ←/→: Switch tabs | Enter: Select | Esc: Cancel"
+QWEN_Q_HINT_TAB_MULTI = "↑/↓: Navigate | ←/→: Switch tabs | Space: Toggle | Enter: Confirm | Esc: Cancel"
+QWEN_SUBMIT_HINT = "↑/↓: Navigate | ←/→: Switch tabs | Enter: Select"
+QWEN_SUBMIT_Q = "Ready to submit your answers?"
+QWEN_SUBMIT_HEAD = "Your answers:"
+QWEN_SUBMIT_LABELS = ["Submit answers", "Cancel"]
+QWEN_SUBMIT_TAB = "Submit"
+QWEN_TAB_CUR = "▸ "
+QWEN_TAB_DONE = " ✓"
+QWEN_CHECK_ROW_RE = re.compile(r"^(\s*(?:❯\s*)?)\[([ ✓])\]\s+(\d+\.\s+)")
 QWEN_FREE = "Type something..."
 QWEN_TRUST_Q = "Do you trust this folder?"
 
@@ -1513,24 +1529,118 @@ def _parse_qwen_plan(inner):
                                 selected=next(k for k, r in enumerate(rows) if r["selected"]), reject_index=3))
 
 
+def _qwen_tabs(line, n):
+    """탭 막대 `▸ Features   Deploy  Submit` / `Features ✓ ▸ Deploy  Submit` → ([{label, answered}], 지금 탭 index)
+    또는 None. 질문 탭 n개 + 맨 끝 Submit이어야 한다."""
+    s = line.strip().replace(" " + QWEN_TAB_CUR, "  " + QWEN_TAB_CUR)
+    items = [x for x in re.split(r"\s{2,}", s) if x]
+    if len(items) != n + 1:
+        return None
+    tabs, cur = [], None
+    for k, it in enumerate(items):
+        if it.startswith(QWEN_TAB_CUR):
+            if cur is not None:
+                return None
+            cur, it = k, it[len(QWEN_TAB_CUR):]
+        done = it.endswith(QWEN_TAB_DONE)
+        if done:
+            it = it[:-len(QWEN_TAB_DONE)]
+        if not it or "▸" in it:
+            return None
+        tabs.append({"label": it, "answered": done})
+    if cur is None or tabs[-1] != {"label": QWEN_SUBMIT_TAB, "answered": False}:
+        return None
+    return tabs[:-1], cur
+
+
 def _parse_qwen_question(summary, inner):
     nz = [i for i, ln in enumerate(inner) if ln.strip()]
-    if summary != QWEN_Q_SUMMARY or len(nz) < 4 or inner[nz[-1]].strip() != QWEN_Q_HINT:
-        return None  # 여러 질문(탭 막대·←/→ 힌트)·복수 선택·제출 탭은 힌트가 다르다
-    menu = _qwen_menu(inner, nz[-1])
+    if len(nz) < 4:
+        return None
+    hint = inner[nz[-1]].strip()
+    m = QWEN_Q_SUMMARY_RE.match(summary)
+    tabs = cur = None
+    if m:
+        t = _qwen_tabs(inner[nz[0]], int(m.group(1)))
+        if t is None:
+            return None
+        tabs, cur = t
+        if cur == len(tabs):
+            return _parse_qwen_submit(inner, nz, tabs)
+        if hint not in (QWEN_Q_HINT_TAB, QWEN_Q_HINT_TAB_MULTI):
+            return None
+        multi = hint == QWEN_Q_HINT_TAB_MULTI
+    elif summary == QWEN_Q_SUMMARY and hint in (QWEN_Q_HINT, QWEN_Q_HINT_MULTI):
+        multi = hint == QWEN_Q_HINT_MULTI
+    else:
+        return None
+    # 복수 선택 줄 `❯ [✓] 1. Auth`를 `❯ 1. [✓] Auth`로 바꿔 공통 메뉴 읽기(체크박스는 번호 뒤)를 쓴다
+    body = [QWEN_CHECK_ROW_RE.sub(r"\1\3[\2] ", ln) for ln in inner] if multi else inner
+    menu = _qwen_menu(body, nz[-1])
     if menu is None:
         return None
     rows, labels, _ = menu
-    if any(r["checkbox"] for r in rows) or any(lb.startswith(">") for lb in labels):
-        return None  # 복수 선택, 또는 PC에서 직접 입력 칸을 연 상태(`❯ 4. > Type something...`)
-    head = [inner[i].strip() for i in nz if i < rows[0]["line"]]
-    if len(head) < 2:
+    if any(r["checkbox"] for r in rows) != multi or (multi and not all(r["checkbox"] for r in rows)) \
+            or any(lb.startswith(">") for lb in labels):
+        return None  # 힌트와 줄 모양이 다르거나, PC에서 직접 입력 칸을 연 상태(`❯ 4. > Type something...`)
+    head = [body[i].strip() for i in nz if i < rows[0]["line"]]
+    if tabs is not None:
+        head = head[1:]  # 탭 막대
+        if not head or labels[-1] != QWEN_FREE:
+            return None
+        title, question = None, _norm(" ".join(head))
+    else:
+        if len(head) < 2:
+            return None
+        title, question = head[0], _norm(" ".join(head[1:]))
+    keep = list(range(len(rows)))
+    if multi:
+        # 복수 선택의 "Type something..."은 체크박스 줄이라 카드에서 뺀다(Claude와 같다). PC에서 체크했으면 모르는 상태
+        if labels[-1] != QWEN_FREE or rows[-1]["checked"]:
+            return None
+        keep = keep[:-1]
+    opts = [(labels[k], _norm(" ".join(rows[k]["extra"])) or None, rows[k]["num"]) for k in keep]
+    kl = [labels[k] for k in keep]
+    free = kl.index(QWEN_FREE) if QWEN_FREE in kl and not multi else None
+    sel = next((j for j, k in enumerate(keep) if rows[k]["selected"]), None)
+    return _qwen_finish(_finish("question", title, question, None, opts, selected=sel, multi=multi,
+                                checked=[j for j, k in enumerate(keep) if rows[k]["checked"]],
+                                free_text_index=free, tabs=tabs))
+
+
+def _parse_qwen_submit(inner, nz, tabs):
+    """여러 질문 끝 Submit 탭: "Your answers:" 요약 + "Ready to submit your answers?" 1 Submit answers / 2 Cancel."""
+    if inner[nz[-1]].strip() != QWEN_SUBMIT_HINT:
         return None
-    opts = [(lb, _norm(" ".join(r["extra"])) or None, r["num"]) for lb, r in zip(labels, rows)]
-    free = labels.index(QWEN_FREE) if QWEN_FREE in labels else None
-    return _qwen_finish(_finish("question", head[0], _norm(" ".join(head[1:])), None, opts,
-                                selected=next(k for k, r in enumerate(rows) if r["selected"]),
-                                free_text_index=free))
+    menu = _qwen_menu(inner, nz[-1])
+    if menu is None:
+        return None
+    rows, labels, q = menu
+    if labels != QWEN_SUBMIT_LABELS or inner[q].strip() != QWEN_SUBMIT_Q:
+        return None
+    ans = [i for i in nz if nz[0] < i < q]
+    if not ans or inner[ans[0]].strip() != QWEN_SUBMIT_HEAD:
+        return None
+    body = "\n".join(inner[i].strip() for i in ans)
+    return _qwen_finish(_finish("submit", None, QWEN_SUBMIT_Q, body, [(lb, None, r["num"]) for lb, r in zip(labels, rows)],
+                                selected=next(k for k, r in enumerate(rows) if r["selected"]), tabs=tabs))
+
+
+def _pick_qwen(p, option_index):
+    """Submit 탭은 숫자 키가 커서만 옮긴다: 숫자 + enter(실측 0.28.3). 그 밖에는 기본(숫자 키 = 고르고 제출)."""
+    if p["kind"] == "submit":
+        return [("keys", [str(p["options"][option_index]["number"]), "enter"])]
+    return None
+
+
+def _multi_qwen(p, num, want):
+    """복수 선택: 숫자 키는 커서만 옮기고 space가 토글, enter가 확정(실측 0.28.3). 하나도 안 고르면 enter가 무시된다."""
+    if not want:
+        raise ApiError(400, "bad_option")
+    keys = []
+    for i in sorted(want.symmetric_difference(set(p["checked"]))):
+        keys += [str(num(i)), "space"]
+    return [("keys", keys + ["enter"])]
 
 
 def _parse_qwen_trust(lines):
@@ -2527,6 +2637,9 @@ def answer_steps(p, option_index=None, option_indices=None, text=None):
             raise ApiError(400, "no_free_text")
         if any(num(i) > 9 for i in want):
             raise ApiError(400, "bad_option")
+        multi = agent_spec(p.get("agent")).get("multi")  # 에이전트만의 토글·확정 키(Qwen: 숫자+space, enter)
+        if multi:
+            return multi(p, num, want)
         toggle = sorted(want.symmetric_difference(set(p["checked"])) - {p.get("free_text_index")})
         return [("keys", [str(num(i)) for i in toggle] + ["right"])]
     if option_index is None:
@@ -5933,6 +6046,7 @@ QWEN_PUSH_PROMPT_WAIT = 1.0
 #   idle_after_re          (선택) "full"에서 이 msg의 막힘(시작 화면) 뒤에는 끝남이 아니라 idle
 #   dialog_re              "full"에서 카드를 못 읽어도 화면 끝 줄이 이 힌트면 막힘(제목으로 막힘을 모르는 에이전트, 없으면 None)
 #   pick(p, i)             (선택) 그 항목을 고르는 키 단계. None을 주면 숫자·커서 이동 기본 방식
+#   multi(p, num, want)    (선택) 복수 선택 답(want: 고를 index 집합) → 키 단계. 없으면 숫자 토글 + right(Claude)
 #   reject_keys(p)         (선택) reject_index가 없는 카드의 거절 키(기본 esc)
 #   approve_keys           (선택) 카드 없이(prompt_id 없이) 승인할 때 "1" 대신 보낼 키. 함수면 지금 화면 카드(또는 None)로
 #                          키를 정한다(None이면 409 needs_manual)
@@ -5969,6 +6083,7 @@ AGENTS = {
     # Qwen Code는 OSC 7501로 승인·계획(permission)·질문(question)·폴더 신뢰(permission "Approval needed")를 다 보낸다
     # (실측 0.28.3): 화면 덧씌우기가 필요 없다. 시작 신뢰 상자는 blocked 뒤 30~50ms 늦게 그려져 다시 읽는다.
     "qwen": {"match": is_qwen, "parse": _parse_qwen_lines, "free_text": _free_text_digit,
+             "pick": _pick_qwen, "multi": _multi_qwen,
              "transcript": lambda info, home, runner=None: find_qwen_transcript(info, home, runner=runner),
              "push_wait": lambda: QWEN_PUSH_PROMPT_WAIT, "retry": True, "screen": None, "send_guard": True},
     # OpenCode는 OSC 7501을 안 보내고 제목도 "OC | <세션 제목>"으로 고정이다(실측 1.19.6): 막힘은 화면 대화 상자,

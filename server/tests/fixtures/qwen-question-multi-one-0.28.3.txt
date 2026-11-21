@@ -1,0 +1,42 @@
+
+   ▄▄▄▄▄▄  ▄▄     ▄▄ ▄▄▄▄▄▄▄ ▄▄▄    ▄▄   ┌──────────────────────────────────────────────────────────┐
+  ██╔═══██╗██║    ██║██╔════╝████╗  ██║  │ >_ Qwen Code (v0.28.3)                                   │
+  ██║   ██║██║ █╗ ██║█████╗  ██╔██╗ ██║  │                                                          │
+  ██║▄▄ ██║██║███╗██║██╔══╝  ██║╚██╗██║  │ API Key | mock-model (/model to change)                  │
+  ╚██████╔╝╚███╔███╔╝███████╗██║ ╚████║  │ ~/work/demo   │
+   ╚══▀▀═╝  ╚══╝╚══╝ ╚══════╝╚═╝  ╚═══╝  └──────────────────────────────────────────────────────────┘
+
+  Tips: You can run any shell commands from Qwen Code using ! (e.g. !ls).
+  ● Read context files: ~/.qwen/output-language.md
+
+  > ask multi
+  ✓ AskUserQuestion Ask user 2 questions
+    User has provided the following answers:
+
+    **Features**: Export, Auth
+    **Deploy**: Render 2
+
+  ◆ Got it.
+
+  > ask one multi
+  ? AskUserQuestion Ask user 1 question ←
+
+   Langs
+
+   Which languages?
+
+   ❯ [ ] 1. Python
+            Scripting
+     [ ] 2. Go
+            Services
+     [ ] 3. Rust
+            Systems
+     [ ] 4. Swift
+            Apple
+     [ ] 5. Type something...
+
+
+   ↑/↓: Navigate | Space: Toggle | Enter: Confirm | Esc: Cancel
+
+
+  ⠏ Waiting for user confirmation...

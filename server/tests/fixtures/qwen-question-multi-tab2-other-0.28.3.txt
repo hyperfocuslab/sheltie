@@ -1,0 +1,29 @@
+
+   ▄▄▄▄▄▄  ▄▄     ▄▄ ▄▄▄▄▄▄▄ ▄▄▄    ▄▄   ┌──────────────────────────────────────────────────────────┐
+  ██╔═══██╗██║    ██║██╔════╝████╗  ██║  │ >_ Qwen Code (v0.28.3)                                   │
+  ██║   ██║██║ █╗ ██║█████╗  ██╔██╗ ██║  │                                                          │
+  ██║▄▄ ██║██║███╗██║██╔══╝  ██║╚██╗██║  │ API Key | mock-model (/model to change)                  │
+  ╚██████╔╝╚███╔███╔╝███████╗██║ ╚████║  │ ~/work/demo   │
+   ╚══▀▀═╝  ╚══╝╚══╝ ╚══════╝╚═╝  ╚═══╝  └──────────────────────────────────────────────────────────┘
+
+  Tips: You can run any shell commands from Qwen Code using ! (e.g. !ls).
+  ● Read context files: ~/.qwen/output-language.md
+
+  > ask multi
+  ? AskUserQuestion Ask user 2 questions ←
+
+     Features ✓ ▸ Deploy  Submit
+
+   Which deploy target?
+
+     1. Fly.io
+        Containers
+     2. Vercel
+        Serverless
+   ❯ 3. > Type something...
+
+
+   ↑/↓: Navigate | ←/→: Switch tabs | Enter: Select | Esc: Cancel
+
+
+  ⠏ Waiting for user confirmation...
