@@ -1748,6 +1748,24 @@ SUBTITLES = {"HR_PERMISSION": "Needs permission", "HR_PERMISSION_ALWAYS": "Needs
 SUBTITLE_KEYS = {"HR_PERMISSION": "push.subtitle.permission", "HR_PERMISSION_ALWAYS": "push.subtitle.permission",
                  "HR_BLOCKED": "push.subtitle.blocked", "HR_DONE": "push.subtitle.done",
                  "HR_EXITED": "push.subtitle.exited"}
+# 알림 유효기간(초). 이 시간 안에 기기에 못 닿으면 APNs·FCM이 버린다(오래 꺼진 폰에 지난 알림이 늦게 오지 않게).
+PUSH_TTL_BLOCKED = 3600  # 답을 기다리는 막힘·권한 요청(미답 재알림 포함)
+PUSH_TTL_DONE = 6 * 3600  # 작업 끝남·터미널 종료
+PUSH_TTL_TEST = 300  # 시험 알림
+PUSH_TTLS = {"HR_PERMISSION": PUSH_TTL_BLOCKED, "HR_PERMISSION_ALWAYS": PUSH_TTL_BLOCKED,
+             "HR_BLOCKED": PUSH_TTL_BLOCKED, "HR_DONE": PUSH_TTL_DONE, "HR_EXITED": PUSH_TTL_DONE,
+             "HR_TEST": PUSH_TTL_TEST}
+
+
+def push_ttl(payload):
+    """알림 종류(category)별 유효기간(초). 모르는 종류는 막힘과 같이 1시간."""
+    aps = payload.get("aps") if isinstance(payload, dict) else None
+    cat = aps.get("category") if isinstance(aps, dict) else None
+    if cat is None and isinstance(payload, dict):
+        cat = payload.get("category")
+    return PUSH_TTLS.get(cat, PUSH_TTL_BLOCKED)
+
+
 REMINDER_SUBTITLE_KEYS = {"HR_PERMISSION": "push.subtitle.reminder.permission",
                           "HR_PERMISSION_ALWAYS": "push.subtitle.reminder.permission",
                           "HR_BLOCKED": "push.subtitle.reminder.blocked"}
@@ -2001,20 +2019,24 @@ class ApnsPusher:
                 self._jwt_at = now
             return self._jwt
 
-    def send_one(self, device, payload):
-        """반환: (http_code, reason). 토큰·JWT는 argv가 아니라 stdin의 curl 설정으로 넘긴다."""
+    def send_one(self, device, payload, ttl=None):
+        """반환: (http_code, reason). 토큰·JWT는 argv가 아니라 stdin의 curl 설정으로 넘긴다.
+        ttl(초)을 안 주면 알림 종류로 정한다(push_ttl)."""
         hosts = self.cfg.get("apns_hosts") or DEFAULTS["apns_hosts"]
         env = device.get("env") if device.get("env") in ("sandbox", "production") else "sandbox"
         base = (hosts.get(env) or DEFAULTS["apns_hosts"][env]).rstrip("/")
         if not base.startswith("https://"):
             raise ValueError("apns host must be https")
         tok = device["token"]
+        if ttl is None:
+            ttl = push_ttl(payload)
         body = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
         conf = "\n".join([
             "url = " + _curl_quote("%s/3/device/%s" % (base, tok)),
             "header = " + _curl_quote("apns-topic: %s" % self.cfg["topic"]),
             "header = " + _curl_quote("apns-push-type: alert"),
             "header = " + _curl_quote("apns-priority: 10"),
+            "header = " + _curl_quote("apns-expiration: %d" % (int(self.clock()) + ttl)),
             "header = " + _curl_quote("authorization: bearer %s" % self.jwt()),
             "data = " + _curl_quote(body),
         ]) + "\n"
@@ -2035,27 +2057,27 @@ class ApnsPusher:
         except ValueError:
             return 0, "curl exit %d" % p.returncode
 
-    def push(self, payload):
+    def push(self, payload, ttl=None):
         sent = 0
         apns_ok = None  # APNs 기기가 있을 때만 확인한다(키 없음 경고도 그때 한 번)
         for d in self.devices.list():
             if d.get("env") == FCM_ENV:
-                code, _ = self._deliver_fcm(d, payload)
+                code, _ = self._deliver_fcm(d, payload, ttl)
             else:
                 if apns_ok is None:
                     apns_ok = self.available()
                 if not apns_ok:
                     continue
-                code, _ = self._deliver(d, payload)
+                code, _ = self._deliver(d, payload, ttl)
             if code == 200:
                 sent += 1
         return sent
 
-    def push_device(self, device, payload):
+    def push_device(self, device, payload, ttl=None):
         """기기 하나에만 보낸다(시험 알림). 반환: (http_code, reason). 예외는 (0, 예외 이름)."""
         if device.get("env") == FCM_ENV:
-            return self._deliver_fcm(device, payload)
-        return self._deliver(device, payload)
+            return self._deliver_fcm(device, payload, ttl)
+        return self._deliver(device, payload, ttl)
 
     def fcm_relay_url(self):
         return self.cfg.get("fcm_relay_url") or ""
@@ -2072,7 +2094,7 @@ class ApnsPusher:
                 self._fcm = RelayPusher(self.cfg, self.devices, url=url, push_log=self.push_log)
             return self._fcm
 
-    def _deliver_fcm(self, d, payload):
+    def _deliver_fcm(self, d, payload, ttl=None):
         """Android 기기: APNs 키가 있어도 항상 중계로. 중계가 꺼져 있으면 보내지 않고 실패로 남긴다."""
         p = self._fcm_pusher()
         if p is None:
@@ -2081,13 +2103,13 @@ class ApnsPusher:
                         short_token(d.get("token")))
             return 0, FCM_RELAY_OFF_REASON
         if p is self:
-            return self._deliver(d, payload)
-        return p.push_device(d, payload)
+            return self._deliver(d, payload, ttl)
+        return p.push_device(d, payload, ttl)
 
-    def _deliver(self, d, payload):
+    def _deliver(self, d, payload, ttl=None):
         """한 기기 발송 + 결과 처리(기기 삭제·서명 표시) + PushLog 기록. 반환: (http_code, reason)."""
         try:
-            code, reason = self.send_one(d, payload)
+            code, reason = self.send_one(d, payload, ttl)
         except Exception as e:  # noqa: BLE001 - 한 기기 실패가 다른 기기를 막지 않게
             log.warning("푸시 실패 %s: %s", short_token(d.get("token")), type(e).__name__)
             self._record(d, 0, type(e).__name__)
@@ -2175,23 +2197,24 @@ class RelayPusher(ApnsPusher):
                     if attempt:
                         raise
 
-    def push(self, payload):
+    def push(self, payload, ttl=None):
         # 알림 하나에 collapse_id 하나: 중계가 apns-collapse-id로 넘겨 재시도 중복을 하나로 합친다.
         self._push_ctx.collapse_id = uuid.uuid4().hex
         try:
-            return super().push(payload)
+            return super().push(payload, ttl)
         finally:
             self._push_ctx.collapse_id = None
 
-    def push_device(self, device, payload):
+    def push_device(self, device, payload, ttl=None):
         self._push_ctx.collapse_id = uuid.uuid4().hex
         try:
-            return super().push_device(device, payload)
+            return super().push_device(device, payload, ttl)
         finally:
             self._push_ctx.collapse_id = None
 
-    def send_one(self, device, payload):
-        """반환: (http_code, reason). 중계 자신의 거절은 reason "relay:<error>"."""
+    def send_one(self, device, payload, ttl=None):
+        """반환: (http_code, reason). 중계 자신의 거절은 reason "relay:<error>".
+        ttl(초)은 중계가 APNs apns-expiration·FCM android.ttl로 바꾼다. 안 주면 알림 종류로 정한다."""
         tok = device["token"]
         sig = device.get("relay_sig")
         if not sig:
@@ -2201,8 +2224,10 @@ class RelayPusher(ApnsPusher):
             return 0, "no_relay_sig"
         env = device.get("env") if device.get("env") in APNS_ENVS + (FCM_ENV,) else "sandbox"
         cid = getattr(self._push_ctx, "collapse_id", None) or uuid.uuid4().hex
-        body = json.dumps({"device_token": tok, "env": env, "relay_sig": sig, "collapse_id": cid, "payload": payload},
-                          ensure_ascii=True, separators=(",", ":")).encode("ascii")
+        if ttl is None:
+            ttl = push_ttl(payload)
+        body = json.dumps({"device_token": tok, "env": env, "relay_sig": sig, "collapse_id": cid, "ttl": int(ttl),
+                           "payload": payload}, ensure_ascii=True, separators=(",", ":")).encode("ascii")
         status, data = self._post(body)
         if 500 <= status < 600:
             # 중계·APNs 쪽 일시 오류: 같은 collapse_id로 한 번만 다시(중계가 apns-collapse-id로 중복을 합친다).
@@ -3851,7 +3876,7 @@ def cmd_test_push():
     devs = app.devices.list()
     payload = build_payload("test", "herdr-remote", "done", {})
     payload["aps"]["alert"] = test_alert()
-    sent = app.pusher.push(payload)
+    sent = app.pusher.push(payload, ttl=PUSH_TTL_TEST)
     print("시험 푸시: 기기 %d대 중 %d대 성공" % (len(devs), sent))
     return 0 if sent == len(devs) and devs else 1
 

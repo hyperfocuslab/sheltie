@@ -141,6 +141,8 @@ class FcmRoutingTests(unittest.TestCase):
         self.assertEqual(body["payload"], payload)
         self.assertRegex(body["collapse_id"], r"^[0-9a-f]{32}$")
         self.assertIsNotNone(self.pl.device(did(FCM_TOK))["last_success_at"])
+        self.assertEqual(body["ttl"], hr.PUSH_TTL_BLOCKED)  # fcm 기기도 알림 종류별 유효기간
+        self.assertIn('"apns-expiration: ', self.curl_calls[0])
 
     def test_off_records_failure_and_sends_nothing(self):
         p = self.apns_pusher("")
@@ -248,6 +250,7 @@ class FcmHttpTests(unittest.TestCase):
         self.assertEqual((code, body["ok"], body["code"]), (200, True, 200))
         self.assertEqual(self.relay.requests[-1][2]["payload"]["category"], "HR_TEST")
         self.assertEqual(self.relay.requests[-1][2]["env"], "fcm")
+        self.assertEqual(self.relay.requests[-1][2]["ttl"], 300)
         code, st = self.req("GET", "/api/push/status?device=" + did(FCM_TOK))
         self.assertTrue(st["device"]["registered"])
         self.assertIsNotNone(st["device"]["last_success_at"])

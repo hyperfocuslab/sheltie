@@ -340,6 +340,27 @@ def _openssl_bins():
     return bins
 
 
+class PushTtlTests(unittest.TestCase):
+    def test_ttl_by_category(self):
+        ttl = lambda *a, **k: hr.push_ttl(hr.build_payload("t1", "n", *a, **k))  # noqa: E731
+        self.assertEqual(ttl("blocked", {"kind": "question"}), 3600)  # HR_BLOCKED
+        self.assertEqual(ttl("blocked", PERM), 3600)  # HR_PERMISSION
+        always = {"id": "p1", "kind": "approval", "body": "rm x", "always_index": 1}
+        p = hr.build_payload("t1", "n", "blocked", PERM, prompt=always)
+        self.assertEqual(p["aps"]["category"], "HR_PERMISSION_ALWAYS")
+        self.assertEqual(hr.push_ttl(p), 3600)
+        self.assertEqual(ttl("done", {}), 6 * 3600)  # HR_DONE
+        self.assertEqual(ttl("exited", None, exit_code=1), 6 * 3600)  # HR_EXITED
+        self.assertEqual(hr.push_ttl({"aps": {"category": "HR_TEST"}}), 300)
+        self.assertEqual(hr.push_ttl({"aps": {"category": "HR_NEW"}}), 3600)  # 모르는 종류
+        self.assertEqual(hr.push_ttl({"aps": {}}), 3600)
+        self.assertEqual(hr.push_ttl({"category": "HR_DONE"}), 6 * 3600)
+
+    def test_all_categories_have_ttl(self):
+        for cat in hr.SUBTITLES:
+            self.assertIn(cat, hr.PUSH_TTLS)
+
+
 class ApnsTests(unittest.TestCase):
     def test_der_to_raw(self):
         r = b"\x80" + b"\x11" * 31          # 앞 비트 1 → DER에서 0x00 패딩
@@ -433,6 +454,18 @@ class ApnsTests(unittest.TestCase):
         self.assertIn('url = "https://api.push.apple.com/3/device/' + "bb" * 32, calls[1][1]["input"])
         self.assertIn('"authorization: bearer JWT.SECRET.SIG"', calls[0][1]["input"])
         self.assertIn('"apns-topic: com.hyperfocuslab.sheltie"', calls[0][1]["input"])
+
+    def test_apns_expiration_header(self):
+        tmp = tempfile.mkdtemp()
+        p, devices, calls = self._pusher(tmp, ["\n200"] * 4)
+        p.clock = lambda: 1_700_000_000.7
+        devices.add("aa" * 32, "sandbox")
+        p.push(hr.build_payload("t1", "n", "blocked", PERM))
+        p.push(hr.build_payload("t1", "n", "done", {}))
+        p.push(hr.build_payload("t1", "n", "done", {}), ttl=hr.PUSH_TTL_TEST)
+        p.push_device(devices.list()[0], {"aps": {"category": "HR_TEST"}})
+        exp = [re.search(r'"apns-expiration: (\d+)"', kw["input"]).group(1) for _, kw in calls]
+        self.assertEqual(exp, ["1700003600", "1700021600", "1700000300", "1700000300"])
 
     def test_configurable_hosts(self):
         tmp = tempfile.mkdtemp()
@@ -596,7 +629,15 @@ class RelayTests(unittest.TestCase):
         self.assertEqual(path, "/v1/push")
         self.assertEqual(ctype, "application/json")
         self.assertRegex(body.pop("collapse_id"), r"^[0-9a-f]{32}$")
-        self.assertEqual(body, {"device_token": "aa" * 32, "env": "production", "relay_sig": SIG, "payload": payload})
+        self.assertEqual(body, {"device_token": "aa" * 32, "env": "production", "relay_sig": SIG,
+                                "ttl": 6 * 3600, "payload": payload})
+
+    def test_ttl_by_kind_and_override(self):
+        self.devices.add("aa" * 32, "production", relay_sig=SIG)
+        self.p.push(hr.build_payload("t1", "n", "blocked", PERM))
+        self.p.push_device(self.devices.list()[0], {"aps": {"category": "HR_TEST"}, "category": "HR_TEST"})
+        self.p.push(hr.build_payload("t1", "n", "done", {}), ttl=hr.PUSH_TTL_TEST)  # test-push 명령
+        self.assertEqual([r[2]["ttl"] for r in self.relay.requests], [3600, 300, 300])
 
     def test_collapse_id_per_push_and_same_on_retry(self):
         self.devices.add("aa" * 32, "sandbox", relay_sig=SIG)
