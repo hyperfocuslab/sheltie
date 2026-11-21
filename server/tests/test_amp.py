@@ -17,6 +17,7 @@ BLOCKED = {"app": APP, "msg": "Input needed", "state": "blocked"}
 WORKING = {"app": APP, "msg": "README copy", "state": "working"}
 DONE = {"app": APP, "msg": "README copy", "state": "done"}
 THREAD = "T-01a1fd2e-ab90-7770-a569-5292f24f799e"
+LATEST = "T-01a1fd6e-3aed-7767-9e99-0d5520a37179"  # amp-threads-list fixture에서 /Users/me/work/demo의 가장 최근 스레드
 
 
 def ap(name):
@@ -276,6 +277,7 @@ class AmpApiTests(unittest.TestCase):
 class AmpTranscriptTests(unittest.TestCase):
     def setUp(self):
         hr._amp_export_cache.clear()
+        hr._amp_list_cache.clear()
         self.tmp = os.path.realpath(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.exe = os.path.join(self.tmp, "amp")
@@ -285,6 +287,9 @@ class AmpTranscriptTests(unittest.TestCase):
         with open(os.path.join(os.path.dirname(__file__), "fixtures", "amp-session-%s.json" % V),
                   encoding="utf-8") as f:
             self.export = f.read()
+        with open(os.path.join(os.path.dirname(__file__), "fixtures", "amp-threads-list-%s.json" % V),
+                  encoding="utf-8") as f:
+            self.threads = f.read()
         self.calls = []
         self.lsof = "p4242\nn/dev/ttys001\nn/Users/me/.cache/amp/logs/cli.log\nn/Users/me/.cache/amp/logs/threads/%s.log\n" \
                     % THREAD
@@ -297,6 +302,8 @@ class AmpTranscriptTests(unittest.TestCase):
             self.calls.append((argv, kw))
             if argv[0].endswith("lsof"):
                 return R(self.lsof)
+            if argv[1:3] == ["threads", "list"]:
+                return R(self.threads)
             return R(self.export)
         self.runner = runner
         orig_exe, orig_export = hr.amp_executable, hr.amp_thread_export
@@ -310,11 +317,78 @@ class AmpTranscriptTests(unittest.TestCase):
         info = {"agent": "amp", "cwd": "/Users/me/work/demo", "pid": 4242}
         self.assertEqual(hr.find_agent_transcript(info, self.tmp, runner=self.runner), (THREAD, self.exe))
         self.assertEqual(self.calls[0][0][1:], ["-a", "-p", "4242", "-Fn"])
-        # 다른 폴더의 같은 이름·ID 모양이 아닌 파일은 무시. 로그를 못 찾으면 (None, None)(폴더로 찾을 기록이 로컬에 없다)
+        self.assertEqual(len(self.calls), 1)  # lsof로 찾으면 threads list를 부르지 않는다
+        # 다른 폴더의 같은 이름·ID 모양이 아닌 파일은 무시. 로그를 못 찾고 그 폴더 스레드도 없으면 (None, None)
         self.lsof = "n/tmp/x/%s.log\nn/Users/me/.cache/amp/logs/threads/T-nope.log\n" % THREAD
-        self.assertEqual(hr.find_agent_transcript(info, self.tmp, runner=self.runner), (None, None))
-        self.assertEqual(hr.find_agent_transcript({"agent": "amp", "cwd": "/w"}, self.tmp, runner=self.runner),
-                         (None, None))
+        self.assertEqual(hr.find_agent_transcript({"agent": "amp", "cwd": "/w", "pid": 4242}, self.tmp,
+                                                  runner=self.runner), (None, None))
+        self.assertEqual(hr.find_agent_transcript({"agent": "amp"}, self.tmp, runner=self.runner), (None, None))
+
+    def test_find_by_thread_list_when_lsof_misses(self):
+        # lsof가 로그를 못 찾으면 `amp threads list --json`에서 그 터미널 폴더(tree)의 가장 최근 스레드
+        self.lsof = "n/dev/ttys001\n"
+        info = {"agent": "amp", "cwd": "/Users/me/work/demo", "pid": 4242}
+        self.assertEqual(hr.find_agent_transcript(info, self.tmp, runner=self.runner), (LATEST, self.exe))
+        argv, kw = self.calls[-1]
+        self.assertEqual(argv, [self.exe, "threads", "list", "--json", "--limit", str(hr.AMP_LIST_LIMIT)])
+        self.assertEqual((kw["timeout"], kw["shell"]), (hr.AMP_EXPORT_TIMEOUT, False))
+        # 폴더 끝 / 차이는 같은 폴더
+        self.assertEqual(hr.find_agent_transcript(dict(info, cwd="/Users/me/work/demo/"), self.tmp,
+                                                  runner=self.runner), (LATEST, self.exe))
+
+    def test_find_by_thread_list_without_lsof(self):
+        # lsof가 없는 기기(Windows): lsof를 부르지 않고 threads list로
+        orig = hr._lsof_exe
+        hr._lsof_exe = lambda: None
+        self.addCleanup(setattr, hr, "_lsof_exe", orig)
+        info = {"agent": "amp", "cwd": "/Users/me/work/demo", "pid": 4242}
+        self.assertEqual(hr.find_agent_transcript(info, self.tmp, runner=self.runner), (LATEST, self.exe))
+        self.assertFalse(any(c[0][0].endswith("lsof") for c in self.calls))
+
+    def test_thread_list_picks_newest_in_cwd_and_caches(self):
+        rows = [{"id": "T-00000000-0000-0000-0000-00000000000%d" % i, "title": "t", "updated": u, "tree": tree,
+                 "messageCount": 1}
+                for i, (u, tree) in enumerate([
+                    ("2026-11-21T10:00:00.000Z", "file:///Users/me/other"),
+                    ("2026-11-21T08:00:00.000Z", "file:///Users/me/work/demo"),
+                    ("2026-11-21T09:00:00.000Z", "file:///Users/me/work/demo"),
+                    ("2026-11-21T11:00:00.000Z", "file:///Users/me/work/demo-2"),
+                    ("2026-11-21T12:00:00.000Z", None),
+                    ("2026-11-21T12:00:00.000Z", "file:///Users/me/work/demo; rm")])]
+        rows.append({"id": "--help", "updated": "2026-11-21T13:00:00.000Z", "tree": "file:///Users/me/work/demo"})
+        self.threads = json.dumps(rows)
+        clock = [100.0]
+        pick = lambda cwd: hr.amp_latest_thread_in(cwd, self.exe, runner=self.runner, clock=lambda: clock[0])
+        self.assertEqual(pick("/Users/me/work/demo"), rows[2]["id"])  # 순서가 아니라 updated로
+        self.assertEqual(pick("/Users/me/other"), rows[0]["id"])
+        self.assertIsNone(pick("/Users/me/none"))
+        self.assertEqual(len(self.calls), 1)  # 짧은 시간 안에는 목록을 다시 부르지 않는다
+        clock[0] += hr.AMP_LIST_TTL
+        pick("/Users/me/other")
+        self.assertEqual(len(self.calls), 2)
+        # 실패·깨진 출력·실행 파일 아님은 None
+        for out in ("", "not json", json.dumps({"id": THREAD})):
+            hr._amp_list_cache.clear()
+            self.threads = out
+            self.assertIsNone(pick("/Users/me/work/demo"))
+        self.assertIsNone(hr.amp_latest_thread_in("/Users/me/work/demo", "amp", runner=self.runner))
+        self.assertIsNone(hr.amp_latest_thread_in(None, self.exe, runner=self.runner))
+
+        def timeout(argv, **kw):
+            raise hr.subprocess.TimeoutExpired(argv, kw.get("timeout"))
+        hr._amp_list_cache.clear()
+        self.assertIsNone(hr.amp_latest_thread_in("/Users/me/work/demo", self.exe, runner=timeout))
+
+    def test_tree_uri_to_path(self):
+        self.assertEqual(hr._amp_tree_path("file:///Users/me/work/my%20demo", win=False), "/Users/me/work/my demo")
+        self.assertIsNone(hr._amp_tree_path("https://x/y", win=False))
+        self.assertIsNone(hr._amp_tree_path(None, win=False))
+        # Windows: 드라이브 앞 / 를 떼고, 대소문자·구분자는 비교할 때 맞춘다
+        self.assertEqual(hr._amp_tree_path("file:///C:/Users/me/work/demo", win=True), "C:/Users/me/work/demo")
+        self.assertEqual(hr._amp_tree_path("file:///c%3A/Users/me/work/demo", win=True), "c:/Users/me/work/demo")
+        self.assertTrue(hr._amp_same_dir("C:/Users/me/work/demo", "c:\\users\\me\\work\\demo\\", win=True))
+        self.assertFalse(hr._amp_same_dir("C:/Users/me/work/demo", "C:\\Users\\me\\work\\demo2", win=True))
+        self.assertFalse(hr._amp_same_dir("/Users/me/a", "/Users/me/b", win=False))
 
     def test_export_args_cache_and_guards(self):
         clock = [100.0]
@@ -383,7 +457,7 @@ class AmpTranscriptTests(unittest.TestCase):
         i["pid"] = 4242
         by = {t["id"]: t for t in app.api_terminals()["terminals"]}
         self.assertIsNone(by["a1"]["preview"])
-        self.assertFalse(any(c[0][0] == self.exe for c in self.calls))  # 목록에서는 export를 부르지 않는다
+        self.assertEqual(self.calls, [])  # 목록에서는 lsof·threads list·export를 부르지 않는다
         r = app.api_transcript("a1", 50)
         self.assertEqual(r["session_id"], THREAD)
         self.assertEqual(r["turns"][0]["parts"][0]["text"],

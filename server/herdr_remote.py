@@ -1492,7 +1492,8 @@ def _parse_gemini_lines(lines, plan_reader=None):
 # ---- GitHub Copilot CLI 대화 상자. 실측: copilot 1.0.114, 200열(tests/fixtures/copilot-*-1.0.114.txt).
 # 승인·폴더 신뢰·계획·autopilot 권한은 화면 맨 끝 ╭…╰ 상자(제목, 가로줄, 본문, 번호 메뉴, 힌트)다. 숫자 키가 그 항목을
 # 바로 고르고 제출한다. "No, and tell Copilot…"·"Suggest changes"는 입력 항목이라 숫자는 커서만 옮기고 글자를 치면
-# 라벨이 입력값으로 바뀐다(빈 enter는 무시): 숫자 → 붙여넣기+enter. esc는 거절과 함께 턴 전체를 멈춘다.
+# 라벨이 입력값으로 바뀐다(빈 enter는 무시): 숫자 → 붙여넣기+enter. esc는 거절과 함께 턴 전체를 멈춘다: 앱의 거절은
+# 3번 + 정해진 문구(COPILOT_DENY_TEXT)로 보내 Copilot이 다른 방법으로 이어 가게 한다.
 # ask_user 질문은 가로줄 두 개 사이 대화 상자이고 번호가 없다(숫자 키 무시): ↑/↓ + enter. "Other"로 커서를 옮기면
 # 상자 아래 입력 칸이 열린다.
 # 여러 칸 폼은 메시지 아래 탭 막대(`  Language   Features   Project name   Public repo?`, 지금 탭·답한 탭 표시는 글자로
@@ -1505,7 +1506,8 @@ COPILOT_HINT_RE = re.compile(r"^↑/↓ to navigate · enter to select(?: · ctr
 COPILOT_APPROVAL_Q_RE = re.compile(r"^Do you (?:want to .+|trust the files in this folder)\?$")
 COPILOT_ESC_SUFFIX_RE = re.compile(r"\s*\(Esc(?: to stop)?\)$")
 COPILOT_REJECT_FREE = "No, and tell Copilot what to do differently"
-COPILOT_REJECT_LABEL = "No"  # 서버가 승인 카드 끝에 더하는 거절 버튼(화면에는 없다, 키는 esc)
+COPILOT_REJECT_LABEL = "No"  # 서버가 승인 카드 끝에 더하는 거절 버튼(화면에는 없다, 키는 3번 + COPILOT_DENY_TEXT)
+COPILOT_DENY_TEXT = "Denied from phone. Don't do this; suggest another way."
 COPILOT_TRUST_TITLE = "Confirm folder trust"
 COPILOT_PLAN_TITLE = "Plan Ready for Review"
 COPILOT_PLAN_FREE = "Suggest changes"
@@ -1571,8 +1573,8 @@ def _parse_copilot_box(lines):
             free, reject = None, len(rows) - 1
         elif labels[-1] == COPILOT_REJECT_FREE:
             # 거절 항목은 입력 항목이라 숫자만으로는 제출되지 않는다: 이 줄은 직접 입력(지시와 함께 거절)으로 두고,
-            # 앱이 입력 항목을 버튼에서 빼므로 번호 없는 거절 버튼 "No"를 끝에 더한다. 키는 esc(라벨의 "Esc to stop",
-            # _pick_copilot)
+            # 앱이 입력 항목을 버튼에서 빼므로 번호 없는 거절 버튼 "No"를 끝에 더한다. 키는 3번 + 정해진 문구
+            # (_pick_copilot. 라벨의 "Esc to stop"은 턴 전체를 멈춘다)
             free, reject = len(rows) - 1, len(rows)
             opts.append((COPILOT_REJECT_LABEL, None, None))
         else:
@@ -1721,11 +1723,23 @@ def _parse_copilot_lines(lines, plan_reader=None):
 
 
 def _pick_copilot(p, option_index):
-    """승인 카드에 서버가 더한 거절 버튼(번호 없음): esc(거절, 턴이 멈춘다. 실측 1.0.114). 그 밖에는 기본."""
+    """승인 카드에 서버가 더한 거절 버튼(번호 없음): 입력 항목 3번을 고르고 정해진 문구를 붙여넣기+enter(직접 입력과
+    같은 키). esc는 거절과 함께 턴 전체를 멈춘다(실측 1.0.114). 그 밖에는 기본."""
     o = p["options"][option_index]
     if p["kind"] == "approval" and option_index == p.get("reject_index") and o.get("number") is None:
-        return [("keys", ["esc"])]
+        return _free_text_digit(p, lambda i: p["options"][i]["number"], COPILOT_DENY_TEXT)
     return None
+
+
+def _copilot_status_reject(p):
+    """카드 없이(prompt_id 없이) 거절: 승인 카드에 서버가 더한 거절 버튼이 있으면 그 키 단계(3번 + 문구).
+    폴더 신뢰·계획 등 다른 상자나 카드를 못 읽으면 None(예전대로 esc)."""
+    if not p or p.get("agent") != "copilot" or p["kind"] != "approval":
+        return None
+    ri = p.get("reject_index")
+    if ri is None or p["options"][ri].get("number") is not None:
+        return None
+    return _pick_copilot(p, ri)
 
 
 def _multi_copilot(p, num, want):
@@ -4790,6 +4804,8 @@ def cursor_preview(path, sid):
 
 # ---- Amp 대화 기록. 본문은 Amp 서버(ampcode.com)에만 있다(실측 0.0.1795233642). 로컬에는 스레드별 운영 로그
 # $XDG_CACHE_HOME/amp/logs/threads/<T-id>.log만 있고 amp가 세션 동안 쓰기로 열어 둔다(lsof로 스레드 ID).
+# lsof가 없거나(Windows) 못 찾으면 `amp threads list --json`(1.2초 안팎, [{id, title, updated, tree: "file:///<폴더>",
+# messageCount}])에서 그 터미널 폴더의 가장 최근 스레드를 고른다.
 # 본문은 `amp threads export <T-id>`(JSON, 0.6초 안팎)로 읽는다. 실행 비용 때문에 대화 보기 요청 때만 부르고
 # 목록 미리보기에는 쓰지 않는다. 실행 파일은 허용 목록 이름(AGENT_BY_ID)을 find_executable로 찾고 인자는 검증한 id만.
 AMP_THREAD_RE = re.compile(r"^T-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
@@ -4797,12 +4813,19 @@ AMP_EXPORT_TIMEOUT = 8.0
 AMP_EXPORT_TTL = 5.0  # 같은 스레드 export를 다시 쓰는 시간(초)
 AMP_EXPORT_MAX = 16 * 1024 * 1024
 AMP_SUGGESTED_RE = re.compile(r"\s*<suggested-replies>.*?</suggested-replies>\s*", re.S)
+AMP_LIST_LIMIT = 50
+AMP_LIST_TTL = 5.0  # threads list를 다시 쓰는 시간(초)
 _amp_export_cache = {}  # (exe, id) → (시각, dict)
+_amp_list_cache = {}    # exe → (시각, list)
 _amp_export_lock = threading.Lock()
 
 
+def _lsof_exe():
+    return next((p for p in ("/usr/sbin/lsof", "/usr/bin/lsof") if os.path.exists(p)), None)
+
+
 def _lsof_amp(pid, runner):
-    exe = next((p for p in ("/usr/sbin/lsof", "/usr/bin/lsof") if os.path.exists(p)), None)
+    exe = _lsof_exe()
     if not exe:
         return None
     try:
@@ -4826,13 +4849,79 @@ def amp_executable(home):
     return find_executable(AGENT_BY_ID["amp"][2], agent_search_dirs(home))
 
 
+def _amp_tree_path(tree, win=IS_WINDOWS):
+    """threads list의 tree("file:///Users/me/demo", Windows "file:///C:/…") → 폴더 경로 또는 None."""
+    if not isinstance(tree, str) or not tree.startswith("file://"):
+        return None
+    p = urllib.parse.unquote(tree[len("file://"):])
+    if win:
+        if re.match(r"^/[A-Za-z]:", p):
+            return p[1:]
+        return "//" + p if p and not p.startswith("/") else None  # file://server/share → UNC
+    return p if p.startswith("/") else None
+
+
+def _amp_same_dir(a, b, win=IS_WINDOWS):
+    """같은 폴더인가. Windows는 대소문자·구분자·끝 구분자를 무시한다."""
+    if win:
+        def f(x):
+            return ntpath.normcase(ntpath.normpath(x)).rstrip("\\")
+    else:
+        def f(x):
+            return os.path.normcase(os.path.realpath(x))
+    return f(a) == f(b)
+
+
+def amp_latest_thread_in(cwd, exe, runner=None, clock=time.monotonic):
+    """`amp threads list --json`에서 cwd 폴더(tree)의 가장 최근(updated) 스레드 ID. 없거나 실패하면 None.
+    목록은 AMP_LIST_TTL 동안 기억한 값."""
+    if not isinstance(cwd, str) or not cwd or not is_abs_path(cwd):
+        return None
+    if not isinstance(exe, str) or not is_abs_path(exe) or not os.path.isfile(exe):
+        return None
+    now = clock()
+    with _amp_export_lock:
+        hit = _amp_list_cache.get(exe)
+    if hit and now - hit[0] < AMP_LIST_TTL:
+        rows = hit[1]
+    else:
+        runner = runner or subprocess.run
+        try:
+            r = runner([exe, "threads", "list", "--json", "--limit", str(AMP_LIST_LIMIT)], capture_output=True,
+                       text=True, timeout=AMP_EXPORT_TIMEOUT, shell=False, **subprocess_kwargs(text=True))
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        out = r.stdout if isinstance(r.stdout, str) else ""
+        if getattr(r, "returncode", 0) != 0 or not out or len(out) > AMP_EXPORT_MAX:
+            return None
+        try:
+            rows = json.loads(out)
+        except ValueError:
+            return None
+        if not isinstance(rows, list):
+            return None
+        with _amp_export_lock:
+            if len(_amp_list_cache) > 10:
+                _amp_list_cache.clear()
+            _amp_list_cache[exe] = (now, rows)
+    best = None
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        tid, updated, path = row.get("id"), row.get("updated"), _amp_tree_path(row.get("tree"))
+        if not isinstance(tid, str) or not AMP_THREAD_RE.match(tid) or not isinstance(updated, str) or not path:
+            continue
+        if _amp_same_dir(path, cwd) and (best is None or updated > best[0]):
+            best = (updated, tid)
+    return best[1] if best else None
+
+
 def find_amp_transcript(info, home, runner=None):
-    """Amp 터미널 → (스레드 ID, amp 실행 파일 경로). 스레드는 amp가 열어 둔 운영 로그(lsof)로만 안다(로컬에 본문이 없어
-    폴더 최근 기록으로 찾을 수 없다). 실행 파일을 못 찾으면 경로 None(대화 보기 빈 목록)."""
+    """Amp 터미널 → (스레드 ID, amp 실행 파일 경로). 스레드는 amp가 열어 둔 운영 로그(lsof)로 먼저 찾고, lsof가 없거나
+    못 찾으면 threads list에서 그 터미널 폴더의 가장 최근 스레드(같은 폴더에 Amp 둘이면 최근 것). 실행 파일을 못 찾으면
+    경로 None(대화 보기 빈 목록)."""
     info = info or {}
     runner = runner or subprocess.run
-    if IS_WINDOWS:
-        return None, None  # lsof 없음(미확인: Windows의 Amp 로그 위치)
     fg = info.get("foreground")
     pids = [v for v in (info.get("pid"), fg.get("pid") if isinstance(fg, dict) else None)
             if isinstance(v, int) and not isinstance(v, bool) and v > 0]
@@ -4840,7 +4929,9 @@ def find_amp_transcript(info, home, runner=None):
         tid = _lsof_amp(pid, runner)
         if tid:
             return tid, amp_executable(home)
-    return None, None
+    exe = amp_executable(home)
+    tid = amp_latest_thread_in(info.get("cwd"), exe, runner=runner) if exe else None
+    return (tid, exe) if tid else (None, None)
 
 
 def amp_thread_export(exe, thread_id, runner=None, clock=time.monotonic):
@@ -5023,6 +5114,9 @@ def terminal_preview(info, home, runner=None, now=None):
             fg = (info or {}).get("foreground")
             pid = fg.get("pid") if isinstance(fg, dict) else None
         now = time.monotonic() if now is None else now
+        spec = agent_spec(agent_kind(info))
+        if "preview" in spec and spec["preview"] is None:
+            return None  # 미리보기가 없는 에이전트(Amp: 기록 찾기에 lsof·threads list를 부른다)
         hit = _preview_by_pid.get(pid) if isinstance(pid, int) else None
         if hit and hit[0] > now:
             sid, path = hit[1]
@@ -6741,7 +6835,10 @@ QWEN_PUSH_PROMPT_WAIT = 1.0
 #                          키를 정한다(None이면 409 needs_manual)
 #   reject_status_keys     (선택) 카드 없이 거절할 때 esc 대신 보낼 키. None이면 거절을 앱에서 직접(409 needs_manual).
 #                          함수면 approve_keys처럼 지금 화면 카드로 정한다
+#   reject_status_steps(p) (선택) 카드 없이 거절할 때 지금 화면 카드로 정하는 키 단계(글 붙여넣기 포함, Copilot 3번 + 문구).
+#                          None이면 기본(esc 또는 reject_status_keys)
 #   read(path, sid, n)     (선택) 기록이 jsonl이 아닐 때 (turns, 잘렸는지). preview(path, sid)는 목록 미리보기
+#                          (preview None: 미리보기 없음, 목록에서 기록 찾기도 부르지 않는다)
 #   ask_reader(info, home, runner=)  (선택) 화면에 일부만 보이는 질문 상자를 채울 기록 속 질문 인자(Gemini ask_user).
 #                          parse의 reader에 GEMINI_ASK_KEY를 주면 이걸 부른다(필요할 때만 기록을 읽는다)
 #   card_status            (선택) hc가 막힘을 알지만 kind가 없을 때(Amp): 막힘 중 화면 카드가 읽히면 API 판정(effective_info)
@@ -6767,7 +6864,7 @@ AGENTS = {
     # Copilot은 OSC 7501로 승인(permission)·질문·계획(question) 막힘을 보낸다. 폴더 신뢰(idle)·autopilot 권한(working)
     # 상자만 hc가 모른다(실측 1.0.114). 질문 상자는 blocked 직후 조금 늦게 그려질 때가 있어 다시 읽는다.
     "copilot": {"match": _named("copilot"), "parse": _parse_copilot_lines, "free_text": _free_text_copilot,
-                "pick": _pick_copilot, "multi": _multi_copilot,
+                "pick": _pick_copilot, "multi": _multi_copilot, "reject_status_steps": _copilot_status_reject,
                 "transcript": lambda info, home, runner=None: find_copilot_transcript(info, home, runner=runner),
                 "push_wait": lambda: COPILOT_PUSH_PROMPT_WAIT, "retry": True, "screen": "overlay",
                 "overlay": {"states": ("idle", "working", "done"), "card": _copilot_overlay_card,
@@ -6821,7 +6918,7 @@ AGENTS = {
     "amp": {"match": _named("amp"), "parse": _parse_amp_lines, "free_text": _free_text_amp,
             "transcript": lambda info, home, runner=None: find_amp_transcript(info, home, runner=runner),
             "read": lambda path, sid, n: read_amp_transcript(path, sid, n),
-            "preview": lambda path, sid: None,
+            "preview": None,
             "push_wait": lambda: PUSH_PROMPT_BUDGET, "retry": False, "screen": None, "card_status": True,
             "approve_keys": _amp_status_approve, "reject_status_keys": _amp_status_reject, "send_guard": True},
 }
@@ -7675,6 +7772,12 @@ class App:
             info = self.require_claude(tid)
             keys = decide_answer(self.effective_info(tid, info), action, expect)
             spec = agent_spec(agent_kind(info))
+            if action == "reject" and "reject_status_steps" in spec:
+                steps = spec["reject_status_steps"](self.current_prompt(tid, info))
+                if steps is not None:  # esc가 턴 전체를 멈추는 에이전트(Copilot): 거절 항목 + 문구
+                    keys = self._do_steps(tid, steps)
+                    log.info("answer %s %s", tid, action)
+                    return {"ok": True, "keys": keys}
             if action == "reject" and "reject_status_keys" in spec:
                 keys = spec["reject_status_keys"]  # esc가 거절이 아닌 에이전트(Grok: 포커스만 옮긴다)
                 if callable(keys):

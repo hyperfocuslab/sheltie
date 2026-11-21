@@ -56,7 +56,8 @@ class CopilotParseTests(unittest.TestCase):
         self.assertEqual([o["number"] for o in p["options"]], [1, 2, 3, None])
         # 2번은 permissions-config.json에 영구 저장(실측): 잠금화면 "계속 허용"에 붙이지 않는다
         self.assertEqual((p["selected"], p["always_index"], p["persist_index"]), (0, None, 1))
-        # 3번은 입력 항목(숫자는 커서만): 직접 입력으로. 앱이 입력 항목을 버튼에서 빼므로 서버가 거절 버튼 "No"(esc)를 더한다
+        # 3번은 입력 항목(숫자는 커서만): 직접 입력으로. 앱이 입력 항목을 버튼에서 빼므로 서버가 거절 버튼 "No"를 더한다
+        # (키는 3번 + 정해진 문구. esc는 턴 전체를 멈춘다)
         self.assertEqual((p["reject_index"], p["free_text_index"]), (3, 2))
         self.assertEqual(hr.push_category("blocked", PERM, p), "HR_PERMISSION")
 
@@ -145,9 +146,11 @@ class CopilotParseTests(unittest.TestCase):
         self.assertEqual(hr.answer_steps(card("exec"), text="use hi.py"), [("keys", ["3"]), ("text", "use hi.py")])
         with self.assertRaises(hr.ApiError):
             hr.answer_steps(card("exec"), option_index=2)  # 입력 항목은 글이 있어야 한다
-        # 서버가 더한 거절 버튼 "No": esc(거절, 턴이 멈춘다)
+        # 서버가 더한 거절 버튼 "No": 3번 + 정해진 문구(esc는 턴 전체를 멈춘다)
+        self.assertEqual(hr.COPILOT_DENY_TEXT, "Denied from phone. Don't do this; suggest another way.")
         for name in ("exec", "write", "edit"):
-            self.assertEqual(hr.answer_steps(card(name), option_index=3), [("keys", ["esc"])], name)
+            self.assertEqual(hr.answer_steps(card(name), option_index=3),
+                             [("keys", ["3"]), ("text", hr.COPILOT_DENY_TEXT)], name)
         self.assertEqual(hr.answer_steps(card("trust"), option_index=2), [("keys", ["3"])])
         self.assertEqual(hr.answer_steps(card("plan"), text="add docs"), [("keys", ["4"]), ("text", "add docs")])
         self.assertEqual(hr.answer_steps(card("plan"), option_index=2), [("keys", ["3"])])
@@ -279,15 +282,31 @@ class CopilotApiTests(unittest.TestCase):
         self.assertEqual(self.app.api_answer("p1", {"action": "approve", "prompt_id": pid})["keys"], ["1"])
         self.assertEqual(self.err(self.app.api_answer, "p1", {"action": "always", "prompt_id": pid}),
                          (409, "no_always"))
-        self.assertEqual(self.app.api_answer("p1", {"action": "reject", "prompt_id": pid})["keys"], ["esc"])
+        # 잠금화면 거부: esc(턴 전체 중단) 대신 3번 + 정해진 문구
+        self.assertEqual(self.app.api_answer("p1", {"action": "reject", "prompt_id": pid})["keys"], ["3", "<text>"])
         self.app.api_prompt_answer("p1", {"prompt_id": pid, "text": "use hi.py instead"})
         self.app.api_prompt_answer("p1", {"prompt_id": pid, "option_index": 1})  # 영구 허용은 카드에서 직접 고를 때만
         self.app.api_prompt_answer("p1", {"prompt_id": pid, "option_index": 3})  # 거절 버튼 "No"
-        self.assertEqual(self.hc.keys_calls, [("p1", ["1"]), ("p1", ["esc"]), ("p1", ["3"]), ("p1", ["2"]),
-                                              ("p1", ["esc"])])
-        self.assertEqual(self.hc.send_calls, [("p1", "use hi.py instead", "force")])
-        # 옛 경로(prompt_id 없음): hc status에 msg가 없어 승인은 앱에서, 거절은 esc
+        self.assertEqual(self.hc.keys_calls, [("p1", ["1"]), ("p1", ["3"]), ("p1", ["3"]), ("p1", ["2"]),
+                                              ("p1", ["3"])])
+        deny = ("p1", hr.COPILOT_DENY_TEXT, "force")
+        self.assertEqual(self.hc.send_calls, [deny, ("p1", "use hi.py instead", "force"), deny])
+        # 옛 경로(prompt_id 없음): hc status에 msg가 없어 승인은 앱에서, 거절은 3번 + 문구
         self.assertEqual(self.err(self.app.api_answer, "p1", {"action": "approve"}), (409, "needs_manual"))
+        self.assertEqual(self.app.api_answer("p1", {"action": "reject"})["keys"], ["3", "<text>"])
+        self.assertEqual((self.hc.keys_calls[-1], self.hc.send_calls[-1]), (("p1", ["3"]), deny))
+
+    def test_old_path_reject_file_approvals_and_fallback(self):
+        for name in ("write", "edit"):
+            self.set(PERM, cp(name))
+            self.assertEqual(self.app.api_answer("p1", {"action": "reject"})["keys"], ["3", "<text>"], name)
+        self.assertEqual(self.hc.send_calls, [("p1", hr.COPILOT_DENY_TEXT, "force")] * 2)
+        # 카드를 못 읽는 화면(PC에서 3번에 글을 치는 중)은 예전대로 esc
+        self.hc.screens["p1"] = cp("edit-3-typed")
+        self.assertEqual(self.app.api_answer("p1", {"action": "reject"})["keys"], ["esc"])
+        # 계획 카드는 그대로 esc
+        self.set(QUESTION, cp("plan"))
+        self.assertEqual(self.app.api_answer("p1", {"action": "reject"})["keys"], ["esc"])
 
     def test_recheck_before_keys(self):
         self.set(PERM, cp("write"))
