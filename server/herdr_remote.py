@@ -48,6 +48,7 @@ import ipaddress
 import json
 import logging
 import logging.handlers
+import mimetypes
 import ntpath
 import os
 import re
@@ -5163,6 +5164,14 @@ def home_real():
 
 def resolve_home_path(rel, home):
     """홈 기준 상대 경로 → 홈 아래 실제 폴더 절대 경로. 숨김 요소, 절대 경로, 홈 밖(심볼릭 링크 포함)은 400."""
+    p = _resolve_under_home(rel, home)
+    if not os.path.isdir(p):
+        raise ApiError(400, "bad_path")
+    return p
+
+
+def _resolve_under_home(rel, home):
+    """resolve_home_path의 경로 검사(폴더인지는 안 본다). 파일 보기 API도 같은 검사를 쓴다."""
     if rel is None:
         rel = ""
     if not isinstance(rel, str) or len(rel) > 1024 or "\x00" in rel or rel.startswith("/"):
@@ -5176,8 +5185,6 @@ def resolve_home_path(rel, home):
     if p != home and not p.startswith(home.rstrip(os.sep) + os.sep):
         raise ApiError(400, "bad_path")
     if p != home and rel_to_home(p, home) is None:  # 심볼릭 링크로 숨김 폴더에 들어간 경우
-        raise ApiError(400, "bad_path")
-    if not os.path.isdir(p):
         raise ApiError(400, "bad_path")
     return p
 
@@ -5193,6 +5200,157 @@ def rel_to_home(p, home):
     if any(x.startswith(".") for x in r.split("/" if IS_WINDOWS else os.sep)):
         return None
     return r
+
+
+# ---------------------------------------------------------------- 파일 보기·첨부
+#
+# 파일 보기(GET /api/files, /api/files/raw)는 폴더 고르기(/api/folders)와 같은 경로 검사에 더해
+# 홈 바로 아래 Library(Windows는 AppData도)를 통째로 막는다. 키체인·메일·메시지·브라우저 프로필이 거기 있다.
+# 맥 기본 파일 시스템은 대소문자를 가리지 않으므로 "library"도 막는다.
+# 첨부(POST /api/uploads)는 ~/.sheltie/uploads/<날짜>/에만 쓴다(점 폴더라 파일 보기로는 안 보인다).
+
+FILE_MAX = 32 * 1024 * 1024
+FILES_LIST_MAX = 1000
+UPLOAD_NAME_MAX = 80
+
+
+def _blocked_top(rel):
+    """홈 기준 상대 경로의 첫 요소가 홈의 숨김 폴더(Library 등)인가. 대소문자 무시."""
+    first = rel.replace("\\", "/").split("/", 1)[0].lower()
+    return first in {d.lower() for d in hidden_home_dirs()}
+
+
+def resolve_home_file(rel, home):
+    """파일 보기용: 홈 아래 실제 절대 경로(파일·폴더). 폴더 API 규칙 + Library 금지 + 없는 경로 400."""
+    p = _resolve_under_home(rel, home)
+    if p != home:
+        if _blocked_top(rel or "") or _blocked_top(rel_to_home(p, home) or ""):
+            raise ApiError(400, "bad_path")
+    if not os.path.exists(p):
+        raise ApiError(400, "bad_path")
+    return p
+
+
+def open_home_file(rel, home):
+    """GET /api/files/raw: (fd, 크기, 실제 경로). 일반 파일만, FILE_MAX 넘으면 413. fd는 호출한 쪽이 닫는다."""
+    if not rel:
+        raise ApiError(400, "bad_path")
+    p = resolve_home_file(rel, home)
+    if IS_WINDOWS and is_reparse_point(p):
+        raise ApiError(400, "bad_path")
+    try:
+        # FIFO에서 멈추지 않게 O_NONBLOCK, 검사와 열기 사이에 링크로 바뀐 경우를 막으려고 O_NOFOLLOW
+        fd = os.open(p, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+                     | getattr(os, "O_BINARY", 0))
+    except OSError:
+        raise ApiError(400, "bad_path")
+    try:
+        st_ = os.fstat(fd)
+        if not stat.S_ISREG(st_.st_mode):
+            raise ApiError(400, "not_file")
+        if st_.st_size > FILE_MAX:
+            raise ApiError(413, "too_large", max=FILE_MAX)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd, st_.st_size, p
+
+
+def list_home_dir(rel, home):
+    """GET /api/files: 폴더 안 파일·폴더. 숨김, 홈의 Library, 홈 밖·숨김으로 가는 링크, 특수 파일은 뺀다."""
+    p = resolve_home_file(rel or "", home)
+    if not os.path.isdir(p):
+        raise ApiError(400, "not_dir")
+    entries = []
+    try:
+        with os.scandir(p) as it:
+            for e in it:
+                if e.name.startswith(".") or (p == home and _blocked_top(e.name)):
+                    continue
+                try:
+                    if e.is_symlink():
+                        r = rel_to_home(os.path.realpath(e.path), home)
+                        if r is None or r == "" or _blocked_top(r):
+                            continue
+                    st_ = e.stat(follow_symlinks=True)
+                except OSError:
+                    continue
+                is_dir = stat.S_ISDIR(st_.st_mode)
+                if not is_dir and not stat.S_ISREG(st_.st_mode):
+                    continue
+                entries.append({"name": e.name, "dir": is_dir, "size": None if is_dir else st_.st_size,
+                                "mtime": int(st_.st_mtime)})
+    except OSError:
+        raise ApiError(400, "bad_path")
+    entries.sort(key=lambda x: (not x["dir"], x["name"].lower()))
+    return {"path": rel_to_home(p, home) or "", "entries": entries[:FILES_LIST_MAX],
+            "truncated": len(entries) > FILES_LIST_MAX}
+
+
+def sanitize_upload_name(name):
+    """첨부 파일 이름: 마지막 경로 요소만, 글자·숫자·._-만 남기고 나머지는 _, 앞의 점(숨김)은 뗀다."""
+    if not isinstance(name, str):
+        name = ""
+    name = unicodedata.normalize("NFC", name)
+    name = re.split(r"[/\\]", name)[-1]
+    out = "".join(c if (c.isalnum() or c in "._-") else "_" for c in name)
+    out = re.sub(r"_{2,}", "_", out).lstrip(".").rstrip(".")
+    if len(out) > UPLOAD_NAME_MAX:
+        stem, ext = os.path.splitext(out)
+        ext = ext if len(ext) <= 16 else ""
+        out = stem[:UPLOAD_NAME_MAX - len(ext)] + ext
+    if not out or not any(c.isalnum() for c in out):
+        out = "file" + (os.path.splitext(out)[1] if out else "")
+    return out
+
+
+def upload_dir(home, day):
+    """~/.sheltie/uploads/<day>. 단계마다 0700, 링크면 거부(다른 곳에 쓰지 않게)."""
+    d = home
+    for part in (".sheltie", "uploads", day):
+        d = os.path.join(d, part)
+        try:
+            os.mkdir(d) if IS_WINDOWS else os.mkdir(d, 0o700)
+        except FileExistsError:
+            pass
+        st_ = os.lstat(d)
+        if not stat.S_ISDIR(st_.st_mode) or (IS_WINDOWS and is_reparse_point(d)):
+            raise ApiError(500, "upload_dir")
+        if not IS_WINDOWS:
+            os.chmod(d, 0o700, follow_symlinks=False) if os.chmod in os.supports_follow_symlinks else os.chmod(d, 0o700)
+    return d
+
+
+def save_upload(home, name, length, rfile, day=None):
+    """POST /api/uploads 본문 length 바이트를 새 파일에 쓴다. 덜 오면 지우고 400."""
+    safe = sanitize_upload_name(name)
+    d = upload_dir(home, day or time.strftime("%Y-%m-%d"))
+    path = os.path.join(d, "%s-%s" % (secrets.token_hex(4), safe))
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+                 | getattr(os, "O_BINARY", 0), 0o600)
+    left = length
+    try:
+        with os.fdopen(fd, "wb") as f:
+            while left > 0:
+                b = rfile.read(min(left, 1 << 20))
+                if not b:
+                    break
+                f.write(b)
+                left -= len(b)
+    except BaseException:
+        _unlink_quiet(path)
+        raise
+    if left:
+        _unlink_quiet(path)
+        raise ApiError(400, "short_body")
+    return {"path": path, "name": os.path.basename(path), "size": length}
+
+
+def _unlink_quiet(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------- QR(페어링)
@@ -7986,6 +8144,7 @@ class App:
         for i in out:
             i["blocked_since"] = since.get(i["id"])
             i["branch"] = self.branches.get(i.get("cwd"))
+            i["cwd_rel"] = self.cwd_rel(i.get("cwd"))
         return {"terminals": out}
 
     def _read_screen(self, tid, n):
@@ -8255,6 +8414,22 @@ class App:
             if r and r not in recent and os.path.isdir(os.path.join(self.home, r)):
                 recent.append(r)
         return {"path": rel_to_home(p, self.home) or "", "dirs": dirs[:500], "recent": recent[:20]}
+
+    # --- 파일 보기·첨부
+    def api_files(self, rel):
+        return list_home_dir(rel or "", self.home)
+
+    def api_file_raw(self, rel):
+        return open_home_file(rel or "", self.home)
+
+    def api_upload(self, name, length, rfile):
+        return save_upload(self.home, name, length, rfile)
+
+    def cwd_rel(self, cwd):
+        """터미널 cwd의 홈 기준 상대 경로(파일 보기 시작 폴더). 홈 밖·숨김이면 None, 홈이면 ""."""
+        if not isinstance(cwd, str) or not cwd or not is_abs_path(cwd):
+            return None
+        return rel_to_home(os.path.realpath(cwd), self.home)
 
     def api_agents(self, body):
         p = resolve_home_path(body.get("path", ""), self.home)
@@ -8975,6 +9150,9 @@ ROUTES = [
     ("POST", re.compile(r"^/api/terminals/([^/]+)/prompt/answer$"), "prompt_answer"),
     ("GET", re.compile(r"^/api/terminals/([^/]+)/transcript$"), "transcript"),
     ("GET", re.compile(r"^/api/folders$"), "folders"),
+    ("GET", re.compile(r"^/api/files$"), "files"),
+    ("GET", re.compile(r"^/api/files/raw$"), "file_raw"),
+    ("POST", re.compile(r"^/api/uploads$"), "upload"),
     ("GET", re.compile(r"^/api/agents/catalog$"), "agent_catalog"),
     ("POST", re.compile(r"^/api/agents$"), "agents"),
     ("POST", re.compile(r"^/api/terminals/([^/]+)/keys$"), "keys"),
@@ -9056,6 +9234,50 @@ class Handler(http.server.BaseHTTPRequestHandler):
             raise ApiError(400, "bad_json")
         return body
 
+    def _reply_file(self, fd, size, real):
+        """파일 바이트를 그대로. 여는 사이 파일이 줄면 연결을 끊어 앱이 덜 받은 것을 알게 한다."""
+        ctype = mimetypes.guess_type(os.path.basename(real))[0] or "application/octet-stream"
+        with os.fdopen(fd, "rb") as f:
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(size))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            left = size
+            try:
+                while left > 0:
+                    b = f.read(min(left, 1 << 20))
+                    if not b:
+                        self.close_connection = True
+                        break
+                    self.wfile.write(b)
+                    left -= len(b)
+            except (BrokenPipeError, ConnectionResetError):  # 앱이 받다가 닫음(미리보기 취소)
+                self.close_connection = True
+
+    def _upload(self, app, query):
+        """POST /api/uploads?name=: 본문이 파일 바이트. Content-Length 필수, FILE_MAX까지."""
+        try:
+            if self.headers.get("Transfer-Encoding"):
+                raise ApiError(400, "chunked_not_supported")
+            cl = self.headers.get("Content-Length")
+            if not cl:
+                raise ApiError(411, "length_required")
+            try:
+                n = int(cl)
+            except ValueError:
+                raise ApiError(400, "bad_length")
+            if n <= 0:
+                raise ApiError(400, "empty")
+            if n > FILE_MAX:
+                raise ApiError(413, "too_large", max=FILE_MAX)
+            res = app.api_upload((query.get("name") or [""])[0], n, self.rfile)
+        except ApiError:
+            self.close_connection = True  # 안 읽은 본문이 다음 요청으로 읽히지 않게
+            raise
+        return self._reply(200, res)
+
     def _handle(self, method):
         app = self.server.app
         try:
@@ -9083,6 +9305,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     if res is None:
                         return self._reply_empty()
                     return self._reply(200, res)
+                if name == "upload":
+                    return self._upload(app, query)
+                if name == "file_raw":
+                    fd, size, real = app.api_file_raw((query.get("path") or [""])[0])
+                    return self._reply_file(fd, size, real)
                 body = self._body() if method in ("POST", "DELETE") else {}
                 tid = urllib.parse.unquote(mt.group(1)) if mt.groups() else None
                 if name == "health":
@@ -9110,6 +9337,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     res = app.api_transcript(tid, (query.get("limit") or [None])[0])
                 elif name == "folders":
                     res = app.api_folders((query.get("path") or [""])[0])
+                elif name == "files":
+                    res = app.api_files((query.get("path") or [""])[0])
                 elif name == "agent_catalog":
                     res = app.api_agent_catalog()
                 elif name == "agents":
