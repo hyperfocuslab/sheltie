@@ -1,0 +1,119 @@
+
+  ┃                                                                                                                                                             Hi from mock.
+  ┃  hello
+  ┃                                                                                                                                                             Context
+                                                                                                                                                                15 tokens
+     Hi from mock.                                                                                                                                              0% used
+                                                                                                                                                                $0.00 spent
+     ▣  Build · Mock Model · 563ms
+                                                                                                                                                                LSP
+  ┃                                                                                                                                                             LSPs are disabled
+  ┃  make notes file
+  ┃
+
+  ┃
+  ┃  $ touch notes.txt
+  ┃
+  ┃  (no output)
+  ┃
+
+     Created notes.txt.
+
+     ▣  Build · Mock Model · 33.9s
+
+  ┃
+  ┃  write hello.py
+  ┃
+
+     ← Write hello.py
+
+  ┃
+  ┃  edit readme
+  ┃
+
+  ┃
+  ┃  ← Edit README.md
+  ┃
+  ┃    1 - # demo                                                                 1 + # demo project
+  ┃
+
+     Edited README.md.
+
+     ▣  Build · Mock Model · 20.2s
+
+  ┃
+  ┃  ask me
+  ┃
+
+  ┃
+  ┃  # Questions
+  ┃
+  ┃  Which language should the demo use?
+  ┃  Go
+  ┃
+
+     Got it.
+
+     ▣  Build · Mock Model · 18.0s
+
+  ┃
+  ┃  ask me again
+  ┃
+
+  ┃
+  ┃  # Questions
+  ┃
+  ┃  Which language should the demo use?
+  ┃  Zig lang
+  ┃
+
+     Got it.
+
+     ▣  Build · Mock Model · 18.5s
+
+  ┃
+  ┃  ask many
+  ┃
+
+     → Asked 2 questions
+
+     ▣  Build · Mock Model
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  ┃
+  ┃   Features   License   Confirm
+  ┃
+  ┃  Review
+  ┃
+  ┃  Features: Logging, CI
+  ┃
+  ┃  License: GPL                                                                                                                                               ~/work/demo:main
+  ┃
+  ┃  ⇆ tab  enter submit  esc dismiss
+  ┃                                                                                                                                                             • OpenCode 1.19.6

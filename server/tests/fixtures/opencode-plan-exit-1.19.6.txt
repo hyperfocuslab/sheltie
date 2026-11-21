@@ -1,0 +1,119 @@
+
+  ┃                                                                                                                                                             Hi again.
+  ┃  hello
+  ┃                                                                                                                                                             Context
+                                                                                                                                                                15 tokens
+     Hi again.                                                                                                                                                  0% used
+                                                                                                                                                                $0.00 spent
+     ▣  Build · Mock Model · 473ms
+                                                                                                                                                                LSP
+  ┃                                                                                                                                                             LSPs are disabled
+  ┃  plan hello
+  ┃
+
+     Planning.
+
+     ▣  Plan · Mock Model · 111ms
+
+  ┃
+  ┃  write the plan
+  ┃
+
+  ┃
+  ┃  # Wrote .opencode/plans/1795247430562-quiet-eagle.md
+  ┃
+  ┃   1 # Plan
+  ┃   2
+  ┃   3 1. Add hello.py
+  ┃   4 2. Add tests
+  ┃   5
+  ┃
+
+     Plan written.
+
+     ▣  Plan · Mock Model · 15.3s
+
+  ┃
+  ┃  done planning
+  ┃
+
+     ⚙ plan_exit
+
+     ▣  Plan · Mock Model
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  ┃
+  ┃  Plan at .opencode/plans/1795247430562-quiet-eagle.md is complete. Would you like to switch to the build agent and start implementing?
+  ┃
+  ┃  1. Yes
+  ┃     Switch to build agent and start implementing the plan
+  ┃  2. No
+  ┃     Stay with plan agent to continue refining the plan                                                                                                      ~/work/demo:main
+  ┃
+  ┃  ↑↓ select  enter submit  esc dismiss
+  ┃                                                                                                                                                             • OpenCode 1.19.6

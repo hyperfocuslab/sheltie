@@ -1,0 +1,119 @@
+
+  ┃                                                                                                                                                             Hi again.
+  ┃  hello
+  ┃                                                                                                                                                             Context
+                                                                                                                                                                15 tokens
+     Hi again.                                                                                                                                                  0% used
+                                                                                                                                                                $0.00 spent
+     ▣  Build · Mock Model · 473ms
+                                                                                                                                                                LSP
+  ┃                                                                                                                                                             LSPs are disabled
+  ┃  plan hello
+  ┃
+
+     Planning.
+
+     ▣  Plan · Mock Model · 111ms
+
+  ┃
+  ┃  write the plan
+  ┃
+
+  ┃
+  ┃  # Wrote .opencode/plans/1795247430562-quiet-eagle.md
+  ┃
+  ┃   1 # Plan
+  ┃   2
+  ┃   3 1. Add hello.py
+  ┃   4 2. Add tests
+  ┃   5
+  ┃
+
+     Plan written.
+
+     ▣  Plan · Mock Model · 15.3s
+
+  ┃
+  ┃  done planning
+  ┃
+
+     ⚙ plan_exit
+     ⚙ invalid [tool=plan_exit, error=Model tried to call unavailable tool 'plan_exit'. Available tools: bash, edit, glob, grep, invalid, question, read,
+       skill, task, todowrite, webfetch, write.]
+
+     Starting implementation.
+
+     ▣  Build · Mock Model · 271ms
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  ┃
+  ┃
+  ┃                                                                                                                                                             ~/work/demo:main
+  ┃  Build · Mock Model Mock
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   /Users/me/work/demo                                                             15  ctrl+p commands    • OpenCode 1.19.6

@@ -1,0 +1,119 @@
+
+  ┃                                                                                                                                                             Hi again.
+  ┃  hello
+  ┃                                                                                                                                                             Context
+                                                                                                                                                                15 tokens
+     Hi again.                                                                                                                                                  0% used
+                                                                                                                                                                $0.00 spent
+     ▣  Build · Mock Model · 473ms
+                                                                                                                                                                LSP
+  ┃                                                                                                                                                             LSPs are disabled
+  ┃  plan hello
+  ┃
+
+     Planning.
+
+     ▣  Plan · Mock Model · 111ms
+
+  ┃
+  ┃  write the plan
+  ┃
+
+     ← Write .opencode/plans/1795247430562-quiet-eagle.md
+
+     ▣  Plan · Mock Model
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  ┃
+  ┃  △ Permission required
+  ┃    → Edit .opencode/plans/1795247430562-quiet-eagle.md
+  ┃
+  ┃                                                                             1 + # Plan
+  ┃                                                                             2 +
+  ┃                                                                             3 + 1. Add hello.py
+  ┃                                                                             4 + 2. Add tests
+  ┃
+  ┃
+  ┃
+  ┃                                                                                                                                                             ~/work/demo:main
+  ┃
+  ┃   Allow once   Allow always   Reject                                                                       ctrl+f fullscreen  ⇆ select  enter confirm
+  ┃                                                                                                                                                             • OpenCode 1.19.6

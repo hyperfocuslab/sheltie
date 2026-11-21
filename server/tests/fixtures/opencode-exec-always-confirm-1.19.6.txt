@@ -1,0 +1,119 @@
+
+  ┃                                                                                                                                                             Hi from mock.
+  ┃  hello
+  ┃                                                                                                                                                             Context
+                                                                                                                                                                15 tokens
+     Hi from mock.                                                                                                                                              0% used
+                                                                                                                                                                $0.00 spent
+     ▣  Build · Mock Model · 563ms
+                                                                                                                                                                LSP
+  ┃                                                                                                                                                             LSPs are disabled
+  ┃  make notes file
+  ┃
+
+     $ touch notes.txt
+
+     ▣  Build · Mock Model
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  ┃
+  ┃  △ Always allow
+  ┃
+  ┃  This will allow the following patterns until OpenCode is restarted
+  ┃
+  ┃  - touch *
+  ┃                                                                                                                                                             ~/work/demo:main
+  ┃
+  ┃   Confirm   Cancel                                                                                                            ⇆ select  enter confirm
+  ┃                                                                                                                                                             • OpenCode 1.19.6

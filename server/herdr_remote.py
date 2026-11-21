@@ -1569,6 +1569,144 @@ def is_qwen(info):
     return False
 
 
+# ---- OpenCode 대화 상자. 실측: opencode 1.19.6, 194열(tests/fixtures/opencode-*-1.19.6.txt).
+# 승인·질문·plan_exit는 화면 맨 아래 왼쪽 막대(`┃`) 블록이다. 오른쪽 사이드바(제목·Context·경로·"• OpenCode <버전>")가
+# 테두리 없이 같은 줄에 붙어 있어 마지막 줄의 "• OpenCode" 열에서 자른다(사이드바가 없는 좁은 화면은 자르지 않는다).
+# OSC 7501을 안 보내고 제목은 "OC | <세션 제목>"으로 고정이라 막힘·작업 중은 화면으로만 안다.
+# 승인 메뉴 `Allow once   Allow always   Reject`는 번호가 없고 숫자 키를 무시한다. ←/→(h/l)는 끝에서 반대편으로 돌고
+# 지금 고른 버튼은 색으로만 보여 화면 글자로 알 수 없다. 메뉴가 뜰 때 커서는 늘 Allow once라(실측) 그 자리를 기준으로
+# 한 번 허용 = enter, 계속 허용 = right enter + 2차 확인(Confirm) enter, 거절 = esc(커서 위치와 상관없다).
+# "Allow always"는 메모리에만 있다("until OpenCode is restarted", 재시작 뒤 다시 물음 실측): 세션 한정.
+# 2차 확인 화면(△ Always allow)의 esc는 Cancel(원래 메뉴로, 커서는 다시 Allow once), esc 두 번이면 거절(실측).
+# 질문(질문 1개·단일 선택)은 번호를 누르면 바로 제출, "Type your own answer"는 번호 → 붙여넣기+enter.
+# 여러 질문(탭)·복수 선택은 카드 없음. plan_exit(실험 플랜 모드)는 질문 모양 Yes/No(No는 턴 끝).
+OPENCODE_SIDEBAR_RE = re.compile(r"• OpenCode \d")
+OPENCODE_PERM_HEAD = "△ Permission required"
+OPENCODE_ALWAYS_HEAD = "△ Always allow"
+OPENCODE_PERM_LABELS = ("Allow once", "Allow always", "Reject")
+OPENCODE_BUTTONS_RE = re.compile(r"^Allow once {2,}Allow always {2,}Reject {2,}(.+)$")
+OPENCODE_CONFIRM_RE = re.compile(r"^Confirm {2,}Cancel {2,}(.+)$")
+OPENCODE_PERM_HINT_RE = re.compile(r"^(?:ctrl\+f (?:fullscreen|minimize) {2})?⇆ select {2}enter confirm$")
+OPENCODE_ALWAYS_Q_RE = re.compile(r"^This will allow .+ until OpenCode is restarted\.?$")
+OPENCODE_SHELL_HEAD = "# Shell command"
+OPENCODE_EDIT_HEAD_RE = re.compile(r"^→ (Edit \S.*)$")
+OPENCODE_Q_HINT = "↑↓ select  enter submit  esc dismiss"
+OPENCODE_FREE = "Type your own answer"
+OPENCODE_PLAN_Q_RE = re.compile(
+    r"^Plan at \S+ is complete\. Would you like to switch to the build agent and start implementing\?$")
+OPENCODE_BUSY_RE = re.compile(r"^\s*\S+\s+esc interrupt\b")  # 작업 중 맨 아래 줄 "⬝⬝⬝⬝⬝⬝⬝⬝  esc interrupt"
+# 카드를 못 읽어도 막힘인 대화 상자 힌트(승인·2차 확인 "⇆ select  enter confirm", 질문·여러 질문 "… esc dismiss")
+OPENCODE_DIALOG_RE = re.compile(r"⇆ select {2}enter confirm|\besc dismiss\b")
+OPENCODE_ANSWER_KEYS = {"Allow once": ["enter"], "Allow always": ["right", "enter", "enter"], "Reject": ["esc"],
+                        "Confirm": ["enter"], "Cancel": ["esc"]}
+
+
+def _cut_cols(line, col):
+    """표시 열 col부터 잘라 낸 앞부분."""
+    w = 0
+    for i, ch in enumerate(line):
+        if w >= col:
+            return line[:i]
+        w += char_width(ch)
+    return line
+
+
+def _opencode_block(lines):
+    """화면 맨 아래 `┃` 블록의 안쪽 줄(막대 뒤 글자, 사이드바는 잘라 냄). 맨 아래가 막대 블록이 아니면 None."""
+    nz = [i for i, ln in enumerate(lines) if ln.strip()]
+    if not nz:
+        return None
+    last = nz[-1]
+    bar = lines[last].find("┃")
+    if bar < 0 or lines[last][:bar].strip():
+        return None
+    m = OPENCODE_SIDEBAR_RE.search(lines[last])
+    cut = sum(char_width(c) for c in lines[last][:m.start()]) if m else None
+    top = last
+    while top > 0 and len(lines[top - 1]) > bar and lines[top - 1][bar] == "┃" and not lines[top - 1][:bar].strip():
+        top -= 1
+    return [(_cut_cols(ln, cut) if cut is not None else ln)[bar + 1:].rstrip() for ln in lines[top:last + 1]]
+
+
+def _parse_opencode_approval(inner):
+    idx = [i for i, ln in enumerate(inner) if ln.strip()]
+    if len(idx) < 3:
+        return None
+    head, btn = inner[idx[0]].strip(), idx[-1]
+    rx = {OPENCODE_PERM_HEAD: OPENCODE_BUTTONS_RE, OPENCODE_ALWAYS_HEAD: OPENCODE_CONFIRM_RE}.get(head)
+    m = rx.match(inner[btn].strip()) if rx else None
+    if not m or not OPENCODE_PERM_HINT_RE.match(m.group(1).strip()):
+        return None
+    mid = [i for i in idx if idx[0] < i < btn]
+    if not mid:
+        return None
+    first = inner[mid[0]].strip()
+    if head == OPENCODE_PERM_HEAD:
+        if first == OPENCODE_SHELL_HEAD:
+            title = first[2:]
+        else:
+            me = OPENCODE_EDIT_HEAD_RE.match(first)
+            if not me:
+                return None  # 캡처하지 않은 권한(웹 가져오기, 폴더 밖 접근 등)
+            title = me.group(1)
+        p = _finish("approval", title, OPENCODE_PERM_HEAD[2:], _dedent_block(inner[mid[0] + 1:btn]),
+                    [(lb, None, None) for lb in OPENCODE_PERM_LABELS], selected=0, always_index=1, reject_index=2)
+    else:
+        if not OPENCODE_ALWAYS_Q_RE.match(first):
+            return None
+        # 거절(reject_index 없음)은 esc 두 번: 2차 확인의 esc는 Cancel(원래 메뉴)이라 한 번 더 눌러 거절한다
+        p = _finish("approval", OPENCODE_ALWAYS_HEAD[2:], first, _dedent_block(inner[mid[0] + 1:btn]) or first,
+                    [("Confirm", None, None), ("Cancel", None, None)], selected=0)
+    p["approve_index"] = 0
+    return p
+
+
+def _parse_opencode_question(inner):
+    idx = [i for i, ln in enumerate(inner) if ln.strip()]
+    if len(idx) < 3 or inner[idx[-1]].strip() != OPENCODE_Q_HINT:
+        return None  # 여러 질문(탭: "⇆ tab …")·복수 선택("enter toggle")은 힌트가 다르다
+    rows = _menu_rows(inner, 0, idx[-1])
+    if not rows or any(r["selected"] or r["checkbox"] for r in rows):
+        return None
+    head = [inner[i].strip() for i in idx if i < rows[0]["line"]]
+    if not head:
+        return None
+    question = _norm(" ".join(head))
+    labels = [_norm(r["label"]) for r in rows]
+    free = None
+    if labels[-1] == OPENCODE_FREE:
+        if rows[-1]["extra"]:
+            return None  # PC에서 직접 입력 칸을 열었다(칸이 항목 아래에 그려진다)
+        free = len(rows) - 1
+    opts = [(lb, _norm(" ".join(r["extra"])) or None, r["num"]) for lb, r in zip(labels, rows)]
+    if OPENCODE_PLAN_Q_RE.match(question):
+        if labels != ["Yes", "No"]:
+            return None
+        return _finish("plan", None, question, None, opts, reject_index=1)
+    return _finish("question", None, question, None, opts, free_text_index=free)
+
+
+def _parse_opencode_lines(lines, plan_reader=None):
+    inner = _opencode_block(lines)
+    if inner is None:
+        return None
+    p = _parse_opencode_approval(inner) or _parse_opencode_question(inner)
+    if p:
+        p["agent"] = "opencode"
+    return p
+
+
+def _pick_opencode(p, option_index):
+    """승인·2차 확인 버튼(번호 없음, 커서가 돌아 화면으로 위치를 모른다): 뜰 때 자리(첫 버튼) 기준 키. 질문은 숫자 키."""
+    if p["kind"] != "approval":
+        return None
+    return [("keys", list(OPENCODE_ANSWER_KEYS[p["options"][option_index]["label"]]))]
+
+
+def _reject_keys_opencode(p):
+    return ["esc", "esc"] if p["kind"] == "approval" and p["title"] == OPENCODE_ALWAYS_HEAD[2:] else ["esc"]
+
+
 def _parse_codex_lines(lines, plan_reader=None):
     return _parse_codex_approval(lines) or _parse_codex_question(lines) or _parse_codex_plan(lines)
 
@@ -1729,6 +1867,10 @@ def answer_steps(p, option_index=None, option_indices=None, text=None):
         raise ApiError(400, "use_option_indices")
     if option_index == p.get("free_text_index"):
         raise ApiError(400, "needs_text")
+    pick = agent_spec(p.get("agent")).get("pick")  # 에이전트만의 키(OpenCode 승인 버튼)
+    steps = pick(p, option_index) if pick else None
+    if steps is not None:
+        return steps
     # 화면에 번호가 없는 메뉴(Claude confirm, Copilot 질문: 숫자 키를 무시한다)는 커서 이동 + enter
     if kind == "confirm" or num(option_index) > 9 or p["options"][option_index].get("number") is None:
         cur = p.get("selected")
@@ -2577,6 +2719,156 @@ def find_qwen_transcript(info, home, runner=None):
     return best[2], best[1]
 
 
+# OpenCode 기록은 세션별 파일이 아니라 SQLite 하나다(실측 1.19.6): $XDG_DATA_HOME/opencode/opencode.db
+# (기본 ~/.local/share/opencode/opencode.db, WAL). session(id ses_…, directory=cwd, parent_id=하위 에이전트),
+# message(id, session_id, time_created, data JSON: role…), part(id, message_id, session_id, data JSON: type text·reasoning·
+# tool·step-start…). 실행 중인 OpenCode가 계속 열어 두므로 읽기 전용(mode=ro)으로만 연다.
+OPENCODE_SESSION_RE = re.compile(r"^ses_[0-9A-Za-z]{8,64}$")
+OPENCODE_MAX_MESSAGES = 1000  # 대화 보기에 읽을 최근 메시지 수(넘으면 truncated)
+OPENCODE_PREVIEW_MESSAGES = 40
+OPENCODE_DB_TIMEOUT = 1.0
+OPENCODE_HIDDEN_USER_PREFIXES = ("<system-reminder>",)
+_opencode_preview_cache = {}  # (db 경로, 세션) → ((db·wal 크기·시각), 미리보기)
+
+
+def opencode_db(home):
+    env = os.environ.get("XDG_DATA_HOME")
+    base = os.path.expanduser(env) if env else os.path.join(home, ".local", "share")
+    return os.path.join(base, "opencode", "opencode.db")
+
+
+def _opencode_query(path, sql, args=()):
+    """읽기 전용으로 열어 한 번 묻고 닫는다. 못 열거나 실패하면 None."""
+    try:
+        import pathlib
+        import sqlite3
+    except ImportError:  # _sqlite3 없이 빌드된 Python
+        return None
+    try:
+        if not stat.S_ISREG(os.stat(path, follow_symlinks=False).st_mode):
+            return None
+        con = sqlite3.connect(pathlib.Path(os.path.abspath(path)).as_uri() + "?mode=ro", uri=True,
+                              timeout=OPENCODE_DB_TIMEOUT, check_same_thread=False)
+    except (OSError, ValueError, sqlite3.Error):
+        return None
+    try:
+        return con.execute(sql, args).fetchall()
+    except sqlite3.Error:
+        return None
+    finally:
+        con.close()
+
+
+def find_opencode_transcript(info, home, runner=None):
+    """OpenCode 터미널 → (session_id, opencode.db 경로). 그 폴더(session.directory)에서 가장 최근에 바뀐 최상위 세션."""
+    cwd = live_cwd(info or {})
+    if not cwd:
+        return None, None
+    path = opencode_db(home)
+    rows = _opencode_query(path, "SELECT id FROM session WHERE directory IN (?, ?) AND parent_id IS NULL "
+                                 "ORDER BY time_updated DESC LIMIT 1", (cwd, os.path.realpath(cwd)))
+    if not rows or not isinstance(rows[0][0], str) or not OPENCODE_SESSION_RE.match(rows[0][0]):
+        return None, None
+    return rows[0][0], path
+
+
+def _opencode_tool_summary(name, inp):
+    fp = inp.get("filePath")
+    if isinstance(fp, str) and fp.strip():
+        return _cap(_tilde(fp.strip()), 200)
+    return _tool_summary(name, inp)
+
+
+def _parse_opencode_transcript(items, limit):
+    """[(message data, [part data…])] → (turns, 잘렸는지). user는 text(OpenCode가 넣은 synthetic·system-reminder 숨김),
+    assistant는 text·reasoning·tool(state.status completed → output, error → error, 그 밖은 대기). 실측 1.19.6."""
+    turns = []
+    for msg, parts in items:
+        role = msg.get("role") if isinstance(msg, dict) else None
+        out = []
+        for pt in parts:
+            if not isinstance(pt, dict):
+                continue
+            typ, text = pt.get("type"), pt.get("text")
+            if role == "user":
+                if typ == "text" and isinstance(text, str) and text.strip() and not pt.get("synthetic") \
+                        and not text.lstrip().startswith(OPENCODE_HIDDEN_USER_PREFIXES):
+                    out.append({"kind": "text", "text": _cap(text)})
+            elif typ in ("text", "reasoning"):
+                if isinstance(text, str) and text.strip():
+                    out.append({"kind": "text" if typ == "text" else "thinking", "text": _cap(text)})
+            elif typ == "tool":
+                name = pt.get("tool") if isinstance(pt.get("tool"), str) else "?"
+                s = pt.get("state") if isinstance(pt.get("state"), dict) else {}
+                inp = s.get("input") if isinstance(s.get("input"), dict) else {}
+                status = s.get("status")
+                res = s.get("output") if status == "completed" else s.get("error") if status == "error" else None
+                out.append({"kind": "tool", "name": name, "summary": _opencode_tool_summary(name, inp),
+                            "input": _cap_obj(inp), "output": _cap(_strip_ansi(res)) if isinstance(res, str) else None,
+                            "state": {"completed": "ok", "error": "error"}.get(status, "pending")})
+        if role == "user" and out:
+            turns.append({"role": "user", "parts": out})
+        elif role == "assistant":
+            _codex_add(turns, "assistant", out)
+    cut = len(turns) > limit
+    return turns[-limit:] if limit else turns, cut
+
+
+def read_opencode_transcript(path, sid, limit=50, max_messages=OPENCODE_MAX_MESSAGES):
+    if not isinstance(sid, str) or not OPENCODE_SESSION_RE.match(sid):
+        return [], False
+    msgs = _opencode_query(path, "SELECT id, data FROM message WHERE session_id = ? "
+                                 "ORDER BY time_created DESC, id DESC LIMIT ?", (sid, max_messages + 1))
+    if not msgs:
+        return [], False
+    more = len(msgs) > max_messages
+    msgs = list(reversed(msgs[:max_messages]))
+    by_msg = {m[0]: [] for m in msgs}
+    ids = list(by_msg)
+    for k in range(0, len(ids), 500):
+        chunk = ids[k:k + 500]
+        rows = _opencode_query(path, "SELECT message_id, data FROM part WHERE session_id = ? AND message_id IN (%s) "
+                                     "ORDER BY message_id, id" % ",".join("?" * len(chunk)), [sid] + chunk)
+        for mid, data in rows or []:
+            try:
+                by_msg[mid].append(json.loads(data))
+            except (ValueError, TypeError, KeyError):
+                continue
+    items = []
+    for mid, data in msgs:
+        try:
+            items.append((json.loads(data), by_msg[mid]))
+        except (ValueError, TypeError):
+            continue
+    turns, cut = _parse_opencode_transcript(items, limit)
+    return turns, cut or more
+
+
+def opencode_preview(path, sid):
+    """목록 미리보기: 최근 메시지 몇 개만 읽어 마지막 assistant 글. db·wal이 안 바뀌었으면 기억한 값."""
+    key = []
+    for f in (path, path + "-wal"):
+        try:
+            st_ = os.stat(f, follow_symlinks=False)
+            key.append((st_.st_mtime_ns, st_.st_size))
+        except OSError:
+            key.append(None)
+    hit = _opencode_preview_cache.get((path, sid))
+    if hit and hit[0] == key:
+        return hit[1]
+    turns, _ = read_opencode_transcript(path, sid, 0, max_messages=OPENCODE_PREVIEW_MESSAGES)
+    pv = None
+    for turn in reversed(turns):
+        texts = [p["text"] for p in turn["parts"] if p.get("kind") == "text"] if turn["role"] == "assistant" else []
+        if texts:
+            pv = preview_clean(texts[-1])
+            break
+    if len(_opencode_preview_cache) > 200:
+        _opencode_preview_cache.clear()
+    _opencode_preview_cache[(path, sid)] = (key, pv)
+    return pv
+
+
 def find_agent_transcript(info, home, runner=None):
     return agent_spec(agent_kind(info))["transcript"](info, home, runner=runner)
 
@@ -2663,7 +2955,10 @@ def terminal_preview(info, home, runner=None, now=None):
                 if len(_preview_by_pid) > 200:
                     _preview_by_pid.clear()
                 _preview_by_pid[pid] = (now + PREVIEW_SESSION_TTL, (sid, path))
-        return preview_for_path(path) if path else None
+        if not path:
+            return None
+        pv = agent_spec(agent_kind(info)).get("preview")  # 기록이 jsonl이 아닌 에이전트(OpenCode SQLite)
+        return pv(path, sid) if pv else preview_for_path(path)
     except Exception:
         return None
 
@@ -4345,6 +4640,11 @@ QWEN_PUSH_PROMPT_WAIT = 1.0
 #   send_guard             화면으로 판정한 막힘이면 메시지 보내기를 409로 막는다(hc는 그 상자를 몰라 글자가 들어간다)
 #   title_blocked/title_working  "full"에서 터미널 제목으로 막힘·작업 중을 아는 정규식(없으면 None)
 #   busy_re                "full"에서 제목이 없을 때 화면 끝 줄로 작업 중을 아는 정규식(없으면 None)
+#   dialog_re              "full"에서 카드를 못 읽어도 화면 끝 줄이 이 힌트면 막힘(제목으로 막힘을 모르는 에이전트, 없으면 None)
+#   pick(p, i)             (선택) 그 항목을 고르는 키 단계. None을 주면 숫자·커서 이동 기본 방식
+#   reject_keys(p)         (선택) reject_index가 없는 카드의 거절 키(기본 esc)
+#   approve_keys           (선택) 카드 없이(prompt_id 없이) 승인할 때 "1" 대신 보낼 키
+#   read(path, sid, n)     (선택) 기록이 jsonl이 아닐 때 (turns, 잘렸는지). preview(path, sid)는 목록 미리보기
 AGENTS = {
     "claude": {"match": is_claude, "parse": _parse_claude_lines, "free_text": _free_text_digit,
                "transcript": lambda info, home, runner=None: find_transcript(info, home, runner=runner),
@@ -4374,8 +4674,19 @@ AGENTS = {
     "qwen": {"match": is_qwen, "parse": _parse_qwen_lines, "free_text": _free_text_digit,
              "transcript": lambda info, home, runner=None: find_qwen_transcript(info, home, runner=runner),
              "push_wait": lambda: QWEN_PUSH_PROMPT_WAIT, "retry": True, "screen": None, "send_guard": True},
+    # OpenCode는 OSC 7501을 안 보내고 제목도 "OC | <세션 제목>"으로 고정이다(실측 1.19.6): 막힘은 화면 대화 상자,
+    # 작업 중은 맨 아래 "esc interrupt" 줄로만 안다. 기록은 SQLite(opencode.db).
+    "opencode": {"match": _named("opencode"), "parse": _parse_opencode_lines, "free_text": _free_text_digit,
+                 "transcript": lambda info, home, runner=None: find_opencode_transcript(info, home, runner=runner),
+                 "read": lambda path, sid, n: read_opencode_transcript(path, sid, n),
+                 "preview": lambda path, sid: opencode_preview(path, sid),
+                 "push_wait": lambda: PUSH_PROMPT_BUDGET, "retry": False, "screen": "full",
+                 "title_blocked": None, "title_working": None, "busy_re": OPENCODE_BUSY_RE,
+                 "dialog_re": OPENCODE_DIALOG_RE, "pick": _pick_opencode, "reject_keys": _reject_keys_opencode,
+                 "approve_keys": ["enter"],
+                 "send_guard": True},
 }
-AGENT_ORDER = ("claude", "codex", "gemini", "copilot", "qwen")
+AGENT_ORDER = ("claude", "codex", "gemini", "copilot", "qwen", "opencode")
 SCREEN_POLL_INTERVAL = 3.0  # "full" 에이전트 화면 판정 주기(초). 제목 이벤트가 먼저 오면 그때 바로 본다
 SCREEN_SETTLE = 0.6  # 제목은 막힘인데 메뉴를 못 읽었을 때 다시 볼 때까지(초)
 PROMPT_STATUS_KINDS = {"approval": "permission", "confirm": "permission", "question": "question", "plan": "plan"}
@@ -4524,6 +4835,10 @@ class App:
                 return None
             else:
                 st = {"app": kind, "state": "blocked", "kind": "dialog", "msg": None}
+        elif spec.get("dialog_re") and text and any(
+                spec["dialog_re"].search(ln) for ln in [x for x in screen_lines(text) if x.strip()][-4:]):
+            # 카드로 못 읽는 대화 상자(여러 질문 등)나 PC에서 직접 입력 칸을 연 상자: 같은 상자면 그대로
+            st = prev_st if prev == "blocked" else {"app": kind, "state": "blocked", "kind": "dialog", "msg": None}
         else:
             busy = bool(spec.get("title_working") and spec["title_working"].search(title))
             if not busy and spec.get("busy_re") and text:
@@ -5097,7 +5412,7 @@ class App:
                 else:
                     idx = p.get("reject_index")
                 if idx is None:
-                    keys = ["esc"]
+                    keys = agent_spec(p.get("agent")).get("reject_keys", lambda _p: ["esc"])(p)
                     self._keys(tid, keys)
                 else:
                     keys = self._do_steps(tid, answer_steps(p, option_index=idx))
@@ -5111,6 +5426,8 @@ class App:
         with self.term_lock(tid):
             info = self.require_claude(tid)
             keys = decide_answer(self.effective_info(tid, info), action, expect)
+            if keys == ["1"]:
+                keys = list(agent_spec(agent_kind(info)).get("approve_keys") or keys)  # 숫자 키를 무시하는 승인 메뉴
             self._keys(tid, keys)
         log.info("answer %s %s", tid, action)
         return {"ok": True, "keys": keys}
@@ -5204,6 +5521,10 @@ class App:
         else:
             info = self.require_claude(tid)
             sid, path = find_agent_transcript(info, self.home, runner=self.runner)
+            reader = agent_spec(agent_kind(info)).get("read")  # 기록이 jsonl이 아닌 에이전트(OpenCode SQLite)
+            if reader and path:
+                turns, cut = reader(path, sid, n)
+                return {"session_id": sid, "turns": turns, "truncated": cut}
         if not path:
             return {"session_id": sid, "turns": [], "truncated": False}
         try:

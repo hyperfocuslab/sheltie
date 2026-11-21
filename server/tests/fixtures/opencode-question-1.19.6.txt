@@ -1,0 +1,119 @@
+
+  ┃                                                                                                                                                             Hi from mock.
+  ┃  hello
+  ┃                                                                                                                                                             Context
+                                                                                                                                                                15 tokens
+     Hi from mock.                                                                                                                                              0% used
+                                                                                                                                                                $0.00 spent
+     ▣  Build · Mock Model · 563ms
+                                                                                                                                                                LSP
+  ┃                                                                                                                                                             LSPs are disabled
+  ┃  make notes file
+  ┃
+
+  ┃
+  ┃  $ touch notes.txt
+  ┃
+  ┃  (no output)
+  ┃
+
+     Created notes.txt.
+
+     ▣  Build · Mock Model · 33.9s
+
+  ┃
+  ┃  write hello.py
+  ┃
+
+     ← Write hello.py
+
+  ┃
+  ┃  edit readme
+  ┃
+
+  ┃
+  ┃  ← Edit README.md
+  ┃
+  ┃    1 - # demo                                                                 1 + # demo project
+  ┃
+
+     Edited README.md.
+
+     ▣  Build · Mock Model · 20.2s
+
+  ┃
+  ┃  ask me
+  ┃
+
+     → Asked 1 question
+
+     ▣  Build · Mock Model
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  ┃
+  ┃  Which language should the demo use?
+  ┃
+  ┃  1. Python
+  ┃     Simple scripting
+  ┃  2. Go
+  ┃     Static binary
+  ┃  3. Rust
+  ┃     Memory safe
+  ┃  4. Type your own answer                                                                                                                                    ~/work/demo:main
+  ┃
+  ┃  ↑↓ select  enter submit  esc dismiss
+  ┃                                                                                                                                                             • OpenCode 1.19.6

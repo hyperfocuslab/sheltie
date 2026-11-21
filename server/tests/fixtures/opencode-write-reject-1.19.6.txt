@@ -1,0 +1,119 @@
+
+  ┃                                                                                                                                                             Hi from mock.
+  ┃  hello
+  ┃                                                                                                                                                             Context
+                                                                                                                                                                15 tokens
+     Hi from mock.                                                                                                                                              0% used
+                                                                                                                                                                $0.00 spent
+     ▣  Build · Mock Model · 563ms
+                                                                                                                                                                LSP
+  ┃                                                                                                                                                             LSPs are disabled
+  ┃  make notes file
+  ┃
+
+  ┃
+  ┃  $ touch notes.txt
+  ┃
+  ┃  (no output)
+  ┃
+
+     Created notes.txt.
+
+     ▣  Build · Mock Model · 33.9s
+
+  ┃
+  ┃  write hello.py
+  ┃
+
+     ← Write hello.py
+
+     ▣  Build · Mock Model
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  ┃
+  ┃
+  ┃                                                                                                                                                             ~/work/demo:main
+  ┃  Build · Mock Model Mock
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   /Users/me/work/demo                                                             15  ctrl+p commands    • OpenCode 1.19.6

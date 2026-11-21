@@ -1,0 +1,119 @@
+  ┃
+                                                                                                                                                                Hi from mock.
+  ┃
+  ┃  ← Edit README.md                                                                                                                                           Context
+  ┃                                                                                                                                                             15 tokens
+  ┃    1 - # demo                                                                 1 + # demo project                                                            0% used
+  ┃                                                                                                                                                             $0.00 spent
+
+     Edited README.md.                                                                                                                                          LSP
+                                                                                                                                                                LSPs are disabled
+     ▣  Build · Mock Model · 20.2s
+
+  ┃
+  ┃  ask me
+  ┃
+
+  ┃
+  ┃  # Questions
+  ┃
+  ┃  Which language should the demo use?
+  ┃  Go
+  ┃
+
+     Got it.
+
+     ▣  Build · Mock Model · 18.0s
+
+  ┃
+  ┃  ask me again
+  ┃
+
+  ┃
+  ┃  # Questions
+  ┃
+  ┃  Which language should the demo use?
+  ┃  Zig lang
+  ┃
+
+     Got it.
+
+     ▣  Build · Mock Model · 18.5s
+
+  ┃
+  ┃  ask many
+  ┃
+
+  ┃
+  ┃  # Questions
+  ┃
+  ┃  Which features do you want?
+  ┃  Logging, CI
+  ┃
+  ┃  Which license?
+  ┃  GPL
+  ┃
+
+     Got it.
+
+     ▣  Build · Mock Model · 25.2s
+
+  ┃
+  ┃  ask name
+  ┃
+
+  ┃
+  ┃  # Questions
+  ┃
+  ┃  What should the project be called?
+  ┃  acme
+  ┃
+
+     Got it.
+
+     ▣  Build · Mock Model · 22.2s
+
+  ┃
+  ┃  ask pick
+  ┃
+
+     → Asked 1 question
+
+  ┃
+  ┃  plan it
+  ┃
+
+  ┃
+  ┃  # Wrote plan.txt
+  ┃
+  ┃   1 x
+  ┃   2
+  ┃
+
+     Plan: do x.
+
+     ▣  Plan · Mock Model · 258ms
+
+  ┃
+  ┃  make b
+  ┃
+
+     $ touch b.txt
+
+  ┃
+  ┃  wait
+  ┃
+
+     $ sleep 8
+
+     ▣  Build · Mock Model
+
+  ┃
+  ┃  △ Permission required
+  ┃    # Shell command
+  ┃
+  ┃  $ sleep 8
+  ┃                                                                                                                                                             ~/work/demo:main
+  ┃
+  ┃   Allow once   Allow always   Reject                                                                       ctrl+f fullscreen  ⇆ select  enter confirm
+  ┃                                                                                                                                                             • OpenCode 1.19.6
