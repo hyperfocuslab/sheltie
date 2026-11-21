@@ -1065,6 +1065,16 @@ def _parse_codex_plan(lines):
 # ---- Gemini CLI 대화 상자. 실측: gemini-cli 0.70.0, 200열(tests/fixtures/gemini-*-0.70.0.txt).
 # 메뉴는 화면 맨 끝의 ╭…╰ 상자 안에 있고 커서는 `●`, 숫자 키가 그 항목을 바로 고르고 제출한다.
 # 직접 입력 줄("Enter a custom value", "Type your feedback...")은 숫자로 커서만 옮기고 입력 칸이 열린다.
+# ask_user 여러 질문은 상자 안 탭 막대(`← □ Features │ ✓ DB │ ≡ Review →`, ✓ = 답한 질문. 지금 탭은 색으로만 보인다)가 있고,
+# 목록은 늘 3항목(6줄) 창으로 스크롤된다(▲/▼, 질문 하나여도 4항목 이상이면). 그래서 항목 전체는 화면이 아니라 Gemini
+# 기록(jsonl)에 먼저 쓰이는 ask_user 호출 인자(status "scheduled")에서 읽고, 보이는 질문 문장·탭 이름·번호 줄이 그것과
+# 맞을 때만 카드로 만든다(지금 질문 = 문장이 같은 질문). 키(실측 0.70.0): 숫자 = 그 항목으로 커서 + 고르기(단일 선택은
+# 고르고 다음 탭, 마지막이면 제출. 복수 선택은 토글). 복수 선택 항목은 옵션들, "All of the above"(옵션 2개 이상),
+# 직접 입력, "Done"(번호 표시 없지만 숫자 키는 된다: 다음 탭/제출). 안 보이는 항목의 체크는 모르니 All → 1 → All → All
+# (어느 상태에서든 전부 해제)로 비운 뒤 고를 것만 토글하고 Done. 직접 입력은 그 번호 → 붙여넣기+enter(다음 탭). 글 질문은
+# 붙여넣기+enter. Review 탭은 enter 제출(안 답한 질문은 빠진 채로), esc는 질문 전체 취소(턴이 멈춘다).
+# 커서가 직접 입력 줄에 있으면(숫자가 글자로 들어간다) 카드 없음. 안 보이는 직접 입력 줄에 PC에서 글을 넣었으면 그 글도
+# 같이 간다(화면으로 못 본다).
 GEMINI_APPROVE_FIRST = "Allow once"
 GEMINI_ALWAYS = "Allow for this session"
 GEMINI_EDITOR_RE = re.compile(r"external editor", re.I)
@@ -1078,6 +1088,18 @@ GEMINI_PLAN_Q = "Ready to start implementation?"
 GEMINI_PLAN_HINT_RE = re.compile(r"^Enter to select · ↑/↓ to navigate · Ctrl\+G to edit plan · Esc to cancel$")
 GEMINI_TITLE_BLOCKED_RE = re.compile(r"^\s*✋")  # 터미널 제목: ✋ Action Required / ✦ Working… / ◇ Ready
 GEMINI_TITLE_WORKING_RE = re.compile(r"^\s*✦")
+GEMINI_ASK_KEY = "gemini:ask_user"  # parse의 reader에 이 키를 주면 답을 기다리는 ask_user 질문들(list)을 준다
+GEMINI_TABS_HINT = "Enter to select · ←/→ to switch questions · Esc to cancel"
+GEMINI_TABS_TEXT_HINT = "Enter to submit · Tab/Shift+Tab to switch questions · Esc to cancel"
+GEMINI_REVIEW_HINT = "Enter to submit · Tab/Shift+Tab to edit answers · Esc to cancel"
+GEMINI_REVIEW_HEAD = "Review your answers:"
+GEMINI_REVIEW_WARN_RE = re.compile(r"^⚠ You have \d+ unanswered questions?$")
+GEMINI_MULTI_NOTE = "(Select all that apply)"
+GEMINI_ALL = "All of the above"
+GEMINI_DONE = "Done"
+GEMINI_ASK_ROW_RE = re.compile(r"^(●)?\s*(\d+)\.\s+(?:\[([ x])\]\s+)?(\S.*)$")
+GEMINI_ASK_DONE_RE = re.compile(r"^(●)?\s+Done$")
+GEMINI_SUBMIT_LABELS = ("Submit", "Cancel")
 
 
 def _box_unwrap(line):
@@ -1166,12 +1188,13 @@ def _gemini_meaningful(inner):
     return [i for i, ln in enumerate(inner) if ln.strip()]
 
 
-def _parse_gemini_question(inner):
+def _parse_gemini_question(inner, plan_reader=None):
     idx = _gemini_meaningful(inner)
     if len(idx) < 3 or inner[idx[0]].strip() != GEMINI_Q_HEAD:
         return None
     if any(inner[i].strip() in ("▲", "▼") or inner[i].strip().startswith("←") for i in idx):
-        return None  # 여러 질문(탭)·스크롤되는 목록: 일부만 보여 카드로 만들지 않는다
+        # 여러 질문(탭)·스크롤되는 목록: 화면엔 일부만 보여 기록의 ask_user 인자와 맞춰 본다(없으면 카드 없음)
+        return _parse_gemini_ask(inner, idx, plan_reader(GEMINI_ASK_KEY) if plan_reader else None)
     hint = inner[idx[-1]].strip()
     rows = _gemini_rows(inner, idx[0] + 1)
     if rows and GEMINI_Q_HINT_RE.match(hint):
@@ -1196,6 +1219,238 @@ def _parse_gemini_question(inner):
     return p
 
 
+def _gemini_tab_bar(s):
+    """`← □ Features │ ✓ DB │ ≡ Review →` → [(답했는가, 이름)](Review 뺌) 또는 None."""
+    if not (s.startswith("← ") and s.endswith(" →")):
+        return None
+    items = s[2:-2].split(" │ ")
+    if len(items) < 3 or items[-1] != "≡ Review":
+        return None
+    out = []
+    for it in items[:-1]:
+        if len(it) < 3 or it[0] not in "□✓" or it[1] != " ":
+            return None
+        out.append((it[0] == "✓", it[2:]))
+    return out
+
+
+def _gemini_ask_questions(qs):
+    """기록의 ask_user questions → [(type, 질문, 머리말, [(라벨, 설명)], 복수 선택, placeholder)] 또는 None(모르는 모양)."""
+    if not isinstance(qs, list) or not qs:
+        return None
+    out = []
+    for q in qs:
+        if not isinstance(q, dict) or not isinstance(q.get("question"), str) or not isinstance(q.get("header"), str):
+            return None
+        t = q.get("type")
+        ph = q.get("placeholder") if isinstance(q.get("placeholder"), str) and q.get("placeholder") else None
+        if t == "yesno":
+            opts = [("Yes", None), ("No", None)]
+        elif t == "choice":
+            raw = q.get("options")
+            if not isinstance(raw, list) or not raw or any(
+                    not isinstance(o, dict) or not isinstance(o.get("label"), str) or not o["label"].strip() for o in raw):
+                return None
+            opts = [(_norm(o["label"]), _norm(o["description"]) if isinstance(o.get("description"), str)
+                     and o["description"].strip() else None) for o in raw]
+        elif t == "text":
+            opts = []
+        else:
+            return None
+        out.append((t, _norm(q["question"]), q["header"], opts, t == "choice" and q.get("multiSelect") is True, ph))
+    return out
+
+
+def _parse_gemini_review(body, tabs):
+    if not body or body[0] != GEMINI_REVIEW_HEAD:
+        return None
+    rest = body[1:]
+    if rest and GEMINI_REVIEW_WARN_RE.match(rest[0]):
+        rest = rest[1:]
+    entries = []
+    for ln in rest:
+        k = len(entries)
+        if k < len(tabs) and ln.startswith(tabs[k]["label"] + " → "):
+            entries.append(ln)
+        elif entries:
+            entries[-1] += " " + ln  # 긴 답이 줄바꿈됐다
+        else:
+            return None
+    if len(entries) != len(tabs):
+        return None
+    return _finish("submit", None, GEMINI_REVIEW_HEAD[:-1], "\n".join(entries),
+                   [(lb, None, None) for lb in GEMINI_SUBMIT_LABELS], reject_index=1, tabs=tabs)
+
+
+def _parse_gemini_ask(inner, idx, qs):
+    """탭·스크롤 목록이 있는 ask_user 상자. qs: 기록의 ask_user questions(답을 기다리는 호출)."""
+    qs = _gemini_ask_questions(qs)
+    if not qs or len(idx) < 4:
+        return None
+    bar = _gemini_tab_bar(inner[idx[1]].strip())
+    if bar is not None:
+        if [h for _, h in bar] != [q[2] for q in qs]:
+            return None
+        tabs = [{"label": h, "answered": a} for a, h in bar]
+        pos = 2
+    elif len(qs) == 1 and not inner[idx[1]].strip().startswith("←"):
+        tabs, pos = None, 1
+    else:
+        return None
+    hint = inner[idx[-1]].strip()
+    body = [inner[i] for i in idx[pos:-1]]
+    if hint == GEMINI_REVIEW_HINT:
+        p = _parse_gemini_review([b.strip() for b in body], tabs) if tabs else None
+        if p:
+            p["agent"] = "gemini"
+        return p
+    stop = next((k for k, b in enumerate(body) if b.strip() in ("▲", "▼", GEMINI_MULTI_NOTE)
+                 or b.strip().startswith("> ") or GEMINI_ASK_ROW_RE.match(b.strip())
+                 or GEMINI_ASK_DONE_RE.match(b)), len(body))
+    text = _norm(" ".join(b.strip() for b in body[:stop]))
+    hit = [k for k, q in enumerate(qs) if q[1] == text]
+    if not text or len(hit) != 1:
+        return None
+    t, question, header, src, multi, ph = qs[hit[0]]
+    title = header if tabs else None
+    rest = body[stop:]
+    if t == "text":
+        want_hint = GEMINI_TABS_TEXT_HINT if tabs else "Enter to submit · Esc to cancel"
+        label = ph or GEMINI_TEXT_PLACEHOLDER[2:]
+        if hint != want_hint or [b.strip() for b in rest] != ["> " + label]:
+            return None  # PC에서 글을 넣었다(placeholder 대신 글이 보인다)
+        p = _finish("question", title, question, None, [(label, None, None)], free_text_index=0, tabs=tabs)
+        p["agent"] = "gemini"
+        return p
+    if hint != (GEMINI_TABS_HINT if tabs else "Enter to select · ↑/↓ to navigate · Esc to cancel"):
+        return None  # 직접 입력 줄에 커서(힌트가 Enter to submit으로 바뀐다)
+    n = len(src)
+    other = ph or GEMINI_FREE_LABELS[0]
+    items = [lb for lb, _ in src] + ([GEMINI_ALL] if multi and n > 1 else []) + [other]
+    total = len(items) + (1 if multi else 0)
+    if total > 9:
+        return None  # 두 자리 번호는 숫자 키가 1초 기다린다
+    if (GEMINI_MULTI_NOTE in [b.strip() for b in rest]) != multi or (rest and rest[0].strip() == GEMINI_MULTI_NOTE) != multi:
+        return None
+    cursor, checked, seen, prev_row = [], [], 0, False
+    for b in rest[1:] if multi else rest:
+        s = b.strip()
+        if s in ("▲", "▼"):
+            prev_row = False
+            continue
+        m = GEMINI_ASK_ROW_RE.match(s)
+        d = GEMINI_ASK_DONE_RE.match(b) if not m else None
+        if m:
+            k = int(m.group(2))
+            if not 1 <= k <= len(items) or m.group(4) != items[k - 1] or (m.group(3) is not None) != multi:
+                return None  # 기록과 다른 항목, PC에서 직접 입력 줄에 글을 넣었다
+            if m.group(1):
+                cursor.append(k)
+            if multi and m.group(3) == "x" and k <= n:
+                checked.append(k - 1)
+            seen += 1
+            prev_row = True
+        elif d and multi:
+            if d.group(1):
+                cursor.append(total)
+            prev_row = False
+        elif prev_row and b.startswith(" "):
+            continue  # 항목 설명 줄
+        else:
+            return None
+    if not seen or len(cursor) != 1 or cursor[0] == len(items):
+        return None  # 커서가 직접 입력 줄이면 숫자가 글자로 들어간다
+    sel = cursor[0] - 1 if cursor[0] <= n else None
+    opts = [(lb, desc, k + 1) for k, (lb, desc) in enumerate(src)]
+    free = None
+    if not multi:
+        opts.append((other, None, n + 1))
+        free = n
+    p = _finish("question", title, question, None, opts, selected=sel, multi=multi, checked=checked,
+                free_text_index=free, tabs=tabs)
+    p["agent"] = "gemini"
+    return p
+
+
+def _pick_gemini(p, option_index):
+    """Review 탭 확인 카드: Submit = enter, Cancel = esc(질문 전체 취소, 실측). 그 밖에는 기본(숫자 키)."""
+    if p["kind"] != "submit":
+        return None
+    return [("keys", ["enter" if option_index == 0 else "esc"])]
+
+
+def _multi_gemini(p, num, want):
+    """복수 선택(실측 0.70.0): 숫자 = 토글. 안 보이는 항목의 체크를 모르니 옵션이 둘 이상이면 All → 1 → All(어느 상태든
+    전부 체크) → All(전부 해제)로 비우고 고를 것만 숫자로 토글한 뒤 Done 번호(다음 탭, 마지막·질문 하나면 제출).
+    옵션 하나면 All이 없고 항목이 다 보여 체크를 안다."""
+    n = len(p["options"])
+    if n > 1:
+        keys = [str(n + 1), "1", str(n + 1), str(n + 1)] + [str(i + 1) for i in sorted(want)]
+        done = n + 3
+    else:
+        keys = ["1"] if (0 in want) != (0 in p["checked"]) else []
+        done = n + 2
+    if done > 9:
+        raise ApiError(400, "bad_option")
+    return [("keys", keys + [str(done)])]
+
+
+def _gemini_dialog_group(text):
+    """여러 질문 상자(탭 막대)면 묶음 키(탭 이름들), 아니면 None."""
+    inner = _last_box(screen_lines(text))
+    idx = _gemini_meaningful(inner or [])
+    if len(idx) < 2 or inner[idx[0]].strip() != GEMINI_Q_HEAD:
+        return None
+    bar = _gemini_tab_bar(inner[idx[1]].strip())
+    return ("gemini-questions", tuple(h for _, h in bar)) if bar else None
+
+
+GEMINI_ASK_TAIL = 2 * 1024 * 1024
+GEMINI_TOOL_DONE = ("success", "error", "cancelled")
+_gemini_ask_cache = {}  # 기록 경로 → ((크기, 시각), questions)
+
+
+def read_gemini_ask(path):
+    """Gemini 기록(jsonl)에서 답을 기다리는 마지막 ask_user 호출의 questions 또는 None. 실측 0.70.0: 호출은 상자가 뜰 때
+    status "scheduled" 줄로 쓰이고, 답하면 같은 호출 id가 "success"(esc면 "cancelled") 줄로 다시 쓰인다."""
+    try:
+        st_ = os.stat(path, follow_symlinks=False)
+    except OSError:
+        return None
+    key = (st_.st_size, st_.st_mtime_ns)
+    hit = _gemini_ask_cache.get(path)
+    if hit and hit[0] == key:
+        return hit[1]
+    try:
+        data = read_regular_file(path, GEMINI_ASK_TAIL, tail=True)
+    except OSError:
+        return None
+    calls = {}
+    for ln in data.split(b"\n"):
+        if b'"ask_user"' not in ln:
+            continue
+        try:
+            rec = json.loads(ln)
+        except ValueError:
+            continue
+        tcs = rec.get("toolCalls") if isinstance(rec, dict) else None
+        for tc in tcs if isinstance(tcs, list) else []:
+            if isinstance(tc, dict) and tc.get("name") == "ask_user" and isinstance(tc.get("id"), str):
+                calls.pop(tc["id"], None)
+                calls[tc["id"]] = (tc.get("status"), tc.get("args"))
+    pending = [a for s, a in calls.values() if s not in GEMINI_TOOL_DONE]
+    qs = pending[-1].get("questions") if pending and isinstance(pending[-1], dict) else None
+    if len(_gemini_ask_cache) > 50:
+        _gemini_ask_cache.clear()
+    _gemini_ask_cache[path] = (key, qs)
+    return qs
+
+
+def gemini_pending_ask(info, home, runner=None):
+    _, path = find_gemini_transcript(info, home, runner=runner)
+    return read_gemini_ask(path) if path else None
+
+
 def _parse_gemini_plan(inner):
     idx = _gemini_meaningful(inner)
     if len(idx) < 4 or inner[idx[0]].strip() != GEMINI_PLAN_Q or not GEMINI_PLAN_HINT_RE.match(inner[idx[-1]].strip()):
@@ -1215,7 +1470,7 @@ def _parse_gemini_lines(lines, plan_reader=None):
     inner = _last_box(lines)
     if inner is None:
         return None
-    return _parse_gemini_approval(inner) or _parse_gemini_question(inner) or _parse_gemini_plan(inner)
+    return _parse_gemini_approval(inner) or _parse_gemini_question(inner, plan_reader) or _parse_gemini_plan(inner)
 
 
 # ---- GitHub Copilot CLI 대화 상자. 실측: copilot 1.0.114, 200열(tests/fixtures/copilot-*-1.0.114.txt).
@@ -2325,7 +2580,13 @@ def is_cursor(info):
 # (붙여넣기+enter를 모델이 "Rejected: <글>"로 받는다). "Run Everything"(shift+tab)은 저장 방식을 모르고 키를 안 써 봐
 # 카드에서 뺀다. 계획 승인(`Ready to build?`)은 박스 안 번호 줄이고 숫자 키가 바로 제출한다(3은 수정 입력칸, 빈 칸
 # enter는 무시, esc는 메뉴로: 글 없는 거절이 없다).
-# 폴더 신뢰는 `[a] Trust this workspace / [q] Quit` 박스(a 신뢰, q 종료). 질문 도구(AskQuestion) 화면은 캡처 못 해 카드 없음.
+# 폴더 신뢰는 `[a] Trust this workspace / [q] Quit` 박스(a 신뢰, q 종료).
+# 질문 도구(AskQuestion, grok-4.7 모델에서만 뜬다)는 화면 맨 아래 `┌ … └` 박스: 제목, `Question N of M`(탭 막대 없음, 한 번에
+# 한 질문), `N. 질문 (multi-select)`, `› [ ] 항목`(단일 선택도 체크칸, 커서 ›), 끝에 늘 `[ ] Other: (type to answer)`,
+# 힌트 `↑/↓ option · ←/→ question · Space select · Enter next/submit · Esc to skip`. 키(실측): 숫자 무시. enter가 커서 항목을
+# 고르고 다음 질문(마지막이면 제출): 단일 선택은 ↑/↓ + enter. Other는 커서 → 붙여넣기+enter. 복수 선택은 ↑/↓ + space 토글,
+# tab = 다음 질문. 마지막 질문의 복수 선택은 enter 한 번에 제출이 안 된 적이 있어(원인 미확인) 카드 없음. esc 건너뛰기는
+# 실측 못 해 거절 버튼 없음. PC에서 Other에 글을 넣었으면 카드 없음. 계정 한도로 카드 답은 실제로 확인 못 했다(fixture만).
 CURSOR_ROW_RE = re.compile(r"^(→\s+)?(\S.*?) \(([^()]+)\)$")
 CURSOR_SHELL_Q = "Run this command?"
 CURSOR_WRITE_Q = "Write to this file?"
@@ -2349,12 +2610,18 @@ CURSOR_TRUST_Q = "Do you trust the contents of this directory?"
 CURSOR_TRUST_ROW_RE = re.compile(r"^(▶\s+)?\[([a-z])\] (\S.*)$")
 CURSOR_TRUST_HINT = "Use arrow keys to navigate, Enter to select, or press the key shown"
 CURSOR_TRUST_MSG_RE = re.compile(r"^approve Workspace Trust Required$")  # 신뢰 카드의 막힘 msg(_card_status)
+CURSOR_Q_HINT = "↑/↓ option · ←/→ question · Space select · Enter next/submit · Esc to skip"
+CURSOR_Q_COUNT_RE = re.compile(r"^Question (\d+) of (\d+)$")
+CURSOR_Q_ROW_RE = re.compile(r"^(›\s+)?\[([ x])\] (\S.*)$")
+CURSOR_Q_MULTI = " (multi-select)"
+CURSOR_OTHER = "Other: (type to answer)"
 # 작업 중: 입력줄 오른쪽 "ctrl+c to stop", 또는 그 위 스피너 줄 "⠀⠞ Working"
 CURSOR_BUSY_RE = re.compile(r"ctrl\+c to stop$|^\s*[⠀-⣿]+\s+Working\b")
 # 카드를 못 읽어도 막힘: 거절 뒤 "대신 할 말"·계획 수정 입력칸, 모드 전환·신뢰 힌트, 메뉴 줄의 거절·Run Everything 키
 CURSOR_DIALOG_RE = re.compile(
     r"→ Tell the agent what to do instead \(|→ Describe how to revise the plan \("
     r"|auto-rejects when the bar runs out|Use arrow keys to navigate, Enter to select, or press the key shown"
+    r"|Enter next/submit · Esc to skip"
     r"|\((?:esc or n(?: or p)?|n or esc|p or Esc|shift\+tab)\)")
 
 
@@ -2504,8 +2771,77 @@ def _parse_cursor_trust(lines):
     return p
 
 
+def _cursor_question_box(lines):
+    """질문 박스 → (제목, 질문 번호, 질문 수, 안쪽 줄들, 힌트 줄 index) 또는 None."""
+    inner = _cursor_box(lines, "└", "│")
+    nz = [k for k, s in enumerate(inner or []) if s.strip()]
+    if len(nz) < 4 or inner[nz[-1]].strip() != CURSOR_Q_HINT:
+        return None
+    m = CURSOR_Q_COUNT_RE.match(inner[nz[1]].strip())
+    if not m or not 1 <= int(m.group(1)) <= int(m.group(2)):
+        return None
+    return inner[nz[0]].strip(), int(m.group(1)), int(m.group(2)), inner, nz
+
+
+def _parse_cursor_question(lines):
+    box = _cursor_question_box(lines)
+    if not box:
+        return None
+    title, n, total, inner, nz = box
+    body = nz[2:-1]
+    ri = next((j for j, k in enumerate(body) if CURSOR_Q_ROW_RE.match(inner[k].strip())), None)
+    if ri is None or ri == 0:
+        return None
+    qlines, rlines = body[:ri], body[ri:]
+    if rlines[-1] - rlines[0] != len(rlines) - 1:
+        return None  # 항목 사이에 다른 줄(설명 등): 캡처하지 않은 모양
+    rows = [CURSOR_Q_ROW_RE.match(inner[k].strip()) for k in rlines]
+    if any(r is None for r in rows):
+        return None
+    q = _norm(" ".join(inner[k].strip() for k in qlines))
+    prefix = "%d. " % n
+    if not q.startswith(prefix):
+        return None
+    q = q[len(prefix):]
+    multi = q.endswith(CURSOR_Q_MULTI)
+    if multi:
+        q = q[:-len(CURSOR_Q_MULTI)].strip()
+    labels = [_norm(r.group(3)) for r in rows]
+    if not q or len(labels) < 2 or labels[-1] != CURSOR_OTHER or rows[-1].group(2) != " ":
+        return None  # PC에서 Other에 글을 넣었다(`[x] Other: duckdb`)
+    cur = [k for k, r in enumerate(rows) if r.group(1)]
+    if len(cur) != 1:
+        return None
+    checked = [k for k, r in enumerate(rows[:-1]) if r.group(2) == "x"]
+    last = n == total
+    if multi:
+        if last:
+            return None  # 마지막 질문의 복수 선택 enter는 한 번에 제출이 안 된 적이 있다(원인 미확인)
+        opts, free = [(lb, None, None) for lb in labels[:-1]], None
+    else:
+        if len(checked) > 1:
+            return None
+        # 다른 항목에 [x]가 있을 때 Other에 글을 넣으면 어느 쪽이 가는지 모른다: 직접 입력(Other)은 빈 폼에서만
+        opts = [(lb, None, None) for lb in labels[:-1]] + ([] if checked else [("Other", None, None)])
+        free = None if checked else len(opts) - 1
+        checked = []
+    p = _finish("question", "%s %d/%d" % (title, n, total) if total > 1 else title, q, None, opts,
+                selected=cur[0], multi=multi, checked=checked, free_text_index=free)
+    p["last_tab"] = last
+    return p
+
+
+def _cursor_dialog_group(text):
+    """여러 질문 박스(`Question N of M`, M > 1)면 묶음 키(제목, 질문 수), 아니면 None."""
+    box = _cursor_question_box(screen_lines(text))
+    if not box or box[2] < 2:
+        return None
+    return ("cursor-questions", box[0], box[2])
+
+
 def _parse_cursor_lines(lines, plan_reader=None):
-    p = _parse_cursor_approval(lines) or _parse_cursor_plan(lines) or _parse_cursor_trust(lines)
+    p = _parse_cursor_approval(lines) or _parse_cursor_plan(lines) or _parse_cursor_trust(lines) \
+        or _parse_cursor_question(lines)
     if p:
         p["agent"] = "cursor"
     return p
@@ -2533,7 +2869,26 @@ def _free_text_cursor(p, num, text):
     계획 수정: 3 → 붙여넣기+enter(실측)."""
     if p["kind"] == "approval":
         return [("keys", [p["option_keys"][p["free_text_index"]]]), ("text", text)]
+    if p["kind"] == "question":
+        # 질문: 커서를 "Other"로 옮기면 글자가 그 칸에 들어간다. 붙여넣기+enter가 다음 질문(마지막이면 제출, 실측)
+        keys = nav_keys(p.get("selected"), p["free_text_index"])
+        if keys is None:
+            raise ApiError(409, "no_cursor")
+        return ([("keys", keys)] if keys else []) + [("text", text)]
     return _free_text_digit(p, num, text)
+
+
+def _multi_cursor(p, num, want):
+    """복수 선택(마지막 질문이 아닐 때만 카드): 숫자 키 무시. ↑/↓로 항목마다 가서 space 토글, tab = 다음 질문(실측).
+    enter는 커서 항목까지 골라 버려 쓰지 않는다."""
+    cur = p.get("selected")
+    if cur is None or p.get("last_tab", True):
+        raise ApiError(409, "no_cursor")
+    keys = []
+    for i in sorted(want.symmetric_difference(set(p["checked"]))):
+        keys += nav_keys(cur, i) + ["space"]
+        cur = i
+    return [("keys", keys + ["tab"])]
 
 
 def _cursor_status_approve(p):
@@ -6264,6 +6619,8 @@ QWEN_PUSH_PROMPT_WAIT = 1.0
 #   reject_status_keys     (선택) 카드 없이 거절할 때 esc 대신 보낼 키. None이면 거절을 앱에서 직접(409 needs_manual).
 #                          함수면 approve_keys처럼 지금 화면 카드로 정한다
 #   read(path, sid, n)     (선택) 기록이 jsonl이 아닐 때 (turns, 잘렸는지). preview(path, sid)는 목록 미리보기
+#   ask_reader(info, home, runner=)  (선택) 화면에 일부만 보이는 질문 상자를 채울 기록 속 질문 인자(Gemini ask_user).
+#                          parse의 reader에 GEMINI_ASK_KEY를 주면 이걸 부른다(필요할 때만 기록을 읽는다)
 #   card_status            (선택) hc가 막힘을 알지만 kind가 없을 때(Amp): 막힘 중 화면 카드가 읽히면 API 판정(effective_info)
 #                          의 status를 카드로 바꾼다. 알림 판정(refresh)은 hc status 그대로
 AGENTS = {
@@ -6281,6 +6638,8 @@ AGENTS = {
                "transcript": lambda info, home, runner=None: find_gemini_transcript(info, home, runner=runner),
                "push_wait": lambda: PUSH_PROMPT_BUDGET, "retry": False, "screen": "full",
                "title_blocked": GEMINI_TITLE_BLOCKED_RE, "title_working": GEMINI_TITLE_WORKING_RE, "busy_re": None,
+               "pick": _pick_gemini, "multi": _multi_gemini, "dialog_group": _gemini_dialog_group,
+               "ask_reader": lambda info, home, runner=None: gemini_pending_ask(info, home, runner=runner),
                "send_guard": True},
     # Copilot은 OSC 7501로 승인(permission)·질문·계획(question) 막힘을 보낸다. 폴더 신뢰(idle)·autopilot 권한(working)
     # 상자만 hc가 모른다(실측 1.0.114). 질문 상자는 blocked 직후 조금 늦게 그려질 때가 있어 다시 읽는다.
@@ -6327,7 +6686,8 @@ AGENTS = {
                "preview": lambda path, sid: cursor_preview(path, sid),
                "push_wait": lambda: PUSH_PROMPT_BUDGET, "retry": False, "screen": "full",
                "title_blocked": None, "title_working": None, "busy_re": CURSOR_BUSY_RE,
-               "dialog_re": CURSOR_DIALOG_RE, "pick": _pick_cursor, "reject_keys": _reject_keys_cursor,
+               "dialog_re": CURSOR_DIALOG_RE, "dialog_group": _cursor_dialog_group,
+               "pick": _pick_cursor, "multi": _multi_cursor, "reject_keys": _reject_keys_cursor,
                "approve_keys": _cursor_status_approve, "reject_status_keys": _cursor_status_reject,
                "done_settle": True, "idle_after_re": CURSOR_TRUST_MSG_RE, "send_guard": True},
     # Amp은 OSC 7501로 막힘·작업 중·끝남을 보내지만 막힘에 kind가 없다(msg "Input needed", 실측 0.0.1795233642):
@@ -6411,8 +6771,28 @@ class App:
             log.info("알림 %s %s %s 감지→발송 %dms", p["terminal"], p["state"], p["aps"]["category"],
                      int((self.clock() - t0) * 1000))
 
-    def parse_screen(self, text, agent=None):
-        return parse_prompt(text, plan_reader=self.plan_reader, agent=agent)
+    def parse_screen(self, text, agent=None, tid=None, info=None):
+        reader = self.plan_reader
+        ask = agent_spec(agent).get("ask_reader")
+        if ask and tid is not None:
+            base = reader
+
+            def reader(key):
+                """GEMINI_ASK_KEY면 그 터미널 기록의 답을 기다리는 질문 인자(화면에 안 보이는 항목까지), 아니면 계획 파일."""
+                if key != GEMINI_ASK_KEY:
+                    return base(key)
+                i = info
+                if i is None:
+                    try:
+                        i = self.hc.get(tid)
+                    except HcError:
+                        return None
+                try:
+                    return ask(i, self.home, runner=self.runner)
+                except Exception:  # noqa: BLE001 - 기록을 못 읽으면 카드 없음
+                    log.exception("질문 인자 읽기 실패 %s", tid)
+                    return None
+        return parse_prompt(text, plan_reader=reader, agent=agent)
 
     def _prompt_for_push(self, tid):
         """blocked 알림용 카드: hc read 한 번 + 파싱, PUSH_PROMPT_BUDGET 안에 못 끝나면 None."""
@@ -6428,7 +6808,7 @@ class App:
         def work():
             try:
                 while True:
-                    box["p"] = self.parse_screen((self.hc.read(tid, 0) or {}).get("text", ""), agent)
+                    box["p"] = self.parse_screen((self.hc.read(tid, 0) or {}).get("text", ""), agent, tid=tid)
                     if box["p"] or not spec["retry"] or stop.is_set() \
                             or time.monotonic() + CODEX_PUSH_PROMPT_RETRY >= end:
                         return
@@ -6482,7 +6862,7 @@ class App:
             text = (self.hc.read(tid, 0) or {}).get("text", "")
         except HcError:
             text = ""
-        p = self.parse_screen(text, kind) if text else None
+        p = self.parse_screen(text, kind, tid=tid, info=info) if text else None
         prev_st = self._screen_state.get(tid) or {}
         prev = prev_st.get("state")
         group = spec["dialog_group"](text) if p and text and spec.get("dialog_group") else None
@@ -6540,7 +6920,7 @@ class App:
             text = (self.hc.read(tid, 0) or {}).get("text", "")
         except HcError:
             text = ""
-        p = self.parse_screen(text, agent_kind(info)) if text else None
+        p = self.parse_screen(text, agent_kind(info), tid=tid, info=info) if text else None
         if not p:
             return self._card_states.get(tid)
         st = dict(status_of(info), **_card_status(p))
@@ -7190,7 +7570,7 @@ class App:
             r = self.hc.read(tid, 0)
         except HcError:
             raise ApiError(502, "hc_failed")
-        return self.parse_screen((r or {}).get("text", ""), agent_kind(info))
+        return self.parse_screen((r or {}).get("text", ""), agent_kind(info), tid=tid, info=info)
 
     def _same_prompt(self, tid, info, pid):
         """키를 보내기 직전에 화면을 다시 읽어 같은 카드인지(힌트가 화면 끝에 살아 있는지) 확인."""

@@ -1,0 +1,56 @@
+
+
+  Cursor Agent
+  v2026.11.19-f005e9d
+  Tip: Use subagents to parallelize work and preserve context.
+
+
+  List the names of all your tools (include GetDynamicTools catalog). If AskQuestion exists, use it to ask me one single-choice question 'Which language?' with options Python, Go, Rust.
+
+
+  I'll pull the full tool catalog first, then list every tool name and ask the language question.
+
+    Explored available MCP tools
+
+  AskQuestion is available, so I’ll use it for the language choice. These are the tool names I have.
+
+  Built-in tools
+  • Shell
+  • SendToCall
+  • Grep
+  • StrReplace
+  • Write
+  • Read
+  • Glob
+  • AskQuestion
+  • GetDynamicTools
+  • CallDynamicTool
+
+  GetDynamicTools catalog (cursor)
+  • AwaitShell
+  • CreateGoal
+  • Delete
+  • EditNotebook
+  • FetchMcpResource
+  • GenerateImage
+  • ReadLints
+  • SwitchMode
+  • Task
+  • TodoWrite
+  • UpdateGoal
+  • WebFetch
+
+ ┌────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+ │ Clarifying Questions                                                                                                                                                                               │
+ │                                                                                                                                                                                                    │
+ │ Question 1 of 1                                                                                                                                                                                    │
+ │                                                                                                                                                                                                    │
+ │ 1. Which language?                                                                                                                                                                                 │
+ │                                                                                                                                                                                                    │
+ │   › [ ] Python                                                                                                                                                                                     │
+ │     [ ] Go                                                                                                                                                                                         │
+ │     [ ] Rust                                                                                                                                                                                       │
+ │     [ ] Other: (type to answer)                                                                                                                                                                    │
+ │                                                                                                                                                                                                    │
+ │ ↑/↓ option · ←/→ question · Space select · Enter next/submit · Esc to skip                                                                                                                         │
+ └────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘

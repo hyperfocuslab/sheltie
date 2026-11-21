@@ -354,6 +354,160 @@ def build_store(path, jsonl):
     con.close()
 
 
+def multi_first():
+    """복수 선택이 첫 질문(마지막 아님)인 화면. 캡처는 마지막 질문(2/2)뿐이라 같은 박스에서 번호만 바꿔 만든다(키는 실측)."""
+    return cu("question-multi-q2").replace("Question 2 of 2", "Question 1 of 2").replace(
+        "2. Which features?", "1. Which features?")
+
+
+class CursorQuestionParseTests(unittest.TestCase):
+    """AskQuestion 박스(grok-4.7 모델, 실측 2026.11.19). 숫자 키 무시, ↑/↓ + enter(고르고 다음/제출), space 토글,
+    tab 다음 질문, 끝에 늘 "Other: (type to answer)"."""
+
+    def test_single_question(self):
+        p = card("question-single")
+        self.assertEqual((p["kind"], p["agent"], p["title"], p["question"], p["body"]),
+                         ("question", "cursor", "Clarifying Questions", "Which language?", None))
+        self.assertEqual(labels(p), ["Python", "Go", "Rust", "Other"])
+        self.assertEqual([o["number"] for o in p["options"]], [None] * 4)
+        self.assertEqual((p["selected"], p["multi_select"], p["checked"], p["free_text_index"], p["tabs"],
+                          p["reject_index"], p["last_tab"]), (0, False, [], 3, None, None, True))
+        self.assertEqual(hr.push_category("blocked", {}, p), "HR_BLOCKED")
+        # PC에서 space로 Go를 골라 둔 화면: 커서 1. Other에 글을 넣으면 어느 쪽이 갈지 몰라 직접 입력 없음
+        s = card("question-single-space")
+        self.assertEqual((labels(s), s["selected"], s["free_text_index"], s["checked"]),
+                         (["Python", "Go", "Rust"], 1, None, []))
+
+    def test_multi_questions(self):
+        q1 = card("question-multi-q1")
+        self.assertEqual((q1["title"], q1["question"], labels(q1), q1["free_text_index"], q1["last_tab"]),
+                         ("Setup 1/2", "Which database?", ["SQLite", "Postgres", "Other"], 2, False))
+        m = hr.parse_prompt(multi_first(), agent="cursor")
+        self.assertEqual((m["title"], m["question"], labels(m), m["multi_select"], m["checked"],
+                          m["free_text_index"], m["selected"], m["last_tab"]),
+                         ("Setup 1/2", "Which features?", ["Auth", "Logging", "Cache"], True, [], None, 0, False))
+        checked = hr.parse_prompt(multi_first().replace("› [ ] Auth", "› [x] Auth"), agent="cursor")
+        self.assertEqual((checked["checked"], checked["id"]), ([0], m["id"]))
+
+    def test_no_card(self):
+        # 마지막 질문의 복수 선택(enter 한 번에 제출이 안 된 적이 있다, 원인 미확인), PC에서 Other에 글을 넣은 화면,
+        # 답한 뒤 기록
+        for name in ("question-multi-q2", "question-multi-q2-selected", "question-multi-q2-enter1",
+                     "question-other-typed", "question-single-answered"):
+            self.assertIsNone(card(name), name)
+        # 커서가 없거나 질문 번호가 안 맞는 박스
+        self.assertIsNone(hr.parse_prompt(cu("question-single").replace("›", " "), agent="cursor"))
+        self.assertIsNone(hr.parse_prompt(cu("question-single").replace("1. Which", "2. Which"), agent="cursor"))
+
+    def test_answer_steps(self):
+        p = card("question-single")
+        # 숫자 키 무시: 커서 이동 + enter(커서 항목을 고르고 제출, 실측)
+        self.assertEqual(hr.answer_steps(p, option_index=0), [("keys", ["enter"])])
+        self.assertEqual(hr.answer_steps(p, option_index=2), [("keys", ["down", "down", "enter"])])
+        # Other: 커서를 옮긴 뒤 붙여넣기+enter(hc send --force, 실측)
+        self.assertEqual(hr.answer_steps(p, text="Zig"), [("keys", ["down", "down", "down"]), ("text", "Zig")])
+        with self.assertRaises(hr.ApiError):
+            hr.answer_steps(p, option_index=3)  # Other는 글이 필요하다
+        s = card("question-single-space")
+        self.assertEqual(hr.answer_steps(s, option_index=0), [("keys", ["up", "enter"])])
+        with self.assertRaises(hr.ApiError):
+            hr.answer_steps(s, text="Zig")
+        q1 = card("question-multi-q1")
+        self.assertEqual(hr.answer_steps(q1, option_index=1), [("keys", ["down", "enter"])])
+        self.assertEqual(hr.answer_steps(q1, text="DuckDB embedded"), [("keys", ["down", "down"]),
+                                                                       ("text", "DuckDB embedded")])
+        # 복수 선택: ↑/↓ + space 토글, tab = 다음 질문(enter는 커서 항목까지 고른다)
+        m = hr.parse_prompt(multi_first(), agent="cursor")
+        self.assertEqual(hr.answer_steps(m, option_indices=[2, 0]), [("keys", ["space", "down", "down", "space", "tab"])])
+        self.assertEqual(hr.answer_steps(m, option_indices=[]), [("keys", ["tab"])])
+        c = hr.parse_prompt(multi_first().replace("› [ ] Auth", "› [x] Auth"), agent="cursor")
+        self.assertEqual(hr.answer_steps(c, option_indices=[1]), [("keys", ["space", "down", "space", "tab"])])
+        for bad in ({"text": "x"}, {"option_index": 0}, {"option_indices": [3]}):
+            with self.assertRaises(hr.ApiError):
+                hr.answer_steps(m, **bad)
+
+    def test_dialog_group(self):
+        g = hr._cursor_dialog_group
+        self.assertEqual(g(cu("question-multi-q1")), ("cursor-questions", "Setup", 2))
+        self.assertEqual(g(cu("question-multi-q2-selected")), g(cu("question-multi-q1")))
+        for name in ("question-single", "exec", "plan", "idle"):
+            self.assertIsNone(g(cu(name)), name)
+
+    def test_parsers_do_not_cross(self):
+        for name in ("question-single", "question-multi-q1"):
+            for agent in (None, "codex", "gemini", "copilot", "qwen", "opencode", "grok", "amp"):
+                self.assertIsNone(hr.parse_prompt(cu(name), agent=agent), (name, agent))
+        for f in ("gemini-question-0.70.0.txt", "copilot-question-1.0.114.txt", "qwen-question-0.28.3.txt",
+                  "opencode-question-1.19.6.txt", "claude-question-multi-2.1.329.txt"):
+            self.assertIsNone(hr.parse_prompt(fixture(f), agent="cursor"), f)
+
+
+class CursorQuestionApiTests(unittest.TestCase):
+    """질문 박스 막힘·카드·답(화면 판정 "full"). 계정 한도로 실제 답은 못 해 봤다(fixture 기반)."""
+    setUp, screen, settle, err, states, by = (CursorScreenStatusTests.setUp, CursorScreenStatusTests.screen,
+                                              CursorScreenStatusTests.settle, CursorScreenStatusTests.err,
+                                              CursorScreenStatusTests.states, CursorScreenStatusTests.by)
+
+    def test_single_question_push_and_answers(self):
+        self.screen("working")
+        self.screen("question-single")
+        p = card("question-single")
+        self.assertEqual([(x["state"], x["category"], x["kind"], x["prompt_id"]) for x in self.pusher.payloads],
+                         [("blocked", "HR_BLOCKED", "question", p["id"])])
+        self.assertEqual(self.app.api_prompt("c1")["prompt"]["id"], p["id"])
+        self.app.api_prompt_answer("c1", {"prompt_id": p["id"], "option_index": 1})
+        self.app.api_prompt_answer("c1", {"prompt_id": p["id"], "text": "Zig"})
+        self.assertEqual(self.hc.keys_calls, [("c1", ["down", "enter"]), ("c1", ["down", "down", "down"])])
+        self.assertEqual(self.hc.send_calls, [("c1", "Zig", "force")])
+        # 승인·거절 버튼 없음(esc 건너뛰기는 실측 못 했다)
+        self.assertEqual(self.err(self.app.api_answer, "c1", {"action": "reject", "prompt_id": p["id"]}),
+                         (409, "needs_manual"))
+        self.assertEqual(self.err(self.app.api_answer, "c1", {"action": "reject"}), (409, "needs_manual"))
+        self.assertEqual(self.err(self.app.api_answer, "c1", {"action": "approve"}), (409, "needs_manual"))
+        self.assertEqual(self.err(self.app.api_send, "c1", {"text": "hi"}), (409, "hc_refused"))
+
+    def test_recheck_before_keys(self):
+        self.screen("question-single")
+        pid = card("question-single")["id"]
+        self.hc.screens["c1"] = cu("question-single-space")  # PC에서 커서를 옮기고 골랐다
+        self.assertEqual(self.err(self.app.api_prompt_answer, "c1", {"prompt_id": pid, "option_index": 0}),
+                         (409, "prompt_changed"))
+        self.assertEqual(self.hc.keys_calls, [])
+
+    def test_multi_questions_one_push(self):
+        self.screen("working")
+        self.screen("question-multi-q1")
+        p1 = card("question-multi-q1")
+        self.app.api_prompt_answer("c1", {"prompt_id": p1["id"], "text": "DuckDB embedded"})
+        # 다음 질문(마지막 복수 선택: 카드 없음)도 같은 박스: 새 알림 없음, 막힘 유지
+        self.screen("question-multi-q2")
+        self.assertIsNone(self.app.api_prompt("c1")["prompt"])
+        self.assertEqual(self.by()["c1"]["status"]["state"], "blocked")
+        self.screen("question-multi-q2-selected")
+        self.assertEqual(self.err(self.app.api_prompt_answer, "c1", {"prompt_id": p1["id"], "option_index": 0}),
+                         (409, "prompt_changed"))
+        self.screen("question-multi-q1")  # PC에서 ←로 돌아감
+        self.assertEqual([x["state"] for x in self.pusher.payloads], ["blocked"])
+        self.screen("question-single-answered")
+        self.settle()
+        self.assertEqual([x["state"] for x in self.pusher.payloads], ["blocked", "done"])
+
+    def test_multi_select_card_answer(self):
+        self.hc.screens["c1"] = multi_first()
+        self.app.screen_poll()
+        m = self.app.api_prompt("c1")["prompt"]
+        self.assertTrue(m["multi_select"])
+        self.app.api_prompt_answer("c1", {"prompt_id": m["id"], "option_indices": [0, 2]})
+        self.assertEqual(self.hc.keys_calls, [("c1", ["space", "down", "down", "space", "tab"])])
+
+    def test_last_multi_select_without_card(self):
+        # 질문 하나짜리 복수 선택도 마지막 질문이라 카드 없음: 막힘 알림만
+        self.screen("question-multi-q2")
+        self.assertEqual([(s, c) for s, c, _ in self.states()], [("blocked", "HR_BLOCKED")])
+        self.assertIsNone(self.pusher.payloads[0]["prompt_id"])
+        self.assertEqual(self.err(self.app.api_answer, "c1", {"action": "approve"}), (409, "needs_manual"))
+
+
 class CursorTranscriptTests(unittest.TestCase):
     def setUp(self):
         self.home = os.path.realpath(tempfile.mkdtemp())
