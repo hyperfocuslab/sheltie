@@ -403,13 +403,44 @@ def is_codex(info):
     return False
 
 
+SCRIPT_HOSTS = ("node", "bun", "deno")
+
+
+def _agent_names(info):
+    """hc agent, status.app, 앞 프로그램 이름(node·bun으로 도는 CLI는 그 스크립트 이름)."""
+    info = info or {}
+    names = set()
+    for v in (info.get("agent"), status_of(info).get("app")):
+        if isinstance(v, str) and v:
+            names.add(v)
+    fg = info.get("foreground")
+    argv = fg.get("argv") if isinstance(fg, dict) else None
+    if isinstance(argv, list) and argv and all(isinstance(a, str) for a in argv):
+        base = _binary_base(argv[0])
+        names.add(base)
+        if base in SCRIPT_HOSTS:
+            script = next((a for a in argv[1:] if not a.startswith("-")), None)
+            if script:
+                names.add(_binary_base(script))
+    return names
+
+
+def _named(*names):
+    want = set(names)
+    return lambda info: bool(_agent_names(info) & want)
+
+
 def agent_kind(info):
-    """잠금화면 답·대화 보기·메시지 보내기를 지원하는 에이전트 종류: "claude", "codex", 아니면 None."""
-    if is_claude(info):
-        return "claude"
-    if is_codex(info):
-        return "codex"
+    """잠금화면 답·대화 보기·메시지 보내기를 지원하는 에이전트 종류(AGENTS 키), 아니면 None."""
+    for kind in AGENT_ORDER:
+        if AGENTS[kind]["match"](info):
+            return kind
     return None
+
+
+def agent_spec(kind):
+    """에이전트 표 항목. 모르는 종류는 Claude 항목(옛 동작)."""
+    return AGENTS.get(kind) or AGENTS["claude"]
 
 
 def is_permission(status):
@@ -1029,22 +1060,182 @@ def _parse_codex_plan(lines):
     return p
 
 
-def parse_codex_prompt(screen_text):
-    lines = screen_lines(screen_text)
+# ---- Gemini CLI 대화 상자. 실측: gemini-cli 0.70.0, 200열(tests/fixtures/gemini-*-0.70.0.txt).
+# 메뉴는 화면 맨 끝의 ╭…╰ 상자 안에 있고 커서는 `●`, 숫자 키가 그 항목을 바로 고르고 제출한다.
+# 직접 입력 줄("Enter a custom value", "Type your feedback...")은 숫자로 커서만 옮기고 입력 칸이 열린다.
+GEMINI_APPROVE_FIRST = "Allow once"
+GEMINI_ALWAYS = "Allow for this session"
+GEMINI_EDITOR_RE = re.compile(r"external editor", re.I)
+GEMINI_HEAD_RE = re.compile(r"^\?\s+(\S.*)$")
+GEMINI_Q_HEAD = "Answer Questions"
+GEMINI_Q_HINT_RE = re.compile(r"^Enter to select · ↑/↓ to navigate · Esc to cancel$")
+GEMINI_TEXT_HINT_RE = re.compile(r"^Enter to submit · Esc to cancel$")
+GEMINI_TEXT_PLACEHOLDER = "> Enter your response"
+GEMINI_FREE_LABELS = ("Enter a custom value", "Type your feedback...")
+GEMINI_PLAN_Q = "Ready to start implementation?"
+GEMINI_PLAN_HINT_RE = re.compile(r"^Enter to select · ↑/↓ to navigate · Ctrl\+G to edit plan · Esc to cancel$")
+GEMINI_TITLE_BLOCKED_RE = re.compile(r"^\s*✋")  # 터미널 제목: ✋ Action Required / ✦ Working… / ◇ Ready
+GEMINI_TITLE_WORKING_RE = re.compile(r"^\s*✦")
+
+
+def _box_unwrap(line):
+    """`│ 글자 │` → 글자(안쪽 한 칸 여백 제거). 상자 줄이 아니면 None. 오른쪽 테두리는 screen_lines의
+    사이드 패널 자르기가 이미 지웠을 수 있어 없어도 된다."""
+    s = line.rstrip()
+    if not s.startswith("│"):
+        return None
+    s = s[1:-1] if s.endswith("│") and len(s) >= 2 else s[1:]
+    return (s[1:] if s.startswith(" ") else s).rstrip()
+
+
+def _last_box(lines):
+    """화면 맨 끝(마지막 글자 줄)이 상자 아래 테두리면 그 상자의 안쪽 줄들, 아니면 None."""
+    last = next((i for i in range(len(lines) - 1, -1, -1) if lines[i].strip()), -1)
+    if last < 0:
+        return None
+    col = lines[last].find("╰")
+    if col < 0 or lines[last][:col].strip():
+        return None
+    top = next((i for i in range(last - 1, max(-1, last - 400), -1)
+                if len(lines[i]) > col and lines[i][col] == "╭" and not lines[i][:col].strip()), -1)
+    if top < 0:
+        return None
+    inner = []
+    for ln in lines[top + 1:last]:
+        u = _box_unwrap(ln[col:])
+        if u is None:
+            return None
+        inner.append(u)
+    return inner
+
+
+def _gemini_rows(inner, start=0):
+    conv = [("›" + ln[1:]) if ln.startswith("●") else ln for ln in inner]
+    rows = _menu_rows(conv, start, len(conv))
+    if not rows or sum(1 for r in rows if r["selected"]) != 1:
+        return []
+    return rows
+
+
+def _gemini_body(lines):
+    """본문 줄: 안쪽 상자(명령·차이)는 테두리를 벗긴다."""
+    out = []
+    for ln in lines:
+        s = ln.strip()
+        if s.startswith(("╭", "╰")):
+            continue
+        u = _box_unwrap(ln.strip())
+        out.append(u if u is not None else ln)
+    return _dedent_block(out)
+
+
+def _parse_gemini_approval(inner):
+    rows = _gemini_rows(inner)
+    if len(rows) < 2 or rows[0]["label"] != GEMINI_APPROVE_FIRST or rows[0]["num"] != 1:
+        return None
+    if not (rows[-1]["label"].startswith("No") and rows[-1]["label"].endswith("(esc)")):
+        return None
+    first = rows[0]["line"]
+    q = next((i for i in range(first - 1, max(-1, first - 6), -1) if inner[i].strip().endswith("?")), -1)
+    head = next((i for i in range(0, q) if GEMINI_HEAD_RE.match(inner[i].strip())), -1) if q > 0 else -1
+    if q < 0 or head < 0:
+        return None
+    rest = GEMINI_HEAD_RE.match(inner[head].strip()).group(1)
+    title = re.split(r"\s{2,}", rest, maxsplit=1)[0]
+    body = _gemini_body(inner[head + 1:q]) or rest
+    opts, sel = [], None
+    for r in rows:
+        if GEMINI_EDITOR_RE.search(r["label"]):
+            continue  # 외부 편집기는 PC에서만 열린다
+        if r["selected"]:
+            sel = len(opts)
+        lb = _norm(r["label"])
+        opts.append((lb[:-len("(esc)")].rstrip() if lb.endswith("(esc)") else lb, None, r["num"]))
+    lbs = [o[0] for o in opts]
+    p = _finish("approval", title, inner[q].strip(), body, opts, selected=sel,
+                always_index=lbs.index(GEMINI_ALWAYS) if GEMINI_ALWAYS in lbs else None,
+                reject_index=next((k for k, lb in enumerate(lbs) if lb.startswith("No")), None))
+    p["approve_index"] = 0  # "Allow once"(rows[0]로 확인)
+    p["agent"] = "gemini"
+    return p
+
+
+def _gemini_meaningful(inner):
+    return [i for i, ln in enumerate(inner) if ln.strip()]
+
+
+def _parse_gemini_question(inner):
+    idx = _gemini_meaningful(inner)
+    if len(idx) < 3 or inner[idx[0]].strip() != GEMINI_Q_HEAD:
+        return None
+    if any(inner[i].strip() in ("▲", "▼") or inner[i].strip().startswith("←") for i in idx):
+        return None  # 여러 질문(탭)·스크롤되는 목록: 일부만 보여 카드로 만들지 않는다
+    hint = inner[idx[-1]].strip()
+    rows = _gemini_rows(inner, idx[0] + 1)
+    if rows and GEMINI_Q_HINT_RE.match(hint):
+        question = _norm(" ".join(inner[i].strip() for i in idx if idx[0] < i < rows[0]["line"]))
+        opts = []
+        for r in rows:
+            opts.append((_norm(r["label"]), _norm(" ".join(r["extra"])) or None, r["num"]))
+        free = next((k for k, o in enumerate(opts) if o[0] in GEMINI_FREE_LABELS), None)
+        sel = next(k for k, r in enumerate(rows) if r["selected"])
+    elif not rows and GEMINI_TEXT_HINT_RE.match(hint):
+        ph = [i for i in idx if inner[i].strip() == GEMINI_TEXT_PLACEHOLDER]
+        if len(ph) != 1:
+            return None  # 이미 PC에서 입력 중
+        question = _norm(" ".join(inner[i].strip() for i in idx if idx[0] < i < ph[0]))
+        opts, free, sel = [(GEMINI_TEXT_PLACEHOLDER[2:], None, None)], 0, None
+    else:
+        return None
+    if not question:
+        return None
+    p = _finish("question", None, question, None, opts, selected=sel, free_text_index=free)
+    p["agent"] = "gemini"
+    return p
+
+
+def _parse_gemini_plan(inner):
+    idx = _gemini_meaningful(inner)
+    if len(idx) < 4 or inner[idx[0]].strip() != GEMINI_PLAN_Q or not GEMINI_PLAN_HINT_RE.match(inner[idx[-1]].strip()):
+        return None
+    rows = _gemini_rows(inner, idx[0] + 1)
+    if len(rows) != 3 or not rows[0]["label"].startswith("Yes"):
+        return None
+    opts = [(_norm(r["label"]), _norm(" ".join(r["extra"])) or None, r["num"]) for r in rows]
+    free = next((k for k, o in enumerate(opts) if o[0] in GEMINI_FREE_LABELS), None)
+    p = _finish("plan", None, GEMINI_PLAN_Q, _gemini_body(inner[idx[0] + 1:rows[0]["line"]]), opts,
+                selected=next(k for k, r in enumerate(rows) if r["selected"]), free_text_index=free)
+    p["agent"] = "gemini"
+    return p
+
+
+def _parse_gemini_lines(lines, plan_reader=None):
+    inner = _last_box(lines)
+    if inner is None:
+        return None
+    return _parse_gemini_approval(inner) or _parse_gemini_question(inner) or _parse_gemini_plan(inner)
+
+
+def _parse_codex_lines(lines, plan_reader=None):
     return _parse_codex_approval(lines) or _parse_codex_question(lines) or _parse_codex_plan(lines)
 
 
-def parse_prompt(screen_text, plan_reader=None, agent=None):
-    """화면 글자 → 활성 메뉴 카드(dict) 또는 None. plan_reader(path)는 계획 파일 본문을 준다.
-    agent가 "codex"면 Codex 화면으로 읽는다(그 밖에는 Claude Code 화면)."""
-    if agent == "codex":
-        return parse_codex_prompt(screen_text)
-    lines = screen_lines(screen_text)
+def parse_codex_prompt(screen_text):
+    return _parse_codex_lines(screen_lines(screen_text))
+
+
+def _parse_claude_lines(lines, plan_reader=None):
     for fn in (_parse_question, _parse_submit, _parse_approval, _parse_confirm):
         p = fn(lines)
         if p:
             return p
     return _parse_plan(lines, plan_reader)
+
+
+def parse_prompt(screen_text, plan_reader=None, agent=None):
+    """화면 글자 → 활성 메뉴 카드(dict) 또는 None. plan_reader(path)는 계획 파일 본문을 준다.
+    agent(AGENTS 키)의 파서로 읽는다. 없거나 모르면 Claude Code 화면으로 읽는다."""
+    return agent_spec(agent)["parse"](screen_lines(screen_text), plan_reader)
 
 
 def make_plan_reader(home):
@@ -1111,6 +1302,31 @@ def nav_keys(cur, target):
     return (["down"] * d if d > 0 else ["up"] * (-d))
 
 
+def _free_text_digit(p, num, text):
+    """자유 입력 줄 번호를 눌러 커서를 옮긴 뒤 붙여넣기+enter(Claude 실측 2.1.329)."""
+    fi = p["free_text_index"]
+    if num(fi) > 9:
+        raise ApiError(400, "bad_option")
+    return [("keys", [str(num(fi))]), ("text", text)]
+
+
+def _free_text_codex(p, num, text):
+    """Codex: 숫자는 그 항목으로 바로 제출한다. 커서를 "None of the above"로 옮기고 tab으로 메모 칸을 연 뒤
+    붙여넣기+enter(실측 0.171.0: 답 "None of the above" + 메모가 간다)."""
+    cur = p.get("selected")
+    keys = nav_keys(None if cur is None else num(cur), num(p["free_text_index"]))
+    if keys is None:
+        raise ApiError(409, "no_cursor")
+    return [("keys", keys + ["tab"]), ("text", text)]
+
+
+def _free_text_gemini(p, num, text):
+    """Gemini: 입력만 받는 질문(번호 없음)은 바로 붙여넣기+enter, 그 밖에는 Claude처럼 번호 → 붙여넣기."""
+    if p["options"][p["free_text_index"]].get("number") is None:
+        return [("text", text)]
+    return _free_text_digit(p, num, text)
+
+
 def answer_steps(p, option_index=None, option_indices=None, text=None):
     """카드에 대한 답 → [("keys",[...]) | ("text", s)].
     실측(2.1.329): 숫자 키는 승인·계획·단일 선택·리뷰에서 바로 고른다. 자유 입력 줄은 숫자로 커서만 옮기고,
@@ -1127,17 +1343,7 @@ def answer_steps(p, option_index=None, option_indices=None, text=None):
             raise ApiError(400, "no_free_text")
         if "\n" in text or "\t" in text:
             raise ApiError(400, "bad_text")
-        if p.get("agent") == "codex":
-            # Codex: 숫자는 그 항목으로 바로 제출한다. 커서를 "None of the above"로 옮기고 tab으로 메모 칸을 연 뒤
-            # 붙여넣기+enter(실측 0.171.0: 답 "None of the above" + 메모가 간다).
-            cur = p.get("selected")
-            keys = nav_keys(None if cur is None else num(cur), num(fi))
-            if keys is None:
-                raise ApiError(409, "no_cursor")
-            return [("keys", keys + ["tab"]), ("text", text)]
-        if num(fi) > 9:
-            raise ApiError(400, "bad_option")
-        return [("keys", [str(num(fi))]), ("text", text)]
+        return agent_spec(p.get("agent"))["free_text"](p, num, text)
     if option_indices is not None:
         if not p["multi_select"]:
             raise ApiError(400, "not_multi_select")
@@ -1306,10 +1512,93 @@ def _codex_record(p, turns, tools):
             t["state"] = "ok"
 
 
-def parse_transcript(lines, limit=50):
-    """Claude Code 세션 jsonl(또는 Codex rollout jsonl) 줄들 → (turns, 잘렸는지)."""
+GEMINI_HIDDEN_USER_PREFIXES = ("<session_context>",)
+
+
+def _gemini_tool_result(tc):
+    res = tc.get("result")
+    for part in res if isinstance(res, list) else []:
+        fr = part.get("functionResponse") if isinstance(part, dict) else None
+        resp = fr.get("response") if isinstance(fr, dict) else None
+        if isinstance(resp, dict):
+            v = resp.get("output", resp.get("error"))
+            if isinstance(v, str):
+                return v
+            if v is not None:
+                return json.dumps(v, ensure_ascii=False)
+    return None
+
+
+def _parse_gemini_transcript(recs, limit):
+    """Gemini chats jsonl(실측 0.70.0): 같은 id 줄이 다시 오면 갱신, $patch는 content 갱신, $set은 메타.
+    user(content 부분 목록, functionResponse는 도구 결과라 건너뜀), gemini(content·thoughts·toolCalls)."""
+    by_id, order = {}, []
+    for rec in recs:
+        patch = rec.get("$patch")
+        if isinstance(patch, dict):
+            for u in patch.get("updates") if isinstance(patch.get("updates"), list) else []:
+                if isinstance(u, dict) and u.get("id") in by_id:
+                    by_id[u["id"]] = dict(by_id[u["id"]], **{k: v for k, v in u.items() if k != "id"})
+            continue
+        rid = rec.get("id")
+        if not isinstance(rid, str) or rec.get("type") not in ("user", "gemini"):
+            continue
+        if rid not in by_id:
+            order.append(rid)
+        by_id[rid] = rec
     turns = []
-    tools = {}
+    for rid in order:
+        rec = by_id[rid]
+        content = rec.get("content")
+        if rec["type"] == "user":
+            parts = []
+            for c in content if isinstance(content, list) else [{"text": content}]:
+                t = c.get("text") if isinstance(c, dict) else None
+                if isinstance(t, str) and t.strip() and not t.lstrip().startswith(GEMINI_HIDDEN_USER_PREFIXES):
+                    parts.append({"kind": "text", "text": _cap(t)})
+            if parts:
+                turns.append({"role": "user", "parts": parts})
+            continue
+        parts = []
+        for th in rec.get("thoughts") if isinstance(rec.get("thoughts"), list) else []:
+            if isinstance(th, dict):
+                t = "\n".join(x for x in (th.get("subject"), th.get("description")) if isinstance(x, str) and x.strip())
+                if t.strip():
+                    parts.append({"kind": "thinking", "text": _cap(t)})
+        if isinstance(content, str):
+            texts = [content]
+        else:
+            texts = [c.get("text") for c in content if isinstance(c, dict)] if isinstance(content, list) else []
+        for t in texts:
+            if isinstance(t, str) and t.strip():
+                parts.append({"kind": "text", "text": _cap(t)})
+        for tc in rec.get("toolCalls") if isinstance(rec.get("toolCalls"), list) else []:
+            if not isinstance(tc, dict):
+                continue
+            name = tc.get("name") if isinstance(tc.get("name"), str) else "?"
+            inp = tc.get("args") if isinstance(tc.get("args"), dict) else {}
+            out = _gemini_tool_result(tc)
+            status = tc.get("status")
+            state = "ok" if status == "success" else ("error" if status in ("error", "cancelled") else "pending")
+            parts.append({"kind": "tool", "name": name, "summary": _tool_summary(name, inp), "input": _cap_obj(inp),
+                          "output": _cap(_strip_ansi(out)) if out is not None else None, "state": state})
+        if not parts:
+            continue
+        if turns and turns[-1]["role"] == "assistant":
+            turns[-1]["parts"].extend(parts)
+        else:
+            turns.append({"role": "assistant", "parts": parts})
+    cut = len(turns) > limit
+    return turns[-limit:] if limit else turns, cut
+
+
+def _is_gemini_record(rec):
+    return rec.get("type") == "gemini" or "$set" in rec or "$patch" in rec or "projectHash" in rec
+
+
+def parse_transcript(lines, limit=50):
+    """Claude Code 세션 jsonl(또는 Codex rollout jsonl, Gemini chats jsonl) 줄들 → (turns, 잘렸는지)."""
+    recs = []
     for line in lines:
         line = line.strip()
         if not line:
@@ -1318,7 +1607,14 @@ def parse_transcript(lines, limit=50):
             rec = json.loads(line)
         except ValueError:
             continue
-        if not isinstance(rec, dict) or rec.get("isMeta") or rec.get("isSidechain"):
+        if isinstance(rec, dict):
+            recs.append(rec)
+    if any(_is_gemini_record(r) for r in recs[:50]):
+        return _parse_gemini_transcript(recs, limit)
+    turns = []
+    tools = {}
+    for rec in recs:
+        if rec.get("isMeta") or rec.get("isSidechain"):
             continue
         typ = rec.get("type")
         if typ == "response_item":  # Codex rollout 줄
@@ -1556,10 +1852,81 @@ def find_codex_transcript(info, home, runner=None):
     return hit if hit else (None, None)
 
 
+GEMINI_SESSION_RE = re.compile(r"^session-[0-9T-]+-[0-9a-fA-F]{4,64}\.jsonl$")
+
+
+def gemini_dir(home):
+    env = os.environ.get("GEMINI_CLI_HOME")
+    return os.path.join(os.path.expanduser(env) if env else home, ".gemini")
+
+
+def _gemini_project_dirs(base, cwd):
+    """그 폴더의 기록 폴더 후보: projects.json의 짧은 이름, 없으면 tmp/*/.project_root가 같은 폴더."""
+    want = {cwd, os.path.realpath(cwd)}
+    out = []
+    try:
+        data = json.loads(read_regular_file(os.path.join(base, "projects.json"), 1 << 20).decode("utf-8", "replace"))
+        projects = data.get("projects") if isinstance(data, dict) else None
+        for k, v in (projects or {}).items():
+            if isinstance(k, str) and isinstance(v, str) and v and k in want:
+                out.append(v)
+    except (OSError, ValueError):
+        pass
+    if not out:
+        try:
+            for name in os.listdir(os.path.join(base, "tmp")):
+                try:
+                    root = read_regular_file(os.path.join(base, "tmp", name, ".project_root"), 4096)
+                except OSError:
+                    continue
+                if root.decode("utf-8", "replace").strip() in want:
+                    out.append(name)
+        except OSError:
+            pass
+    return [n for n in out if n not in (".", "..") and "/" not in n and "\\" not in n]
+
+
+def _jsonl_first(path):
+    try:
+        head = read_regular_file(path, 64 * 1024).decode("utf-8", "replace").split("\n", 1)[0]
+        rec = json.loads(head)
+    except (OSError, ValueError):
+        return {}
+    return rec if isinstance(rec, dict) else {}
+
+
+def find_gemini_transcript(info, home, runner=None):
+    """Gemini 터미널 → (session_id, 기록 경로). 실측 0.70.0: ~/.gemini/tmp/<이름>/chats/session-*.jsonl,
+    이름은 ~/.gemini/projects.json이 폴더마다 정한다. 세션 동안 파일을 열어 두지 않아 그 폴더의 가장 최근 파일을 본다."""
+    cwd = live_cwd(info)
+    if not cwd:
+        return None, None
+    base = gemini_dir(home)
+    best = None
+    for name in _gemini_project_dirs(base, cwd):
+        chats = os.path.join(base, "tmp", name, "chats")
+        try:
+            names = os.listdir(chats)
+        except OSError:
+            continue
+        for f in names:
+            if not GEMINI_SESSION_RE.match(f):
+                continue
+            path = os.path.join(chats, f)
+            try:
+                st_ = os.stat(path, follow_symlinks=False)
+            except OSError:
+                continue
+            if stat.S_ISREG(st_.st_mode) and (best is None or st_.st_mtime > best[0]):
+                best = (st_.st_mtime, path)
+    if best is None:
+        return None, None
+    sid = _jsonl_first(best[1]).get("sessionId")
+    return (sid if isinstance(sid, str) and SESSION_ID_RE.match(sid) else None), best[1]
+
+
 def find_agent_transcript(info, home, runner=None):
-    if agent_kind(info) == "codex":
-        return find_codex_transcript(info, home, runner=runner)
-    return find_transcript(info, home, runner=runner)
+    return agent_spec(agent_kind(info))["transcript"](info, home, runner=runner)
 
 
 def read_transcript(path, limit=50):
@@ -2860,6 +3227,39 @@ CODEX_PUSH_PROMPT_WAIT = 2.0
 CODEX_PUSH_PROMPT_RETRY = 0.15
 
 
+# ---------------------------------------------------------------- 에이전트 표
+# 에이전트마다 다른 것을 한 곳에 모은다. 새 에이전트는 항목 하나와 그 파서·기록 함수만 더한다.
+#   match(info)            이 터미널이 그 에이전트인가(hc agent·status.app·앞 프로그램)
+#   parse(lines, reader)   화면 줄 → 활성 메뉴 카드 또는 None(모르는 화면은 None: 카드·버튼 없음)
+#   free_text(p, num, s)   카드의 직접 입력 답 → answer_steps 단계
+#   transcript(info, home, runner=) → (session_id, 기록 경로) 또는 (None, None). 테스트가 모듈 함수를 바꿔
+#                          끼우므로 호출 때 이름으로 찾는다
+#   push_wait()            blocked 알림 카드를 읽을 시간(초). 메뉴가 늦게 그려지는 에이전트는 그 안에서 다시 읽는다
+#   screen                 hc가 막힘으로 안 보는 화면을 서버가 화면으로 판정하는 방식:
+#                          None, "codex_plan"(hc status + 계획 메뉴만 덧씌움),
+#                          "full"(OSC 7501 상태를 안 보내 hc status가 없다: 화면 메뉴·터미널 제목으로 전부 판정)
+#   title_blocked/title_working  "full"에서 터미널 제목으로 막힘·작업 중을 아는 정규식(없으면 None)
+#   busy_re                "full"에서 제목이 없을 때 화면 끝 줄로 작업 중을 아는 정규식(없으면 None)
+AGENTS = {
+    "claude": {"match": is_claude, "parse": _parse_claude_lines, "free_text": _free_text_digit,
+               "transcript": lambda info, home, runner=None: find_transcript(info, home, runner=runner),
+               "push_wait": lambda: PUSH_PROMPT_BUDGET, "retry": False,
+               "screen": None},
+    "codex": {"match": is_codex, "parse": _parse_codex_lines, "free_text": _free_text_codex,
+              "transcript": lambda info, home, runner=None: find_codex_transcript(info, home, runner=runner),
+              "push_wait": lambda: CODEX_PUSH_PROMPT_WAIT, "retry": True,
+              "screen": "codex_plan"},
+    "gemini": {"match": _named("gemini"), "parse": _parse_gemini_lines, "free_text": _free_text_gemini,
+               "transcript": lambda info, home, runner=None: find_gemini_transcript(info, home, runner=runner),
+               "push_wait": lambda: PUSH_PROMPT_BUDGET, "retry": False, "screen": "full",
+               "title_blocked": GEMINI_TITLE_BLOCKED_RE, "title_working": GEMINI_TITLE_WORKING_RE, "busy_re": None},
+}
+AGENT_ORDER = ("claude", "codex", "gemini")
+SCREEN_POLL_INTERVAL = 3.0  # "full" 에이전트 화면 판정 주기(초). 제목 이벤트가 먼저 오면 그때 바로 본다
+SCREEN_SETTLE = 0.6  # 제목은 막힘인데 메뉴를 못 읽었을 때 다시 볼 때까지(초)
+PROMPT_STATUS_KINDS = {"approval": "permission", "confirm": "permission", "question": "question", "plan": "plan"}
+
+
 class App:
     def __init__(self, cfg, hc, devices, pusher, runner=None, clock=time.monotonic, push_log=None):
         self.cfg = cfg
@@ -2880,6 +3280,8 @@ class App:
         self.reminders = Reminders(reminder_intervals(cfg))
         self._later = lambda sec, fn: threading.Timer(sec, fn).start()  # 테스트가 바꾼다
         self._agent_kinds = {}  # tid → agent_kind(마지막 hc get). 알림 카드를 어느 화면으로 읽을지 정한다
+        self._screen_state = {}  # "full" 에이전트: tid → 마지막으로 판정한 status
+        self._screen_turns = {}  # "full" 에이전트: tid → 끝남 횟수(Tracker의 turn 대신)
         self.tracker = Tracker(self._notify, prompt_for=self._prompt_for_push, reminders=self.reminders)
         self.blocked_since = BlockedSince()
         self.branches = BranchCache()
@@ -2913,8 +3315,8 @@ class App:
         """blocked 알림용 카드: hc read 한 번 + 파싱, PUSH_PROMPT_BUDGET 안에 못 끝나면 None."""
         box = {}
         agent = self._agent_kinds.get(tid)
-
-        budget = CODEX_PUSH_PROMPT_WAIT if agent == "codex" else PUSH_PROMPT_BUDGET
+        spec = agent_spec(agent)
+        budget = spec["push_wait"]()
         end = time.monotonic() + budget
         stop = threading.Event()
 
@@ -2922,7 +3324,7 @@ class App:
             try:
                 while True:
                     box["p"] = self.parse_screen((self.hc.read(tid, 0) or {}).get("text", ""), agent)
-                    if box["p"] or agent != "codex" or stop.is_set() \
+                    if box["p"] or not spec["retry"] or stop.is_set() \
                             or time.monotonic() + CODEX_PUSH_PROMPT_RETRY >= end:
                         return
                     time.sleep(CODEX_PUSH_PROMPT_RETRY)
@@ -2940,7 +3342,7 @@ class App:
     def _codex_plan_status(self, tid, info):
         """hc가 blocked로 보지 않는 Codex "Implement this plan?" 메뉴가 화면 끝에 살아 있으면
         (막힘 status, True). 메뉴는 없고 플랜 모드면 (None, True). 그 밖에는 (None, False)."""
-        if agent_kind(info) != "codex":
+        if agent_spec(agent_kind(info))["screen"] != "codex_plan":
             return None, False
         st = status_of(info)
         if st.get("state") not in ("done", "idle"):
@@ -2955,8 +3357,58 @@ class App:
         tail = [ln for ln in screen_lines(text) if ln.strip()][-1:]
         return None, bool(tail and CODEX_PLAN_MODE_RE.search(tail[0]))
 
+    def _screen_status(self, tid, info, commit=False, settle=False):
+        """hc status가 없는 에이전트("full")의 status를 화면·제목으로 만든다.
+        메뉴 카드가 읽히면 막힘(kind·msg는 카드에서), 제목이 막힘이면 카드 없는 막힘, 작업 중이면 working,
+        작업·막힘 뒤에 멈추면 done(다음 작업까지 유지), 아니면 idle. commit이면 판정을 기억한다(refresh만).
+        제목은 막힘인데 메뉴를 아직 못 읽었고 settle이 아니면 None(잠깐 뒤 다시 본다)."""
+        kind = agent_kind(info)
+        spec = agent_spec(kind)
+        title = info.get("title") if isinstance(info.get("title"), str) else ""
+        try:
+            text = (self.hc.read(tid, 0) or {}).get("text", "")
+        except HcError:
+            text = ""
+        p = self.parse_screen(text, kind) if text else None
+        prev_st = self._screen_state.get(tid) or {}
+        prev = prev_st.get("state")
+        if p:
+            msg = ("approve " + (p["title"] or "")).strip() if p["kind"] in ("approval", "confirm") \
+                else (p["question"] or None if p["kind"] == "question" else None)
+            st = {"app": kind, "state": "blocked", "kind": PROMPT_STATUS_KINDS.get(p["kind"], "question"),
+                  "msg": msg[:200] if msg else None}
+        elif spec.get("title_blocked") and spec["title_blocked"].search(title):
+            if prev == "blocked":
+                st = prev_st  # 같은 상자에서 PC나 앱이 고르는 중(직접 입력 칸 등): 새 막힘이 아니다
+            elif not settle:
+                return None
+            else:
+                st = {"app": kind, "state": "blocked", "kind": "dialog", "msg": None}
+        else:
+            busy = bool(spec.get("title_working") and spec["title_working"].search(title))
+            if not busy and spec.get("busy_re") and text:
+                tail = [ln for ln in screen_lines(text) if ln.strip()][-8:]
+                busy = any(spec["busy_re"].search(ln) for ln in tail)
+            if busy:
+                st = {"app": kind, "state": "working"}
+            elif prev in ("working", "blocked", "done"):
+                st = {"app": kind, "state": "done"}
+            else:
+                st = {"app": kind, "state": "idle"}
+        if commit:
+            if st["state"] == "done" and prev != "done":
+                self._screen_turns[tid] = self._screen_turns.get(tid, 0) + 1
+            self._screen_state[tid] = st
+        return st
+
     def effective_info(self, tid, info):
-        """Codex 계획 메뉴가 떠 있으면 status를 막힘으로 바꾼 사본(카드·답·목록이 막힘으로 다룬다)."""
+        """화면으로 판정한 막힘이 있으면 status를 바꾼 사본(카드·답·목록이 막힘으로 다룬다).
+        Codex는 계획 실행 메뉴만, hc status가 없는 에이전트("full")는 status 전체."""
+        if agent_spec(agent_kind(info))["screen"] == "full":
+            st = self._screen_status(tid, info)
+            info = dict(info)
+            info["status"] = st or self._screen_state.get(tid) or {"app": agent_kind(info), "state": "idle"}
+            return info
         plan_st, _ = self._codex_plan_status(tid, info)
         if plan_st:
             info = dict(info)
@@ -2979,7 +3431,16 @@ class App:
                 self._agent_kinds[tid] = agent_kind(info)
                 turn = info.get("turn")
                 st = status_of(info)
-                plan_st, plan_mode = self._codex_plan_status(tid, info)
+                if agent_spec(self._agent_kinds[tid])["screen"] == "full":
+                    st = self._screen_status(tid, info, commit=True, settle=settle)
+                    if st is None:  # 제목은 막힘인데 메뉴가 아직 안 그려졌다: 잠깐 뒤 한 번 더
+                        self._later(SCREEN_SETTLE, lambda: self.refresh(tid, name=name, settle=True))
+                        self._detected = None
+                        return
+                    turn = self._screen_turns.get(tid)
+                    plan_st, plan_mode = None, False
+                else:
+                    plan_st, plan_mode = self._codex_plan_status(tid, info)
                 if plan_st:
                     st = plan_st  # 계획 실행 메뉴: 끝남 대신 막힘으로(끝남 알림을 따로 보내지 않는다)
                 elif plan_mode and st.get("state") == "done" and not settle:
@@ -3028,6 +3489,10 @@ class App:
             self.refresh(tid, initial=initial, name=t.get("name"))
         for tid in self.tracker.known() - live:
             self.tracker.forget(tid)
+        for tid in set(self._agent_kinds) - live:
+            self._agent_kinds.pop(tid, None)
+            self._screen_state.pop(tid, None)
+            self._screen_turns.pop(tid, None)
         for tid in self.tracker.known_claude() - live:
             self.exited(tid)
 
@@ -3074,7 +3539,12 @@ class App:
             return
         typ = p.get("type")
         data = p.get("data") if isinstance(p.get("data"), dict) else {}
-        if typ in ("status", "turn"):
+        if typ == "title":
+            # hc status가 없는 에이전트는 제목(✋/✦/◇)이 바뀔 때 화면을 본다. 처음 보는 터미널은 한 번 판별한다.
+            kind = self._agent_kinds.get(tid, "?")
+            if kind == "?" or agent_spec(kind)["screen"] == "full":
+                self.refresh(tid, detected=t0)
+        elif typ in ("status", "turn"):
             st = data.get("status") if isinstance(data.get("status"), dict) else {}
             ev_state = st.get("state") or data.get("state")
             self.refresh(tid, event_state=ev_state, detected=t0)
@@ -3110,6 +3580,19 @@ class App:
             log.info("hc events 끊김, %d초 뒤 재연결", backoff)
             self.stop.wait(backoff)
             backoff = min(backoff * 2, EVENTS_MAX_BACKOFF)
+
+    def screen_poll(self):
+        """hc status가 없는 에이전트("full") 터미널만 화면으로 다시 판정한다(제목 이벤트를 놓쳐도 잡히게)."""
+        for tid, kind in list(self._agent_kinds.items()):
+            if kind and agent_spec(kind)["screen"] == "full":
+                self.refresh(tid)
+
+    def screen_poll_loop(self):
+        while not self.stop.wait(SCREEN_POLL_INTERVAL):
+            try:
+                self.screen_poll()
+            except Exception:  # noqa: BLE001
+                log.exception("화면 판정 오류")
 
     def poll_loop(self):
         while not self.stop.wait(POLL_INTERVAL):
@@ -3229,7 +3712,8 @@ class App:
                     raise ApiError(409, "needs_manual", prompt=p)  # 계획 승인은 auto mode 등 갈림길이라 앱에서
                 labels = [o["label"] for o in p["options"]]
                 if action == "approve":
-                    idx = approve_index(labels)
+                    # 승인 글자가 Yes가 아닌 에이전트(Gemini "Allow once")는 파서가 approve_index를 정해 둔다
+                    idx = p["approve_index"] if "approve_index" in p else approve_index(labels)
                     if idx is None:
                         raise ApiError(409, "needs_manual", prompt=p)
                 elif action == "always":
@@ -3423,7 +3907,11 @@ class App:
     def api_send(self, tid, body):
         text = validate_text(body.get("text"))
         with self.term_lock(tid):
-            self.require_claude(tid)
+            info = self.require_claude(tid)
+            if agent_spec(agent_kind(info))["screen"] == "full" \
+                    and status_of(self.effective_info(tid, info)).get("state") == "blocked":
+                # hc는 이 에이전트의 대화 상자를 모른다: 그대로 보내면 메뉴에 글자가 들어간다
+                raise ApiError(409, "hc_refused", detail="blocked")
             try:
                 self.hc.send(tid, text)
             except HcError as e:
@@ -4250,6 +4738,7 @@ def cmd_serve():
     app.poll(initial=True)
     threading.Thread(target=app.events_loop, name="events", daemon=True).start()
     threading.Thread(target=app.poll_loop, name="poll", daemon=True).start()
+    threading.Thread(target=app.screen_poll_loop, name="screen-poll", daemon=True).start()
     try:
         srv.serve_forever()
     finally:
