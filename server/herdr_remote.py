@@ -24,6 +24,8 @@ APNs 키: Apple Developer에서 받은 .p8을 ~/.config/herdr-remote/AuthKey.p8 
 중계 모드: APNs 키 파일이 없고 설정의 push_relay_url이 비어 있으면 기본 중계(DEFAULT_RELAY_URL)로 키 없이 보낸다
 (App Store판 앱, 기기마다 relay_sig 필요). push_relay_url에 https 주소를 넣으면 그 중계를 쓰고, "off"면 중계를 끈다.
 키 파일이 있고 push_relay_url이 비어 있으면 지금처럼 APNs 직접 모드.
+Android(env "fcm") 기기는 APNs 키가 있어도 항상 중계로 보낸다: push_relay_url이 비면 기본 중계, 주소면 그 중계,
+"off"면 보내지 않고 발송 상태에 실패(fcm_relay_off)로 남긴다.
 
 환경변수
   HERDR_REMOTE_CONFIG  설정 파일(기본 ~/.config/herdr-remote/config.json). devices.json은 같은 폴더.
@@ -88,6 +90,11 @@ PUSH_TEST_MIN_GAP = 10.0  # 같은 기기 시험 알림 최소 간격(초)
 
 ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 DEVICE_TOKEN_RE = re.compile(r"^[0-9a-fA-F]{32,200}$")
+# FCM 등록 토큰: 대소문자를 가리므로 바꾸지 않고 저장한다. 중계(relay.ts FCM_TOKEN_RE)와 같은 범위.
+FCM_TOKEN_RE = re.compile(r"^[A-Za-z0-9_:\-]{20,1024}$")
+APNS_ENVS = ("sandbox", "production")
+FCM_ENV = "fcm"
+FCM_RELAY_OFF_REASON = "fcm_relay_off"
 RELAY_SIG_RE = re.compile(r"^v1\.[A-Za-z0-9_-]{43}$")
 DEVICE_ID_RE = re.compile(r"^[0-9a-f]{16}$")
 ALLOWED_KEYS = frozenset(["enter", "esc", "up", "down", "left", "right", "tab", "space"]
@@ -141,7 +148,9 @@ def load_config(path=None):
     cfg["apns_hosts"] = hosts
     for k in ("hc_path", "apns_key_path"):
         cfg[k] = os.path.expanduser(cfg[k])
-    cfg["push_relay_url"] = resolve_relay_url(cfg.get("push_relay_url"), cfg["apns_key_path"])
+    raw_relay = cfg.get("push_relay_url")
+    cfg["push_relay_url"] = resolve_relay_url(raw_relay, cfg["apns_key_path"])
+    cfg["fcm_relay_url"] = resolve_fcm_relay_url(raw_relay)
     cfg["port"] = int(cfg["port"])
     cfg["_path"] = path
     cfg["_dir"] = os.path.dirname(path)
@@ -153,6 +162,15 @@ def resolve_relay_url(url, apns_key_path):
     if url == RELAY_OFF:
         return ""
     if (url is None or url == "") and not os.path.isfile(apns_key_path or ""):
+        return DEFAULT_RELAY_URL
+    return check_relay_url(url)
+
+
+def resolve_fcm_relay_url(url):
+    """Android(fcm) 기기에 쓸 중계 주소. APNs 키와 상관없다: "off"면 "", 비었으면 기본 중계, 아니면 check_relay_url."""
+    if url == RELAY_OFF:
+        return ""
+    if url is None or url == "":
         return DEFAULT_RELAY_URL
     return check_relay_url(url)
 
@@ -1823,6 +1841,8 @@ class ApnsPusher:
         self._jwt_at = 0
         self._lock = threading.Lock()
         self._warned = False
+        self._fcm = None
+        self._fcm_lock = threading.Lock()
 
     def available(self):
         ok = os.path.isfile(self.cfg["apns_key_path"])
@@ -1874,18 +1894,53 @@ class ApnsPusher:
             return 0, "curl exit %d" % p.returncode
 
     def push(self, payload):
-        if not self.available():
-            return 0
         sent = 0
+        apns_ok = None  # APNs 기기가 있을 때만 확인한다(키 없음 경고도 그때 한 번)
         for d in self.devices.list():
-            code, _ = self._deliver(d, payload)
+            if d.get("env") == FCM_ENV:
+                code, _ = self._deliver_fcm(d, payload)
+            else:
+                if apns_ok is None:
+                    apns_ok = self.available()
+                if not apns_ok:
+                    continue
+                code, _ = self._deliver(d, payload)
             if code == 200:
                 sent += 1
         return sent
 
     def push_device(self, device, payload):
         """기기 하나에만 보낸다(시험 알림). 반환: (http_code, reason). 예외는 (0, 예외 이름)."""
+        if device.get("env") == FCM_ENV:
+            return self._deliver_fcm(device, payload)
         return self._deliver(device, payload)
+
+    def fcm_relay_url(self):
+        return self.cfg.get("fcm_relay_url") or ""
+
+    def _fcm_pusher(self):
+        """fcm 기기를 보낼 중계 발송기. 없으면(off) None. 이 발송기가 같은 중계를 쓰면 자기 자신."""
+        url = self.fcm_relay_url()
+        if not url:
+            return None
+        if isinstance(self, RelayPusher) and self._url == url:
+            return self
+        with self._fcm_lock:
+            if self._fcm is None:
+                self._fcm = RelayPusher(self.cfg, self.devices, url=url, push_log=self.push_log)
+            return self._fcm
+
+    def _deliver_fcm(self, d, payload):
+        """Android 기기: APNs 키가 있어도 항상 중계로. 중계가 꺼져 있으면 보내지 않고 실패로 남긴다."""
+        p = self._fcm_pusher()
+        if p is None:
+            self._record(d, 0, FCM_RELAY_OFF_REASON)
+            log.warning("푸시 %s: Android 기기인데 중계가 꺼져 있어(push_relay_url off) 보내지 않는다",
+                        short_token(d.get("token")))
+            return 0, FCM_RELAY_OFF_REASON
+        if p is self:
+            return self._deliver(d, payload)
+        return p.push_device(d, payload)
 
     def _deliver(self, d, payload):
         """한 기기 발송 + 결과 처리(기기 삭제·서명 표시) + PushLog 기록. 반환: (http_code, reason)."""
@@ -1920,10 +1975,12 @@ class ApnsPusher:
 class RelayPusher(ApnsPusher):
     """키 없이 Sheltie 푸시 중계(POST <push_relay_url>/v1/push)로 보낸다. 연결은 keep-alive로 재사용한다."""
 
-    def __init__(self, cfg, devices, timeout=RELAY_TIMEOUT, clock=time.monotonic, sleep=time.sleep, push_log=None):
+    def __init__(self, cfg, devices, timeout=RELAY_TIMEOUT, clock=time.monotonic, sleep=time.sleep, push_log=None,
+                 url=None):
         super().__init__(cfg, devices, clock=clock, push_log=push_log)
         self.sleep = sleep
-        u = urllib.parse.urlsplit(cfg["push_relay_url"])
+        self._url = url or cfg["push_relay_url"]
+        u = urllib.parse.urlsplit(self._url)
         self._https = u.scheme == "https"
         self._host = u.hostname
         self._port = u.port
@@ -1936,7 +1993,7 @@ class RelayPusher(ApnsPusher):
         self._push_ctx = threading.local()
 
     def available(self):
-        return bool(self.cfg.get("push_relay_url"))
+        return bool(self._url)
 
     def _new_conn(self):
         cls = http.client.HTTPSConnection if self._https else http.client.HTTPConnection
@@ -2000,7 +2057,7 @@ class RelayPusher(ApnsPusher):
                 self._no_sig_warned.add(tok)
                 log.warning("푸시 %s: relay_sig가 없어 건너뛴다(앱에서 다시 등록 필요)", short_token(tok))
             return 0, "no_relay_sig"
-        env = device.get("env") if device.get("env") in ("sandbox", "production") else "sandbox"
+        env = device.get("env") if device.get("env") in APNS_ENVS + (FCM_ENV,) else "sandbox"
         cid = getattr(self._push_ctx, "collapse_id", None) or uuid.uuid4().hex
         body = json.dumps({"device_token": tok, "env": env, "relay_sig": sig, "collapse_id": cid, "payload": payload},
                           ensure_ascii=True, separators=(",", ":")).encode("ascii")
@@ -2816,22 +2873,29 @@ class App:
     def api_add_device(self, body):
         tok = body.get("token")
         env = body.get("env")
-        if not isinstance(tok, str) or not DEVICE_TOKEN_RE.match(tok):
-            raise ApiError(400, "bad_token")
-        if env not in ("sandbox", "production"):
-            raise ApiError(400, "bad_env")
+        if env == FCM_ENV:
+            # FCM 토큰은 hex가 아니고 대소문자를 가린다: 그대로 저장한다.
+            if not isinstance(tok, str) or not FCM_TOKEN_RE.match(tok):
+                raise ApiError(400, "bad_token")
+        else:
+            if not isinstance(tok, str) or not DEVICE_TOKEN_RE.match(tok):
+                raise ApiError(400, "bad_token")
+            if env not in APNS_ENVS:
+                raise ApiError(400, "bad_env")
+            tok = tok.lower()
         sig = body.get("relay_sig")
         if sig is not None and (not isinstance(sig, str) or not RELAY_SIG_RE.match(sig)):
             raise ApiError(400, "bad_relay_sig")
-        self.devices.add(tok.lower(), env, relay_sig=sig)
+        self.devices.add(tok, env, relay_sig=sig)
         log.info("기기 등록 %s %s%s", short_token(tok), env, " (중계 서명 있음)" if sig else "")
         return {"ok": True}
 
     def api_delete_device(self, body):
         tok = body.get("token")
-        if not isinstance(tok, str) or not DEVICE_TOKEN_RE.match(tok):
+        if not isinstance(tok, str) or not (DEVICE_TOKEN_RE.match(tok) or FCM_TOKEN_RE.match(tok)):
             raise ApiError(400, "bad_token")
-        removed = self.devices.remove(tok.lower())
+        # APNs 토큰은 소문자로, FCM 토큰은 그대로 저장돼 있다.
+        removed = self.devices.remove(tok) or self.devices.remove(tok.lower())
         return {"ok": True, "removed": removed}
 
     # --- 알림 상태(무음 실패 방지)
@@ -2892,9 +2956,10 @@ class App:
     def api_push_test(self, body):
         """기기 하나에 시험 알림을 동기로 보낸다. 결과는 PushLog에도 남는다."""
         did = self._device_id_arg(body.get("device"))
-        if self.push_mode() == "none":
-            raise ApiError(409, "push_unavailable")
         dev = next((d for d in self.devices.list() if device_id(d["token"]) == did), None)
+        # Android 기기는 APNs 모드와 상관없이 중계로 간다(중계가 꺼져 있으면 아래에서 실패로 기록·응답).
+        if (dev is None or dev.get("env") != FCM_ENV) and self.push_mode() == "none":
+            raise ApiError(409, "push_unavailable")
         if dev is None:
             raise ApiError(404, "device_not_registered")
         now = self.clock()
@@ -3451,6 +3516,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     res = {"ok": True, "name": machine_name()}
                     if app.cfg.get("push_relay_url"):
                         res["push_relay_url"] = app.cfg["push_relay_url"]
+                    if app.cfg.get("fcm_relay_url"):
+                        # Android 앱은 이 주소로 등록한다(APNs 직접 모드여도 fcm은 중계를 쓴다).
+                        res["fcm_relay_url"] = app.cfg["fcm_relay_url"]
+                    if app.cfg.get("push_relay_url") or app.cfg.get("fcm_relay_url"):
                         res["relay_resign"] = app.devices.relay_resign()
                     res["push"] = app.push_health((query.get("device") or [None])[0])
                 elif name == "terminals":
