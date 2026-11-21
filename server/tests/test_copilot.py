@@ -52,12 +52,12 @@ class CopilotParseTests(unittest.TestCase):
         self.assertEqual(p["question"], "Do you want to run this command?")
         self.assertEqual(p["body"], "touch notes.txt")
         self.assertEqual(labels(p), ["Yes", "Yes, and don't ask again for `touch` in this repo (~/work/demo)",
-                                     "No, and tell Copilot what to do differently"])
-        self.assertEqual([o["number"] for o in p["options"]], [1, 2, 3])
+                                     "No, and tell Copilot what to do differently", "No"])
+        self.assertEqual([o["number"] for o in p["options"]], [1, 2, 3, None])
         # 2번은 permissions-config.json에 영구 저장(실측): 잠금화면 "계속 허용"에 붙이지 않는다
         self.assertEqual((p["selected"], p["always_index"], p["persist_index"]), (0, None, 1))
-        # 3번은 입력 항목(숫자는 커서만): 거절 버튼은 esc, 이 줄은 직접 입력으로
-        self.assertEqual((p["reject_index"], p["free_text_index"]), (None, 2))
+        # 3번은 입력 항목(숫자는 커서만): 직접 입력으로. 앱이 입력 항목을 버튼에서 빼므로 서버가 거절 버튼 "No"(esc)를 더한다
+        self.assertEqual((p["reject_index"], p["free_text_index"]), (3, 2))
         self.assertEqual(hr.push_category("blocked", PERM, p), "HR_PERMISSION")
 
     def test_file_approvals(self):
@@ -68,8 +68,9 @@ class CopilotParseTests(unittest.TestCase):
             self.assertEqual((p["kind"], p["title"], p["question"]), ("approval", title, q))
             self.assertIn(needle, p["body"])
             self.assertEqual(labels(p)[0], "Yes")
+            self.assertEqual(labels(p)[3], "No")
             self.assertEqual((p["always_index"], p["persist_index"], p["reject_index"], p["free_text_index"]),
-                             (None, 1, None, 2))
+                             (None, 1, 3, 2))
         self.assertEqual(card("write-no")["selected"], 2)
         self.assertEqual(card("write-no")["id"], card("write")["id"])
 
@@ -143,6 +144,10 @@ class CopilotParseTests(unittest.TestCase):
         self.assertEqual(hr.answer_steps(card("exec"), text="use hi.py"), [("keys", ["3"]), ("text", "use hi.py")])
         with self.assertRaises(hr.ApiError):
             hr.answer_steps(card("exec"), option_index=2)  # 입력 항목은 글이 있어야 한다
+        # 서버가 더한 거절 버튼 "No": esc(거절, 턴이 멈춘다)
+        for name in ("exec", "write", "edit"):
+            self.assertEqual(hr.answer_steps(card(name), option_index=3), [("keys", ["esc"])], name)
+        self.assertEqual(hr.answer_steps(card("trust"), option_index=2), [("keys", ["3"])])
         self.assertEqual(hr.answer_steps(card("plan"), text="add docs"), [("keys", ["4"]), ("text", "add docs")])
         self.assertEqual(hr.answer_steps(card("plan"), option_index=2), [("keys", ["3"])])
         # 질문은 번호가 없어 숫자 키를 무시한다: 커서 이동 + enter
@@ -189,7 +194,9 @@ class CopilotApiTests(unittest.TestCase):
         self.assertEqual(self.app.api_answer("p1", {"action": "reject", "prompt_id": pid})["keys"], ["esc"])
         self.app.api_prompt_answer("p1", {"prompt_id": pid, "text": "use hi.py instead"})
         self.app.api_prompt_answer("p1", {"prompt_id": pid, "option_index": 1})  # 영구 허용은 카드에서 직접 고를 때만
-        self.assertEqual(self.hc.keys_calls, [("p1", ["1"]), ("p1", ["esc"]), ("p1", ["3"]), ("p1", ["2"])])
+        self.app.api_prompt_answer("p1", {"prompt_id": pid, "option_index": 3})  # 거절 버튼 "No"
+        self.assertEqual(self.hc.keys_calls, [("p1", ["1"]), ("p1", ["esc"]), ("p1", ["3"]), ("p1", ["2"]),
+                                              ("p1", ["esc"])])
         self.assertEqual(self.hc.send_calls, [("p1", "use hi.py instead", "force")])
         # 옛 경로(prompt_id 없음): hc status에 msg가 없어 승인은 앱에서, 거절은 esc
         self.assertEqual(self.err(self.app.api_answer, "p1", {"action": "approve"}), (409, "needs_manual"))

@@ -1228,6 +1228,7 @@ COPILOT_HINT_RE = re.compile(r"^↑/↓ to navigate · enter to select(?: · ctr
 COPILOT_APPROVAL_Q_RE = re.compile(r"^Do you (?:want to .+|trust the files in this folder)\?$")
 COPILOT_ESC_SUFFIX_RE = re.compile(r"\s*\(Esc(?: to stop)?\)$")
 COPILOT_REJECT_FREE = "No, and tell Copilot what to do differently"
+COPILOT_REJECT_LABEL = "No"  # 서버가 승인 카드 끝에 더하는 거절 버튼(화면에는 없다, 키는 esc)
 COPILOT_TRUST_TITLE = "Confirm folder trust"
 COPILOT_PLAN_TITLE = "Plan Ready for Review"
 COPILOT_PLAN_FREE = "Suggest changes"
@@ -1290,9 +1291,11 @@ def _parse_copilot_box(lines):
                 return None
             free, reject = None, len(rows) - 1
         elif labels[-1] == COPILOT_REJECT_FREE:
-            # 거절 항목은 입력 항목이라 숫자만으로는 제출되지 않는다: 거절 버튼은 esc(라벨의 "Esc to stop"),
-            # 이 줄을 고르면 직접 입력으로 지시와 함께 거절
-            free, reject = len(rows) - 1, None
+            # 거절 항목은 입력 항목이라 숫자만으로는 제출되지 않는다: 이 줄은 직접 입력(지시와 함께 거절)으로 두고,
+            # 앱이 입력 항목을 버튼에서 빼므로 번호 없는 거절 버튼 "No"를 끝에 더한다. 키는 esc(라벨의 "Esc to stop",
+            # _pick_copilot)
+            free, reject = len(rows) - 1, len(rows)
+            opts.append((COPILOT_REJECT_LABEL, None, None))
         else:
             return None  # 3번에 PC에서 글자를 치는 중(라벨이 입력값으로 바뀐다) 등
         _, persist = allow_more_indices(labels)  # "Yes, and don't ask again …"은 permissions-config.json에 영구 저장
@@ -1391,6 +1394,14 @@ def _parse_copilot_question(lines):
 
 def _parse_copilot_lines(lines, plan_reader=None):
     return _parse_copilot_box(lines) or _parse_copilot_question(lines)
+
+
+def _pick_copilot(p, option_index):
+    """승인 카드에 서버가 더한 거절 버튼(번호 없음): esc(거절, 턴이 멈춘다. 실측 1.0.114). 그 밖에는 기본."""
+    o = p["options"][option_index]
+    if p["kind"] == "approval" and option_index == p.get("reject_index") and o.get("number") is None:
+        return [("keys", ["esc"])]
+    return None
 
 
 def _copilot_overlay_card(p):
@@ -5949,6 +5960,7 @@ AGENTS = {
     # Copilot은 OSC 7501로 승인(permission)·질문·계획(question) 막힘을 보낸다. 폴더 신뢰(idle)·autopilot 권한(working)
     # 상자만 hc가 모른다(실측 1.0.114). 질문 상자는 blocked 직후 조금 늦게 그려질 때가 있어 다시 읽는다.
     "copilot": {"match": _named("copilot"), "parse": _parse_copilot_lines, "free_text": _free_text_copilot,
+                "pick": _pick_copilot,
                 "transcript": lambda info, home, runner=None: find_copilot_transcript(info, home, runner=runner),
                 "push_wait": lambda: COPILOT_PUSH_PROMPT_WAIT, "retry": True, "screen": "overlay",
                 "overlay": {"states": ("idle", "working", "done"), "card": _copilot_overlay_card,
