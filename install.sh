@@ -1,5 +1,6 @@
 #!/bin/sh
-# herdr-remote 설치기(macOS). 사용: sh install.sh [--dry-run] [--uninstall]
+# herdr-remote 설치기(macOS). 사용: sh install.sh [--dry-run] [--uninstall] [--no-hooks]
+#   --no-hooks: Claude Code·Codex 훅 등록(해제)을 건너뜀. hc(herdr-core)가 없어도 설치는 계속한다(공식 훅으로만 동작).
 #   환경변수: HERDR_REMOTE_SRC(서버 파일 https URL 또는 로컬 경로. 기본: 옆의 server/ 파일, 없으면 GitHub raw), HERDR_REMOTE_HC(hc 경로),
 #   HERDR_REMOTE_PORT(기본 8790), HERDR_REMOTE_TAILSCALE(tailscale CLI 경로),
 #   HERDR_REMOTE_SKIP_TAILSCALE=1(tailscale 점검·serve·pair 건너뜀, 시험용),
@@ -20,14 +21,16 @@ CONFIG="$HOME/.config/herdr-remote/config.json"
 UID_N=$(id -u)
 DRY=0
 MODE=install
+NOHOOKS=0
 unset HERDR_REMOTE_CONFIG || true
 
 for a in "$@"; do
   case "$a" in
     --dry-run) DRY=1 ;;
     --uninstall) MODE=uninstall ;;
-    -h|--help) sed -n '2,7p' "$0"; exit 0 ;;
-    *) echo "알 수 없는 옵션: $a (--dry-run, --uninstall)" >&2; exit 2 ;;
+    --no-hooks) NOHOOKS=1 ;;
+    -h|--help) sed -n '2,9p' "$0"; exit 0 ;;
+    *) echo "알 수 없는 옵션: $a (--dry-run, --uninstall, --no-hooks)" >&2; exit 2 ;;
   esac
 done
 
@@ -65,6 +68,162 @@ config_port() { # 설정 파일의 port. 없으면 8790
   echo 8790
 }
 
+# Claude Code·Codex 훅 병합 스크립트(이 한 곳만 고친다. install.ps1에 같은 글자로 들어 있고 테스트가 비교한다).
+HOOKS_PY=$(cat <<'HOOKS_PY_EOF'
+# ---- hooks_merge.py begin (install.sh and install.ps1 embed this identical text; a test compares them)
+# usage: hooks_merge.py <install|uninstall> <claude|codex> <settings-file> <python-exe> <server-file> <posix|windows> [dry]
+# Prints exactly one status word: added | updated | unchanged | removed | absent | broken | error
+import json, os, shutil, sys
+
+action, target, path, py, server, flavor = sys.argv[1:7]
+dry = len(sys.argv) > 7 and sys.argv[7] == "dry"
+MARK = "herdr_remote.py"
+
+
+def ours(cmd):
+    if not isinstance(cmd, str):
+        return False
+    i = cmd.find(MARK)
+    return i >= 0 and cmd[i + len(MARK):i + len(MARK) + 7] in ('" hook ', "' hook ")
+
+
+def spec():
+    # (event, matcher or None, timeout seconds)
+    if target == "claude":
+        return [("PermissionRequest", "*", 600), ("PreToolUse", "AskUserQuestion|ExitPlanMode", 600),
+                ("SessionStart", None, 10), ("SessionEnd", None, 10), ("UserPromptSubmit", None, 10), ("Stop", None, 10)]
+    return [("PermissionRequest", "*", 600), ("SessionStart", None, 10), ("SessionEnd", None, 3),
+            ("UserPromptSubmit", None, 10), ("Stop", None, 10)]
+
+
+def handler(timeout):
+    h = {"type": "command"}
+    if flavor == "windows":
+        if target == "claude":
+            h["command"] = '& "%s" "%s" hook claude' % (py, server)
+            h["shell"] = "powershell"
+        else:
+            # Codex does not document its Windows shell: go through powershell.exe explicitly.
+            inner = "& '%s' '%s' hook codex" % (py.replace("'", "''"), server.replace("'", "''"))
+            h["command"] = 'powershell.exe -NoProfile -Command "%s"' % inner
+    else:
+        h["command"] = '"%s" "%s" hook %s' % (py, server, target)
+    h["timeout"] = timeout
+    return h
+
+
+def strip(groups):
+    """Remove our handlers from an event's group list. Returns (new groups, index where ours was, found)."""
+    out, pos, found = [], None, False
+    for g in groups:
+        hs = g.get("hooks") if isinstance(g, dict) else None
+        if not isinstance(hs, list):
+            out.append(g)
+            continue
+        keep = [h for h in hs if not (isinstance(h, dict) and ours(h.get("command")))]
+        if len(keep) != len(hs):
+            found = True
+            if pos is None:
+                pos = len(out)
+            if keep:
+                g = dict(g)
+                g["hooks"] = keep
+                out.append(g)
+        else:
+            out.append(g)
+    return out, pos, found
+
+
+def main():
+    doc = {}
+    existed = os.path.exists(path)
+    if existed:
+        try:
+            with open(path, encoding="utf-8-sig") as f:
+                text = f.read()
+            doc = json.loads(text) if text.strip() else {}
+        except (ValueError, OSError):
+            return "broken"
+        if not isinstance(doc, dict):
+            return "broken"
+    elif action == "uninstall":
+        return "absent"
+    before = json.dumps(doc, sort_keys=True)
+    hooks = doc.get("hooks")
+    if hooks is None:
+        hooks = {}
+    if not isinstance(hooks, dict) or any(not isinstance(v, list) for v in hooks.values()):
+        return "broken"
+    had = False
+    if action == "install":
+        for ev, matcher, timeout in spec():
+            groups, pos, found = strip(hooks.get(ev, []))
+            had = had or found
+            grp = {}
+            if matcher is not None:
+                grp["matcher"] = matcher
+            grp["hooks"] = [handler(timeout)]
+            groups.insert(len(groups) if pos is None else pos, grp)
+            hooks[ev] = groups
+        doc["hooks"] = hooks
+    else:
+        for ev in list(hooks):
+            groups, pos, found = strip(hooks[ev])
+            had = had or found
+            if groups:
+                hooks[ev] = groups
+            else:
+                del hooks[ev]
+        if not had:
+            return "absent"
+        if hooks:
+            doc["hooks"] = hooks
+        else:
+            doc.pop("hooks", None)
+    if json.dumps(doc, sort_keys=True) == before and existed:
+        return "unchanged"
+    if not dry:
+        if existed and not os.path.exists(path + ".sheltie-bak"):
+            shutil.copy2(path, path + ".sheltie-bak")
+        tmp = path + ".sheltie-tmp"
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(doc, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        os.replace(tmp, path)
+    if action == "uninstall":
+        return "removed"
+    return "updated" if had else "added"
+
+
+try:
+    print(main())
+except Exception:
+    print("error")
+# ---- hooks_merge.py end
+HOOKS_PY_EOF
+)
+
+# hooks_apply <install|uninstall> <python>: 있는 에이전트(~/.claude, ~/.codex)의 훅 설정 파일에 우리 항목을 넣거나 뺀다.
+hooks_apply() {
+  _act=$1; _py=$2
+  _dryarg=""; [ "$DRY" != 1 ] || _dryarg=dry
+  for _t in claude codex; do
+    _dir="$HOME/.$_t"; _file="$_dir/settings.json"; [ "$_t" = codex ] && _file="$_dir/hooks.json"
+    if [ ! -d "$_dir" ]; then say "($_t: $_dir 없음, 훅 건너뜀)"; continue; fi
+    _res=$("$_py" -c "$HOOKS_PY" "$_act" "$_t" "$_file" "$_py" "$SERVER" posix $_dryarg 2>/dev/null) || _res=error
+    _pre=""; [ "$DRY" != 1 ] || _pre="(dry-run) "
+    case "$_res" in
+      added) say "${_pre}$_t 훅 등록: $_file" ;;
+      updated) say "${_pre}$_t 훅 갱신: $_file" ;;
+      unchanged) say "$_t 훅이 이미 등록돼 있다: $_file" ;;
+      removed) say "${_pre}$_t 훅 해제: $_file (백업 $_file.sheltie-bak 은 남긴다)" ;;
+      absent) say "$_t: 우리 훅이 없다($_file)" ;;
+      broken) say "경고: $_file 이 올바른 JSON이 아니라 건드리지 않았다. 고친 뒤 다시 실행해라." >&2 ;;
+      *) say "경고: $_t 훅 처리에 실패했다($_file). 설치는 계속한다." >&2 ;;
+    esac
+  done
+}
+
 if [ "$MODE" = uninstall ]; then
   [ -n "$PORT" ] || PORT=$(config_port)
   run launchctl bootout "gui/$UID_N/$LABEL" 2>/dev/null || say "(실행 중인 서비스가 없다)"
@@ -73,6 +232,10 @@ if [ "$MODE" = uninstall ]; then
     run "$TS" serve "--https=$PORT" off || say "tailscale serve 해제 실패(이미 없을 수 있다)"
   fi
   [ ! -e "$SYS_PLIST" ] || say "/Library/LaunchAgents에도 설치돼 있다. 지우려면: sudo rm $SYS_PLIST"
+  if [ "$NOHOOKS" != 1 ]; then
+    if UPY=$(command -v python3 2>/dev/null) && [ -n "$UPY" ]; then hooks_apply uninstall "$UPY"
+    else say "python3가 없어 Claude Code·Codex 훅은 그대로다. ~/.claude/settings.json, ~/.codex/hooks.json 에서 'herdr_remote.py' hook 항목을 직접 지워라."; fi
+  fi
   say "해제 완료. 설정과 토큰은 남겼다: $HOME/.config/herdr-remote (지우려면 직접 삭제)"
   exit 0
 fi
@@ -93,7 +256,7 @@ elif [ -x "$HOME/.local/bin/hc" ]; then
 elif p=$(command -v hc 2>/dev/null) && [ -x "$p" ]; then
   HC=$p
 fi
-[ -n "$HC" ] || die 1 "hc(herdr-core)가 없다. 먼저 herdr-core를 설치해라(설치되면 ~/.local/bin/hc가 생긴다). 다른 위치면 HERDR_REMOTE_HC=<경로>로 알려줘라."
+[ -n "$HC" ] || say "herdr-core 없이 설치한다: 공식 훅으로만 동작, herdr 터미널 기능은 꺼짐 (hc를 쓰려면 HERDR_REMOTE_HC=<경로>)"
 
 TS=
 if [ "${HERDR_REMOTE_SKIP_TAILSCALE:-}" != 1 ]; then
@@ -157,8 +320,12 @@ else
   [ -n "$PORT" ] || PORT=8790
 fi
 
+# ---- 2b. Claude Code·Codex 훅
+if [ "$NOHOOKS" = 1 ]; then say "(--no-hooks: 훅 등록 건너뜀)"; else hooks_apply install "$PYTHON"; fi
+
 # ---- 3. LaunchAgent
-SVC_PATH="$(dirname "$HC"):$(dirname "$PYTHON"):/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+SVC_PATH=""; [ -z "$HC" ] || SVC_PATH="$(dirname "$HC"):"
+SVC_PATH="$SVC_PATH$(dirname "$PYTHON"):/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 PLIST_BUILTIN='<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!-- install.sh가 @…@ 자리를 채워 ~/Library/LaunchAgents에 둔다. install.sh 안의 내장 사본과 같아야 한다(테스트가 비교). -->
@@ -266,4 +433,7 @@ if [ -n "$TS" ]; then
   fi
 else
   say "(tailscale 없이 설치해서 pair는 건너뜀)"
+fi
+if [ "$NOHOOKS" != 1 ]; then
+  say "Claude Code·Codex를 새로 시작해야 훅이 적용된다(Codex는 /hooks 에서 한 번 신뢰해야 한다)."
 fi

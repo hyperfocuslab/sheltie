@@ -1,0 +1,16 @@
+{
+  "session_id": "d43c1295-83b6-4d1a-aec5-887cb1b3a97b",
+  "transcript_path": "/Users/me/.claude/projects/-Users-me-proj/d43c1295-83b6-4d1a-aec5-887cb1b3a97b.jsonl",
+  "cwd": "/Users/me/proj",
+  "scratchpad_dir": "/private/tmp/claude-501/x/scratchpad",
+  "prompt_id": "93f0a3bc-f996-4b6c-88a0-4913e6ccab35",
+  "permission_mode": "bypassPermissions",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "Stop",
+  "stop_hook_active": false,
+  "last_assistant_message": "The command `python3 -c 'print(41+1)'` printed **42**.",
+  "background_tasks": [],
+  "session_crons": []
+}

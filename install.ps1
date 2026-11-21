@@ -1,4 +1,4 @@
-# herdr-remote installer (Windows). Usage: powershell -File install.ps1 [-DryRun] [-Uninstall] [-Help]
+# herdr-remote installer (Windows). Usage: powershell -File install.ps1 [-DryRun] [-Uninstall] [-NoHooks] [-Help]
 #   Via irm | iex no arguments can be passed: use HERDR_REMOTE_UNINSTALL=1 / HERDR_REMOTE_DRY_RUN=1 instead.
 #   Env: HERDR_REMOTE_SRC (server file https URL or local path; default: server\ next to this file, else GitHub raw),
 #   HERDR_REMOTE_HC (hc.exe path), HERDR_REMOTE_PORT (default 8790), HERDR_REMOTE_PYTHON (python.exe path),
@@ -25,6 +25,7 @@
   $CONFIG = Join-Path $CONFIG_DIR 'config.json'
   $DRY = $false
   $MODE = 'install'
+  $NOHOOKS = $false
   Remove-Item Env:HERDR_REMOTE_CONFIG -ErrorAction SilentlyContinue
 
   # ---- user-facing messages: Base64 of UTF-8 text, {0} {1} are -f placeholders. Keep keys in sync with T calls.
@@ -75,6 +76,19 @@
     dry_pair = 'KyB7MH0gezF9IHBhaXI=' # dry-run pair
     pair_fail = '7ISk7LmY64qUIOuBneuCrOyngOunjCBwYWlyIOuqheugueydtCDsl4bqsbDrgpgg7Iuk7Yyo7ZaI64ukLiDshJzrsoTrpbwg7LWc7IugIOuyhOyghOycvOuhnCDrsJvslYQg64uk7IucIOyLpO2Wie2VmOqxsOuCmCwg7JWx7JeQIOyjvOyGjOyZgCDthqDtgbAoezB9KeydhCDsp4HsoJEg7J6F66Cl7ZW06528Lg==' # pair failed
     pair_skipped = 'KHRhaWxzY2FsZSDsl4bsnbQg7ISk7LmY7ZW07IScIHBhaXLripQg6rG064SI65yAKQ==' # pair skipped
+    no_hc_warn = 'aGVyZHItY29yZSDsl4bsnbQg7ISk7LmY7ZWc64ukOiDqs7Xsi50g7ZuF7Jy866Gc66eMIOuPmeyekSwgaGVyZHIg7YSw66+464SQIOq4sOuKpeydgCDqurzsp5AgKGhj66W8IOyTsOugpOuptCBIRVJEUl9SRU1PVEVfSEM9POqyveuhnD4p' # no_hc_warn
+    hk_skip = 'KHswfTogezF9IOyXhuydjCwg7ZuFIOqxtOuEiOucgCk=' # hk_skip
+    hk_added = 'ezB9ezF9IO2bhSDrk7HroZ06IHsyfQ==' # hk_added
+    hk_updated = 'ezB9ezF9IO2bhSDqsLHsi6A6IHsyfQ==' # hk_updated
+    hk_unchanged = 'ezB9IO2bheydtCDsnbTrr7gg65Ox66Gd64+8IOyeiOuLpDogezF9' # hk_unchanged
+    hk_removed = 'ezB9ezF9IO2bhSDtlbTsoJw6IHsyfSAo67Cx7JeFIHsyfS5zaGVsdGllLWJhayDsnYAg64Ko6ri064ukKQ==' # hk_removed
+    hk_absent = 'ezB9OiDsmrDrpqwg7ZuF7J20IOyXhuuLpCh7MX0p' # hk_absent
+    hk_broken = '6rK96rOgOiB7MH0g7J20IOyYrOuwlOuluCBKU09O7J20IOyVhOuLiOudvCDqsbTrk5zrpqzsp4Ag7JWK7JWY64ukLiDqs6DsuZwg65KkIOuLpOyLnCDsi6TtlontlbTrnbwu' # hk_broken
+    hk_fail = '6rK96rOgOiB7MH0g7ZuFIOyymOumrOyXkCDsi6TtjKjtlojri6QoezF9KS4g7ISk7LmY64qUIOqzhOyGje2VnOuLpC4=' # hk_fail
+    hk_nopy = 'cHl0aG9u7J20IOyXhuyWtCBDbGF1ZGUgQ29kZcK3Q29kZXgg7ZuF7J2AIOq3uOuMgOuhnOuLpC4gJVVTRVJQUk9GSUxFJVwuY2xhdWRlXHNldHRpbmdzLmpzb24sICVVU0VSUFJPRklMRSVcLmNvZGV4XGhvb2tzLmpzb24g7JeQ7IScICdoZXJkcl9yZW1vdGUucHknIGhvb2sg7ZWt66qp7J2EIOyngeygkSDsp4Dsm4zrnbwu' # hk_nopy
+    hk_off = 'KC1Ob0hvb2tzOiDtm4Ug65Ox66GdIOqxtOuEiOucgCk=' # hk_off
+    hk_restart = 'Q2xhdWRlIENvZGXCt0NvZGV466W8IOyDiOuhnCDsi5zsnpHtlbTslbwg7ZuF7J20IOyggeyaqeuQnOuLpChDb2RleOuKlCAvaG9va3Mg7JeQ7IScIO2VnCDrsogg7Iug66Kw7ZW07JW8IO2VnOuLpCku' # hk_restart
+    help5 = 'ICAtTm9Ib29rczogQ2xhdWRlIENvZGXCt0NvZGV4IO2bhSDrk7HroZ0o7ZW07KCcKeydhCDqsbTrhIjrnIAuIGhj6rCAIOyXhuyWtOuPhCDshKTsuZjripQg6rOE7IaN7ZWc64ukKOqzteyLnSDtm4XsnLzroZzrp4wg64+Z7J6RKS4=' # help5
     unexpected = '7JiI7IOB7ZWY7KeAIOuqu+2VnCDsmKTrpZg6IHswfQ==' # unexpected error
   }
   # messages end
@@ -131,7 +145,141 @@
 </Task>
 '@
 
-  $HELP_TEXT = @((T 'help1'), (T 'help2'), (T 'help3'), (T 'help4'))
+  # Merge script for Claude Code / Codex hook files. Same text as in install.sh (a test compares them). Needs python.exe, not pythonw.
+  $HOOKS_PY = @'
+# ---- hooks_merge.py begin (install.sh and install.ps1 embed this identical text; a test compares them)
+# usage: hooks_merge.py <install|uninstall> <claude|codex> <settings-file> <python-exe> <server-file> <posix|windows> [dry]
+# Prints exactly one status word: added | updated | unchanged | removed | absent | broken | error
+import json, os, shutil, sys
+
+action, target, path, py, server, flavor = sys.argv[1:7]
+dry = len(sys.argv) > 7 and sys.argv[7] == "dry"
+MARK = "herdr_remote.py"
+
+
+def ours(cmd):
+    if not isinstance(cmd, str):
+        return False
+    i = cmd.find(MARK)
+    return i >= 0 and cmd[i + len(MARK):i + len(MARK) + 7] in ('" hook ', "' hook ")
+
+
+def spec():
+    # (event, matcher or None, timeout seconds)
+    if target == "claude":
+        return [("PermissionRequest", "*", 600), ("PreToolUse", "AskUserQuestion|ExitPlanMode", 600),
+                ("SessionStart", None, 10), ("SessionEnd", None, 10), ("UserPromptSubmit", None, 10), ("Stop", None, 10)]
+    return [("PermissionRequest", "*", 600), ("SessionStart", None, 10), ("SessionEnd", None, 3),
+            ("UserPromptSubmit", None, 10), ("Stop", None, 10)]
+
+
+def handler(timeout):
+    h = {"type": "command"}
+    if flavor == "windows":
+        if target == "claude":
+            h["command"] = '& "%s" "%s" hook claude' % (py, server)
+            h["shell"] = "powershell"
+        else:
+            # Codex does not document its Windows shell: go through powershell.exe explicitly.
+            inner = "& '%s' '%s' hook codex" % (py.replace("'", "''"), server.replace("'", "''"))
+            h["command"] = 'powershell.exe -NoProfile -Command "%s"' % inner
+    else:
+        h["command"] = '"%s" "%s" hook %s' % (py, server, target)
+    h["timeout"] = timeout
+    return h
+
+
+def strip(groups):
+    """Remove our handlers from an event's group list. Returns (new groups, index where ours was, found)."""
+    out, pos, found = [], None, False
+    for g in groups:
+        hs = g.get("hooks") if isinstance(g, dict) else None
+        if not isinstance(hs, list):
+            out.append(g)
+            continue
+        keep = [h for h in hs if not (isinstance(h, dict) and ours(h.get("command")))]
+        if len(keep) != len(hs):
+            found = True
+            if pos is None:
+                pos = len(out)
+            if keep:
+                g = dict(g)
+                g["hooks"] = keep
+                out.append(g)
+        else:
+            out.append(g)
+    return out, pos, found
+
+
+def main():
+    doc = {}
+    existed = os.path.exists(path)
+    if existed:
+        try:
+            with open(path, encoding="utf-8-sig") as f:
+                text = f.read()
+            doc = json.loads(text) if text.strip() else {}
+        except (ValueError, OSError):
+            return "broken"
+        if not isinstance(doc, dict):
+            return "broken"
+    elif action == "uninstall":
+        return "absent"
+    before = json.dumps(doc, sort_keys=True)
+    hooks = doc.get("hooks")
+    if hooks is None:
+        hooks = {}
+    if not isinstance(hooks, dict) or any(not isinstance(v, list) for v in hooks.values()):
+        return "broken"
+    had = False
+    if action == "install":
+        for ev, matcher, timeout in spec():
+            groups, pos, found = strip(hooks.get(ev, []))
+            had = had or found
+            grp = {}
+            if matcher is not None:
+                grp["matcher"] = matcher
+            grp["hooks"] = [handler(timeout)]
+            groups.insert(len(groups) if pos is None else pos, grp)
+            hooks[ev] = groups
+        doc["hooks"] = hooks
+    else:
+        for ev in list(hooks):
+            groups, pos, found = strip(hooks[ev])
+            had = had or found
+            if groups:
+                hooks[ev] = groups
+            else:
+                del hooks[ev]
+        if not had:
+            return "absent"
+        if hooks:
+            doc["hooks"] = hooks
+        else:
+            doc.pop("hooks", None)
+    if json.dumps(doc, sort_keys=True) == before and existed:
+        return "unchanged"
+    if not dry:
+        if existed and not os.path.exists(path + ".sheltie-bak"):
+            shutil.copy2(path, path + ".sheltie-bak")
+        tmp = path + ".sheltie-tmp"
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(doc, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        os.replace(tmp, path)
+    if action == "uninstall":
+        return "removed"
+    return "updated" if had else "added"
+
+
+try:
+    print(main())
+except Exception:
+    print("error")
+# ---- hooks_merge.py end
+'@
+
+  $HELP_TEXT = @((T 'help1'), (T 'help2'), (T 'help3'), (T 'help4'), (T 'help5'))
 
   function Say([string]$Msg) { Write-Host $Msg }
   function Die([int]$Code, [string]$Msg) {
@@ -144,6 +292,37 @@
     if ($DRY) { Say ('+ ' + ((@($Exe) + $A) -join ' ')); return 0 }
     if ($Quiet) { & $Exe @A 2>$null | Out-Null } else { & $Exe @A | Out-Host }
     return $LASTEXITCODE
+  }
+  # Add/remove our hook entries in ~/.claude/settings.json and ~/.codex/hooks.json (only agents that exist).
+  function Apply-Hooks([string]$Act, [string]$Py) {
+    $script = Join-Path ([IO.Path]::GetTempPath()) ('hooks_merge.' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.py')
+    [IO.File]::WriteAllText($script, $HOOKS_PY, (New-Object System.Text.UTF8Encoding($false)))
+    $pre = ''
+    if ($DRY) { $pre = '(dry-run) ' }
+    try {
+      foreach ($agent in @('claude', 'codex')) {
+        $dir = Join-Path $env:USERPROFILE ".$agent"
+        $name = 'settings.json'
+        if ($agent -eq 'codex') { $name = 'hooks.json' }
+        $file = Join-Path $dir $name
+        if (-not (Test-Path -LiteralPath $dir -PathType Container)) { Say (T 'hk_skip' $agent $dir); continue }
+        $pa = @($script, $Act, $agent, $file, $Py, $SERVER, 'windows')
+        if ($DRY) { $pa += 'dry' }
+        $res = 'error'
+        try { $res = "$(& $Py @pa 2>$null | Select-Object -First 1)".Trim() } catch { $res = 'error' }
+        switch ($res) {
+          'added' { Say (T 'hk_added' $pre $agent $file) }
+          'updated' { Say (T 'hk_updated' $pre $agent $file) }
+          'unchanged' { Say (T 'hk_unchanged' $agent $file) }
+          'removed' { Say (T 'hk_removed' $pre $agent $file) }
+          'absent' { Say (T 'hk_absent' $agent $file) }
+          'broken' { [Console]::Error.WriteLine((T 'hk_broken' $file)) }
+          default { [Console]::Error.WriteLine((T 'hk_fail' $agent $file)) }
+        }
+      }
+    } finally {
+      Remove-Item -LiteralPath $script -Force -ErrorAction SilentlyContinue
+    }
   }
   function Read-Config {
     if (-not (Test-Path -LiteralPath $CONFIG)) { return $null }
@@ -217,12 +396,14 @@
       switch -Regex ([string]$a) {
         '^--?(dry-?run)$' { $DRY = $true }
         '^--?uninstall$' { $MODE = 'uninstall' }
+        '^--?no-?hooks$' { $NOHOOKS = $true }
         '^(--?help|-h|-\?)$' { foreach ($l in $HELP_TEXT) { Say $l }; return }
         default { Die 2 (T 'unknown_opt' $a) }
       }
     }
     if ($env:HERDR_REMOTE_UNINSTALL -eq '1') { $MODE = 'uninstall' }
     if ($env:HERDR_REMOTE_DRY_RUN -eq '1') { $DRY = $true }
+    if ($env:HERDR_REMOTE_NO_HOOKS -eq '1') { $NOHOOKS = $true }
 
     $PORT = $env:HERDR_REMOTE_PORT
     if ($PORT) {
@@ -244,6 +425,10 @@
       }
       if ($DRY) { Say (T 'dry_delete' $SERVER $TASK_COPY) }
       else { Remove-Item -LiteralPath $SERVER, $TASK_COPY -Force -ErrorAction SilentlyContinue }
+      if (-not $NOHOOKS) {
+        $upy = Find-Python
+        if ($upy) { Apply-Hooks 'uninstall' $upy } else { Say (T 'hk_nopy') }
+      }
       Say (T 'uninstalled' $CONFIG_DIR)
       return
     }
@@ -259,7 +444,7 @@
     if (-not (Test-Path -LiteralPath $PYW -PathType Leaf)) { $PYW = $PY }
 
     $HC = Find-Hc
-    if (-not $HC) { Die 1 (T 'no_hc') }
+    if (-not $HC) { Say (T 'no_hc_warn'); $HC = '' }
 
     $TS = $null
     if ($env:HERDR_REMOTE_SKIP_TAILSCALE -ne '1') {
@@ -327,6 +512,9 @@
       $PORT = [string](Config-Port)
     }
     if (-not $PORT) { $PORT = '8790' }
+
+    # ---- 2b. Claude Code / Codex hooks (python.exe, not pythonw: the hook needs stdout)
+    if ($NOHOOKS) { Say (T 'hk_off') } else { Apply-Hooks 'install' $PY }
 
     # ---- 3. Task Scheduler
     $tpl = $TASK_XML_BUILTIN.Replace('@XML_COMMENT@', (T 'xml_comment')).Replace('@XML_DESC@', (T 'xml_desc'))
@@ -407,6 +595,7 @@
     } else {
       Say (T 'pair_skipped')
     }
+    if (-not $NOHOOKS) { Say (T 'hk_restart') }
   } catch {
     if ($_.Exception.Message -ne 'HRExit') {
       [Console]::Error.WriteLine((T 'unexpected' $_.Exception.Message)); if ($env:HERDR_REMOTE_DEBUG -eq '1') { [Console]::Error.WriteLine($_.InvocationInfo.PositionMessage) }

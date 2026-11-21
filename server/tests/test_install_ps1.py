@@ -269,9 +269,52 @@ class InstallPs1Test(unittest.TestCase):
 
     def test_no_hc(self):
         r = self.run_install(HERDR_REMOTE_HC="")
-        self.assertEqual(r.returncode, 1, r.stdout)
-        self.assertIn("herdr-core", r.stderr)
-        self.assertFalse(any(x.startswith("schtasks") for x in self.calls()))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("herdr-core 없이 설치한다", r.stdout)
+        self.assertEqual(read_json(self.cfg_path())["hc_path"], "")
+        self.assertTrue(any(x.startswith("schtasks /Create") for x in self.calls()))
+
+    def hook_files(self):
+        return (os.path.join(self.profile, ".claude", "settings.json"), os.path.join(self.profile, ".codex", "hooks.json"))
+
+    def test_hooks_fresh_merge_reinstall_uninstall(self):
+        cl, cx = self.hook_files()
+        os.makedirs(os.path.dirname(cl))
+        os.makedirs(os.path.dirname(cx))
+        with open(cl, "w", encoding="utf-8") as f:
+            json.dump({"model": "x", "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "mine"}]}]}}, f)
+        for _ in range(2):  # 두 번 설치해도 중복 없음
+            r = self.run_install()
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        c = read_json(cl)
+        want = '& "%s" "%s" hook claude' % (sys.executable, self.server_path())
+        stop = c["hooks"]["Stop"]
+        self.assertEqual(stop[0]["hooks"][0]["command"], "mine")
+        self.assertEqual([h["command"] for g in stop for h in g["hooks"]].count(want), 1)
+        self.assertEqual(c["hooks"]["PermissionRequest"][0]["hooks"][0]["shell"], "powershell")
+        x = read_json(cx)
+        cmd = x["hooks"]["PermissionRequest"][0]["hooks"][0]["command"]
+        self.assertTrue(cmd.startswith("powershell.exe -NoProfile -Command "), cmd)
+        self.assertIn("herdr_remote.py' hook codex", cmd)
+        self.assertTrue(os.path.exists(cl + ".sheltie-bak"))
+        r = self.run_install("-Uninstall")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(read_json(cl), {"model": "x", "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "mine"}]}]}})
+        self.assertEqual(read_json(cx), {})
+
+    def test_hooks_broken_json_and_nohooks(self):
+        cl, cx = self.hook_files()
+        os.makedirs(os.path.dirname(cl))
+        with open(cl, "w") as f:
+            f.write("{ nope")
+        r = self.run_install()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(read(cl), "{ nope")
+        self.assertIn("올바른 JSON이 아니라", r.stderr)
+        os.remove(cl)
+        r = self.run_install("-NoHooks")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertFalse(os.path.exists(cl))
 
     def test_py_launcher_without_python(self):
         # py 런처는 있는데 파이썬이 없으면 출력이 비어도 죽지 않고 "python이 없다"로 끝나야 한다(7950 실측: null-valued 오류).

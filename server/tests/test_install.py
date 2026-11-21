@@ -132,9 +132,11 @@ class InstallTest(unittest.TestCase):
     def test_no_hc(self):
         os.remove(os.path.join(self.bin, "hc"))
         r = self.run_install()
-        self.assertNotEqual(r.returncode, 0)
-        self.assertIn("herdr-core", r.stderr)
-        self.assertFalse(os.path.exists(self.plist()))
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertIn("herdr-core 없이 설치한다", r.stdout)
+        self.assertTrue(os.path.exists(self.plist()))
+        cfg = read_json(os.path.join(self.home, ".config/herdr-remote/config.json"))
+        self.assertEqual(cfg["hc_path"], "")
 
     def test_no_tailscale(self):
         os.remove(os.path.join(self.bin, "tailscale"))
@@ -324,6 +326,191 @@ class InstallTest(unittest.TestCase):
         r = self.run_install(HERDR_REMOTE_SRC="https://example.invalid/herdr_remote.py", STUB_SRC=self.stub)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertTrue(any("https://example.invalid/herdr_remote.py" in x for x in self.calls()))
+
+
+HOOK_EVENTS_CLAUDE = {"PermissionRequest", "PreToolUse", "SessionStart", "SessionEnd", "UserPromptSubmit", "Stop"}
+HOOK_EVENTS_CODEX = {"PermissionRequest", "SessionStart", "SessionEnd", "UserPromptSubmit", "Stop"}
+
+
+@unittest.skipIf(os.name == "nt", "맥 전용")
+class InstallHooksTest(InstallTest):
+    """Claude Code·Codex 훅 등록. 임시 HOME 안에서만 돈다. 부모 테스트는 상속만 하므로 다시 돌지 않게 비운다."""
+
+    def setUp(self):
+        super().setUp()
+        self.claude = os.path.join(self.home, ".claude")
+        self.codex = os.path.join(self.home, ".codex")
+        self.server = os.path.join(self.home, ".local/share/herdr-remote/herdr_remote.py")
+
+    def cmd(self, agent):
+        return '"%s" "%s" hook %s' % (self.py(), self.server, agent)
+
+    def py(self):
+        return os.path.join(self.bin, "python3")
+
+    def write_json(self, p, obj):
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w") as f:
+            json.dump(obj, f)
+
+    def settings(self):
+        return os.path.join(self.claude, "settings.json")
+
+    def hooks_json(self):
+        return os.path.join(self.codex, "hooks.json")
+
+    def ours(self, groups):
+        return [h for g in groups for h in g["hooks"] if "herdr_remote.py\" hook " in h["command"]]
+
+    def test_fresh_install_creates_both(self):
+        os.makedirs(self.claude)
+        os.makedirs(self.codex)
+        r = self.run_install()
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        c = read_json(self.settings())
+        self.assertEqual(set(c["hooks"]), HOOK_EVENTS_CLAUDE)
+        self.assertEqual(c["hooks"]["PermissionRequest"],
+                         [{"matcher": "*", "hooks": [{"type": "command", "command": self.cmd("claude"), "timeout": 600}]}])
+        self.assertEqual(c["hooks"]["PreToolUse"][0]["matcher"], "AskUserQuestion|ExitPlanMode")
+        self.assertEqual(c["hooks"]["Stop"],
+                         [{"hooks": [{"type": "command", "command": self.cmd("claude"), "timeout": 10}]}])
+        x = read_json(self.hooks_json())
+        self.assertEqual(set(x["hooks"]), HOOK_EVENTS_CODEX)
+        self.assertEqual(x["hooks"]["PermissionRequest"][0]["hooks"][0]["command"], self.cmd("codex"))
+        self.assertEqual(x["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"], 3)
+        self.assertFalse(os.path.exists(self.settings() + ".sheltie-bak"), "원본이 없으면 백업도 없다")
+        self.assertIn("새로 시작", r.stdout)
+        self.assertEqual(read(self.settings())[:4], '{\n  ')  # 들여쓰기 2칸
+
+    def test_agent_dirs_missing_are_skipped(self):
+        r = self.run_install()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(os.path.exists(self.claude))
+        self.assertFalse(os.path.exists(self.codex))
+
+    def test_merge_keeps_user_settings_and_hooks_and_backs_up_once(self):
+        orig = {"model": "opus", "zeta": 1, "alpha": {"x": [1, 2]},
+                "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "echo mine"}]}],
+                          "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "lint.sh"}]}],
+                          "Notification": [{"hooks": [{"type": "command", "command": "n.sh"}]}]}}
+        self.write_json(self.settings(), orig)
+        before = read(self.settings())
+        r = self.run_install()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        c = read_json(self.settings())
+        self.assertEqual(list(c)[:3], ["model", "zeta", "alpha"])  # 키 순서 보존
+        self.assertEqual(c["alpha"], {"x": [1, 2]})
+        self.assertEqual(c["hooks"]["Notification"], orig["hooks"]["Notification"])
+        stop = c["hooks"]["Stop"]
+        self.assertEqual(stop[0], orig["hooks"]["Stop"][0])
+        self.assertEqual(len(self.ours(stop)), 1)
+        pre = c["hooks"]["PreToolUse"]
+        self.assertEqual(pre[0], orig["hooks"]["PreToolUse"][0])
+        self.assertEqual(len(self.ours(pre)), 1)
+        self.assertEqual(read(self.settings() + ".sheltie-bak"), before)
+        # 두 번째 설치는 백업을 덮지 않는다
+        self.run_install()
+        self.assertEqual(read(self.settings() + ".sheltie-bak"), before)
+
+    def test_reinstall_no_duplicates_and_replaces_ours(self):
+        os.makedirs(self.claude)
+        os.makedirs(self.codex)
+        self.run_install()
+        first = read(self.settings())
+        # 예전 경로로 등록된 우리 항목은 새 경로로 교체된다(중복 금지)
+        c = read_json(self.settings())
+        c["hooks"]["Stop"][0]["hooks"][0]["command"] = '"/old/python3" "/old/herdr_remote.py" hook claude'
+        c["hooks"]["Stop"].insert(0, {"hooks": [{"type": "command", "command": "mine.sh"}]})
+        self.write_json(self.settings(), c)
+        r = self.run_install()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        c = read_json(self.settings())
+        self.assertEqual(len(self.ours(c["hooks"]["Stop"])), 1)
+        self.assertEqual(self.ours(c["hooks"]["Stop"])[0]["command"], self.cmd("claude"))
+        self.assertEqual(c["hooks"]["Stop"][0]["hooks"][0]["command"], "mine.sh")
+        self.assertEqual(len(c["hooks"]["Stop"]), 2)
+        for ev, groups in c["hooks"].items():
+            self.assertEqual(len(self.ours(groups)), 1, ev)
+        # 그대로면 파일이 안 바뀐다
+        self.run_install()
+        self.assertEqual(len(self.ours(read_json(self.settings())["hooks"]["Stop"])), 1)
+        self.assertEqual(first.count("herdr_remote.py"), 6)
+
+    def test_broken_json_untouched_install_continues(self):
+        os.makedirs(self.claude)
+        os.makedirs(self.codex)
+        with open(self.settings(), "w") as f:
+            f.write("{ not json")
+        r = self.run_install()
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertEqual(read(self.settings()), "{ not json")
+        self.assertFalse(os.path.exists(self.settings() + ".sheltie-bak"))
+        self.assertIn("올바른 JSON이 아니라", r.stderr)
+        self.assertTrue(os.path.exists(self.hooks_json()), "다른 쪽과 나머지 설치는 계속")
+        self.assertTrue(os.path.exists(self.plist()))
+
+    def test_no_hooks_option(self):
+        os.makedirs(self.claude)
+        os.makedirs(self.codex)
+        r = self.run_install("--no-hooks")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(os.path.exists(self.settings()))
+        self.assertFalse(os.path.exists(self.hooks_json()))
+        self.assertNotIn("새로 시작", r.stdout)
+
+    def test_dry_run_hooks_changes_nothing(self):
+        os.makedirs(self.claude)
+        os.makedirs(self.codex)
+        self.write_json(self.settings(), {"a": 1})
+        before = read(self.settings())
+        r = self.run_install("--dry-run")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("(dry-run) claude 훅 등록", r.stdout)
+        self.assertIn("(dry-run) codex 훅 등록", r.stdout)
+        self.assertEqual(read(self.settings()), before)
+        self.assertFalse(os.path.exists(self.settings() + ".sheltie-bak"))
+        self.assertFalse(os.path.exists(self.hooks_json()))
+
+    def test_uninstall_removes_only_ours(self):
+        self.write_json(self.settings(), {"model": "x", "hooks": {
+            "Stop": [{"hooks": [{"type": "command", "command": "mine.sh"}]}]}})
+        os.makedirs(self.codex)
+        self.run_install()
+        self.assertTrue(os.path.exists(self.hooks_json()))
+        r = self.run_install("--uninstall")
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        c = read_json(self.settings())
+        self.assertEqual(c, {"model": "x", "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "mine.sh"}]}]}})
+        # 우리 것만 있던 파일은 빈 객체가 되고, 백업(설치 전 원본)은 남는다
+        self.assertEqual(read_json(self.hooks_json()), {})
+        self.assertTrue(os.path.exists(self.settings() + ".sheltie-bak"))
+        self.assertIn("훅 해제", r.stdout)
+
+    def test_uninstall_no_hooks_option_keeps_them(self):
+        os.makedirs(self.claude)
+        self.run_install()
+        self.run_install("--uninstall", "--no-hooks")
+        self.assertIn("hook claude", read(self.settings()))
+
+    def test_uninstall_broken_json_untouched(self):
+        os.makedirs(self.claude)
+        with open(self.settings(), "w") as f:
+            f.write("[oops")
+        r = self.run_install("--uninstall")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(read(self.settings()), "[oops")
+
+    def test_hooks_merge_script_identical_in_ps1(self):
+        def block(path):
+            t = read(path)
+            a = t.index("# ---- hooks_merge.py begin")
+            b = t.index("# ---- hooks_merge.py end")
+            return t[a:b].replace("\r\n", "\n")
+        self.assertEqual(block(INSTALL), block(os.path.join(ROOT, "install.ps1")))
+
+
+for _n in [n for n in dir(InstallTest) if n.startswith("test_")]:
+    setattr(InstallHooksTest, _n, None)  # 상속된 기존 테스트는 InstallTest에서 이미 돈다
 
 
 if __name__ == "__main__":

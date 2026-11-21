@@ -9,6 +9,7 @@ hc는 항상 argv 리스트(shell=False)로 부르며, 임의 명령을 실행�
   python3 herdr_remote.py serve      서버 실행(기본 동작).
   python3 herdr_remote.py test-push  등록된 모든 기기에 시험 푸시 1건.
   python3 herdr_remote.py pair       앱 연결용 QR과 sheltie:// 주소 출력(설정 public_url, 없으면 Tailscale 이름).
+  python3 herdr_remote.py hook claude|codex  에이전트 훅이 부른다(stdin 훅 JSON → 로컬 서버 → stdout 결정 JSON).
 
 폰 접속: 맥미니 방화벽이 Homebrew Python의 들어오는 연결을 막으므로 127.0.0.1에만 열고
 tailscale serve로 tailnet 안에만 HTTPS로 내보낸다(다른 맥미니 서비스와 같은 방식, Funnel 아님):
@@ -51,6 +52,7 @@ import ntpath
 import os
 import re
 import secrets
+import select
 import shutil
 import socket
 import stat
@@ -3218,6 +3220,451 @@ class BranchCache:
         return b
 
 
+# ---------------------------------------------------------------- 훅 세션(herdr 없이)
+#
+# Claude Code·Codex 공식 훅이 `herdr_remote.py hook <claude|codex>`로 이벤트 JSON을 POST /hook/<agent>에 보낸다.
+# 막힘(PermissionRequest, PreToolUse AskUserQuestion·ExitPlanMode)은 폰 답이 올 때까지 그 요청을 붙잡았다가
+# 결정을 돌려준다. 세션 하나가 터미널 하나(id "h" + session_id 영숫자 끝 12자)이고, App은 MultiBackend로
+# hc 터미널과 같은 자리에서 다룬다. 화면·키·글 보내기·새 작업은 없다(caps []).
+
+HOOK_AGENTS = ("claude", "codex")
+HOOK_APPS = {"claude": "claude-code", "codex": "codex"}
+HOOK_HOLD_SEC = 540           # 훅 타임아웃(600초)보다 짧게. 지나면 결정 없이 {} → 터미널 대화상자로
+HOOK_CLIENT_TIMEOUT = 590     # hook 하위 명령이 서버 답을 기다리는 상한(초)
+HOOK_POLL = 0.2               # 붙잡은 동안 폰 답·연결 끊김을 보는 간격(초)
+HOOK_MAX_BODY = 4 * 1024 * 1024  # Write의 tool_input에는 파일 내용 전체가 들어 있다
+HOOK_MAX_OUT = 1024 * 1024
+HOOK_STALE_SEC = 24 * 3600    # 이 시간 동안 이벤트가 없던 세션은 목록에서 뺀다(SessionEnd 없이 죽은 세션)
+HOOK_REJECT_MSG = "Rejected from phone (Sheltie)"
+HOOK_PROXY_HEADERS = ("Tailscale-User-Login", "Tailscale-User-Name", "X-Forwarded-For")
+HOOK_HOLD_TOOLS = ("AskUserQuestion", "ExitPlanMode")
+HOOK_CAPS = ["read", "keys", "send"]  # hc 터미널이 지원하는 것. 훅 세션은 []
+HOOK_FREE_TEXT = "Type something."
+HOOK_PLAN_FREE_TEXT = "Tell Claude what to change"
+HOOK_NO_REPLY = object()      # 클라이언트가 이미 끊겼다: 아무것도 쓰지 않는다
+
+
+def hook_session_tid(session_id):
+    """session_id → 훅 세션 id("h" + 영숫자 끝 12자). 못 만들면 None.
+    끝을 쓴다: Codex는 UUIDv7이라 앞 12자가 밀리초 시각이어서 같은 순간에 시작한 세션끼리 겹친다."""
+    if not isinstance(session_id, str):
+        return None
+    s = re.sub(r"[^A-Za-z0-9]", "", session_id)[-12:]
+    return "h" + s if s else None
+
+
+def hook_transcript_path(path, home):
+    """훅이 준 transcript_path가 ~/.claude/projects 또는 Codex sessions 아래 .jsonl이면 실제 경로, 아니면 None."""
+    if not isinstance(path, str) or not path.endswith(".jsonl") or "\x00" in path or len(path) > 4096:
+        return None
+    try:
+        real = os.path.realpath(path)
+        for base in (os.path.join(home, ".claude", "projects"), codex_sessions_dir(home)):
+            rb = os.path.realpath(base)
+            if real.startswith(rb.rstrip(os.sep) + os.sep):
+                return real
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _hook_str(v, n=MAX_PROMPT_BODY):
+    return v[:n] if isinstance(v, str) and v else None
+
+
+def hook_tool_body(tool, inp):
+    """카드 본문: 무엇을 승인하는지(명령·파일 경로·바꿀 내용). 비지 않는다."""
+    inp = inp if isinstance(inp, dict) else {}
+    parts = []
+    for k in ("command", "file_path", "notebook_path", "path", "url"):
+        v = _hook_str(inp.get(k))
+        if v:
+            parts.append(v)
+    if tool == "Write":
+        v = _hook_str(inp.get("content"), 4000)
+        if v:
+            parts.append(v)
+    elif tool == "Edit":
+        old, new = _hook_str(inp.get("old_string"), 2000), _hook_str(inp.get("new_string"), 2000)
+        if old or new:
+            parts.append("- %s\n+ %s" % (old or "", new or ""))
+    desc = _hook_str(inp.get("description"), 1000)
+    if desc:
+        parts.append(desc)
+    if not parts:
+        parts.append(json.dumps(inp, ensure_ascii=False, indent=2)[:MAX_PROMPT_BODY] if inp else (tool or "tool"))
+    return "\n\n".join(parts)[:MAX_PROMPT_BODY]
+
+
+def _hook_rule_text(rule):
+    if not isinstance(rule, dict) or not isinstance(rule.get("toolName"), str):
+        return None
+    rc = rule.get("ruleContent")
+    return "%s(%s)" % (rule["toolName"], rc) if isinstance(rc, str) and rc else rule["toolName"]
+
+
+def hook_always_rules(suggestions):
+    """permission_suggestions 중 계속 허용에 쓸 것: type addRules, behavior allow만(addDirectories·setMode는 쓰지 않는다)."""
+    out = []
+    if isinstance(suggestions, list):
+        for s in suggestions:
+            if (isinstance(s, dict) and s.get("type") == "addRules" and s.get("behavior") == "allow"
+                    and isinstance(s.get("rules"), list) and s["rules"]
+                    and all(_hook_rule_text(r) for r in s["rules"])):
+                out.append(s)
+    return out
+
+
+class HookHold:
+    """붙잡힌 훅 요청 하나. state: waiting → decided(폰 답) | gone(PC가 먼저 답해 연결 끊김) | expired(시간 초과)."""
+
+    def __init__(self, agent, event_name, kind, tool_name, tool_input, status, prompts, always_perms=None,
+                 questions=None):
+        self.agent = agent
+        self.event_name = event_name
+        self.kind = kind  # permission | question | plan
+        self.tool_name = tool_name
+        self.tool_input = tool_input if isinstance(tool_input, dict) else {}
+        self.status = status
+        self.prompts = prompts
+        self.always_perms = always_perms or None
+        self.questions = questions or []
+        self.qi = 0
+        self.answers = {}
+        self.state = "waiting"
+        self.result = None
+        self.event = threading.Event()
+
+    def prompt(self):
+        if self.state != "waiting":
+            return None
+        return self.prompts[min(self.qi, len(self.prompts) - 1)]
+
+    def allow(self, updated_input=None, perms=None):
+        if self.event_name == "PreToolUse":
+            out = {"hookEventName": "PreToolUse", "permissionDecision": "allow"}
+            if updated_input is not None:
+                out["updatedInput"] = updated_input
+        else:
+            d = {"behavior": "allow"}
+            if perms:
+                d["updatedPermissions"] = perms
+            out = {"hookEventName": "PermissionRequest", "decision": d}
+        return {"hookSpecificOutput": out}
+
+    def deny(self, message=HOOK_REJECT_MSG):
+        if self.event_name == "PreToolUse":
+            return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                           "permissionDecisionReason": message}}
+        return {"hookSpecificOutput": {"hookEventName": "PermissionRequest",
+                                       "decision": {"behavior": "deny", "message": message}}}
+
+
+def _hook_card_id(p, tool_input, nonce):
+    """카드 id: 화면 카드와 같은 prompt_id에 원본 tool_input 전체와 요청마다 다른 nonce를 섞는다.
+    잘린 본문이 같아도, 같은 명령을 다시 물어도 이전 알림의 답이 새 요청에 들어가지 않게."""
+    raw = json.dumps([prompt_id(p), tool_input, nonce], ensure_ascii=False, sort_keys=True,
+                     separators=(",", ":"), default=str).encode("utf-8")
+    p["id"] = hashlib.sha256(raw).hexdigest()[:12]
+    return p
+
+
+def hook_permission_hold(agent, body):
+    tool = body.get("tool_name") if isinstance(body.get("tool_name"), str) else "tool"
+    inp = body.get("tool_input") if isinstance(body.get("tool_input"), dict) else {}
+    nonce = secrets.token_hex(8)
+    perms = hook_always_rules(body.get("permission_suggestions")) if agent == "claude" else []
+    if agent == "codex":
+        title = CODEX_APPROVAL_TITLES.get("make the following edits" if tool == "apply_patch"
+                                          else "run the following command") if tool in ("Bash", "apply_patch") else tool
+        question = ("Would you like to make the following edits?" if tool == "apply_patch"
+                    else "Would you like to run the following command?" if tool == "Bash"
+                    else "Allow %s?" % tool)
+    else:
+        title = {"Bash": "Bash command", "Write": "Create file", "Edit": "Edit file"}.get(tool, tool)
+        question = "Do you want to proceed?"
+    options = [("Yes", None)]
+    always = None
+    if perms:
+        rules = [_hook_rule_text(r) for s in perms for r in s["rules"]]
+        always = len(options)
+        options.append(("Yes, and don't ask again for %s" % ", ".join(rules)[:300], None))
+    reject = len(options)
+    options.append(("No", None))
+    p = _finish("approval", title, question, hook_tool_body(tool, inp), options, selected=0,
+                always_index=always, reject_index=reject)
+    status = {"state": "blocked", "kind": "permission", "msg": "approve %s" % tool, "app": HOOK_APPS[agent]}
+    return HookHold(agent, "PermissionRequest", "permission", tool, inp, status,
+                    [_hook_card_id(p, inp, nonce)], always_perms=perms)
+
+
+def hook_question_hold(agent, body):
+    """AskUserQuestion: 질문마다 카드 하나(탭처럼 차례로). 질문이 이상하면 None(붙잡지 않는다)."""
+    inp = body.get("tool_input") if isinstance(body.get("tool_input"), dict) else {}
+    qs = inp.get("questions")
+    if not isinstance(qs, list) or not 1 <= len(qs) <= 8:
+        return None
+    clean = []
+    for q in qs:
+        if not isinstance(q, dict) or not isinstance(q.get("question"), str) or not q["question"]:
+            return None
+        opts = q.get("options")
+        if not isinstance(opts, list) or not opts or len(opts) > 20:
+            return None
+        labels = []
+        for o in opts:
+            if not isinstance(o, dict) or not isinstance(o.get("label"), str) or not o["label"]:
+                return None
+            labels.append((o["label"], o.get("description") if isinstance(o.get("description"), str) else None))
+        clean.append({"question": q["question"], "header": q.get("header") if isinstance(q.get("header"), str) else None,
+                      "options": labels, "multi": bool(q.get("multiSelect"))})
+    nonce = secrets.token_hex(8)
+    prompts = []
+    for i, q in enumerate(clean):
+        options = list(q["options"])
+        free = None
+        if not q["multi"]:  # 화면 카드와 같게: 복수 선택에는 자유 입력을 두지 않는다
+            free = len(options)
+            options.append((HOOK_FREE_TEXT, None))
+        tabs = ([{"label": c["header"] or c["question"][:40], "answered": k < i} for k, c in enumerate(clean)]
+                if len(clean) > 1 else None)
+        p = _finish("question", q["header"], q["question"], None, options, selected=0, multi=q["multi"],
+                    free_text_index=free, tabs=tabs)
+        prompts.append(_hook_card_id(p, [inp, i], nonce))
+    status = {"state": "blocked", "kind": "question", "msg": clean[0]["question"][:200], "app": HOOK_APPS[agent]}
+    return HookHold(agent, "PreToolUse", "question", "AskUserQuestion", inp, status, prompts, questions=clean)
+
+
+def hook_plan_hold(agent, body):
+    inp = body.get("tool_input") if isinstance(body.get("tool_input"), dict) else {}
+    plan = _hook_str(inp.get("plan")) or _hook_str(inp.get("planFilePath")) or "(plan)"
+    p = _finish("plan", "Ready to code?",
+                "Claude has written up a plan and is ready to execute. Would you like to proceed?", plan,
+                [("Yes", None), ("No, keep planning", None), (HOOK_PLAN_FREE_TEXT, None)],
+                selected=0, free_text_index=2, reject_index=1)
+    status = {"state": "blocked", "kind": "plan", "msg": None, "app": HOOK_APPS[agent]}
+    return HookHold(agent, "PreToolUse", "plan", "ExitPlanMode", inp, status,
+                    [_hook_card_id(p, inp, secrets.token_hex(8))])
+
+
+class HookBackend:
+    """훅 세션 저장소. Hc와 같은 ls/get 모양을 준다(read·keys·send는 MultiBackend가 거절한다)."""
+
+    def __init__(self, wall=time.time):
+        self.wall = wall
+        self.lock = threading.Lock()
+        self.sessions = {}
+
+    def has(self, tid):
+        with self.lock:
+            return isinstance(tid, str) and tid in self.sessions
+
+    def touch(self, tid, agent, body, home):
+        """세션 등록·갱신. 끝난(시간 초과) 붙잡기는 PC에서 풀렸을 것이라 지운다. 반환: 새로 만들었는지."""
+        now = self.wall()
+        cwd = body.get("cwd") if isinstance(body.get("cwd"), str) else None
+        tp = hook_transcript_path(body.get("transcript_path"), home)
+        with self.lock:
+            s = self.sessions.get(tid)
+            new = s is None
+            if new:
+                s = self.sessions[tid] = {
+                    "tid": tid, "session_id": body.get("session_id"), "agent": agent, "cwd": cwd,
+                    "name": (os.path.basename(cwd.rstrip("/\\")) or cwd) if cwd else None,
+                    "transcript": tp, "base": {"state": "idle", "app": HOOK_APPS[agent]}, "status_ms": int(now * 1000),
+                    "turn": 0, "holds": [], "seen": now}
+            s["seen"] = now
+            if cwd and not s["cwd"]:
+                s["cwd"] = cwd
+                s["name"] = os.path.basename(cwd.rstrip("/\\")) or cwd
+            if tp:
+                s["transcript"] = tp
+            s["holds"] = [h for h in s["holds"] if h.state != "expired"]
+            return new
+
+    def set_base(self, tid, state, new_turn=False):
+        with self.lock:
+            s = self.sessions.get(tid)
+            if s is None:
+                return
+            s["base"] = {"state": state, "app": HOOK_APPS[s["agent"]]}
+            s["status_ms"] = int(self.wall() * 1000)
+            if new_turn:
+                s["turn"] += 1
+
+    def new_stop(self, tid, key):
+        """Stop의 턴 id가 지난 Stop과 다르면 True(턴 id가 없으면 False)."""
+        if not isinstance(key, str) or not key:
+            return False
+        with self.lock:
+            s = self.sessions.get(tid)
+            if s is None or s.get("stop_key") == key:
+                return False
+            s["stop_key"] = key
+            return True
+
+    def add_hold(self, tid, hold):
+        """붙잡기 추가. 맨 앞(지금 카드)이 되었으면 True."""
+        with self.lock:
+            s = self.sessions[tid]
+            s["holds"].append(hold)
+            s["status_ms"] = int(self.wall() * 1000)
+            return s["holds"][0] is hold
+
+    def finish(self, hold, state, result=None):
+        """waiting인 붙잡기만 state로 바꾼다(폰 답과 연결 끊김·시간 초과의 경쟁). 바꿨으면 True."""
+        with self.lock:
+            if hold.state != "waiting":
+                return False
+            hold.state = state
+            hold.result = result
+            hold.event.set()
+            return True
+
+    def pop_hold(self, tid, hold, base="working"):
+        with self.lock:
+            s = self.sessions.get(tid)
+            if s is None or hold not in s["holds"]:
+                return
+            s["holds"].remove(hold)
+            if not s["holds"]:
+                s["base"] = {"state": base, "app": HOOK_APPS[s["agent"]]}
+            s["status_ms"] = int(self.wall() * 1000)
+
+    def queued(self, tid):
+        with self.lock:
+            s = self.sessions.get(tid)
+            return len(s["holds"]) if s else 0
+
+    def active(self, tid):
+        """지금 카드의 붙잡기(맨 앞) 또는 None."""
+        with self.lock:
+            s = self.sessions.get(tid)
+            return s["holds"][0] if s and s["holds"] else None
+
+    def current_prompt(self, tid):
+        h = self.active(tid)
+        return h.prompt() if h else None
+
+    def advance_question(self, hold, question, value):
+        """질문 하나 답. 남은 질문이 있으면 False, 다 답했으면 True. 그사이 풀렸으면 ApiError."""
+        with self.lock:
+            if hold.state != "waiting":
+                raise ApiError(409, "not_blocked")
+            hold.answers[question] = value
+            hold.qi += 1
+            return hold.qi >= len(hold.prompts)
+
+    def remove(self, tid):
+        with self.lock:
+            s = self.sessions.pop(tid, None)
+        for h in (s or {}).get("holds", []):
+            self.finish(h, "gone")
+        return s
+
+    def prune(self, max_idle=HOOK_STALE_SEC):
+        cut = self.wall() - max_idle
+        with self.lock:
+            old = [t for t, s in self.sessions.items() if s["seen"] < cut and not s["holds"]]
+            for t in old:
+                del self.sessions[t]
+        return old
+
+    def transcript(self, tid):
+        with self.lock:
+            s = self.sessions.get(tid)
+            return (s["session_id"], s["transcript"]) if s else (None, None)
+
+    def _status(self, s):
+        if s["holds"]:
+            return dict(s["holds"][0].status)
+        return dict(s["base"])
+
+    def ls(self):
+        with self.lock:
+            return [{"address": s["tid"], "name": s["name"], "cwd": s["cwd"], "agent": s["agent"], "state": "live",
+                     "turn": s["turn"]} for s in self.sessions.values()]
+
+    def get(self, tid):
+        with self.lock:
+            s = self.sessions.get(tid)
+            if s is None:
+                raise HcError("no hook session")
+            return {"address": tid, "name": s["name"], "cwd": s["cwd"], "agent": s["agent"], "state": "live",
+                    "status": self._status(s), "status_ms": s["status_ms"], "title": None, "turn": s["turn"]}
+
+
+class MultiBackend:
+    """App의 self.hc 자리. id가 훅 세션이면 HookBackend, 아니면 hc(동작 그대로).
+    hc가 없는 설치(hc_path가 ""이거나 실행 파일이 없음)는 hc를 부르지 않고 훅 세션만 다룬다(경고는 한 번)."""
+
+    def __init__(self, hc, hooks):
+        self.hc = hc
+        self.hooks = hooks
+        self._warned = False
+
+    def hc_enabled(self):
+        if self.hc is None:
+            ok = False
+        else:
+            path = getattr(self.hc, "path", None)
+            if path is None:  # 경로가 없는 hc(테스트 가짜): 있다고 본다
+                ok = True
+            else:
+                ok = bool(path) and os.path.isfile(path) and os.access(path, os.X_OK)
+        if not ok and not self._warned:
+            self._warned = True
+            log.warning("hc가 없다(%s): herdr 터미널 없이 훅 세션만 다룬다",
+                        getattr(self.hc, "path", None) or "hc_path 비어 있음")
+        elif ok:
+            self._warned = False
+        return ok
+
+    def _hc(self):
+        if not self.hc_enabled():
+            raise HcError("hc not available")
+        return self.hc
+
+    def ls(self):
+        hooks = self.hooks.ls()
+        if not self.hc_enabled():
+            return hooks
+        return list(self.hc.ls()) + hooks
+
+    def get(self, tid):
+        if self.hooks.has(tid):
+            return self.hooks.get(tid)
+        return self._hc().get(tid)
+
+    def read(self, tid, lines=0):
+        if self.hooks.has(tid):
+            raise ApiError(409, "unsupported")
+        return self._hc().read(tid, lines)
+
+    def keys(self, tid, keys):
+        if self.hooks.has(tid):
+            raise ApiError(409, "unsupported")
+        return self._hc().keys(tid, keys)
+
+    def send(self, tid, text, force=False):
+        if self.hooks.has(tid):
+            raise ApiError(409, "unsupported")
+        return self._hc().send(tid, text, force=force)
+
+    def run_claude(self, cwd, prompt=None, exe=None):
+        if not self.hc_enabled():
+            raise ApiError(409, "unsupported")
+        return self.hc.run_claude(cwd, prompt, exe=exe) if exe is not None else self.hc.run_claude(cwd, prompt)
+
+    def run_agent(self, cwd, argv):
+        if not self.hc_enabled():
+            raise ApiError(409, "unsupported")
+        return self.hc.run_agent(cwd, argv)
+
+    def events_argv(self):
+        return self.hc.events_argv()
+
+
 # ---------------------------------------------------------------- 앱
 
 PUSH_PROMPT_BUDGET = 0.3   # 푸시용 카드 읽기 상한(초). 넘으면 prompt_id 없이 보낸다(알림 속도 우선).
@@ -3263,7 +3710,12 @@ PROMPT_STATUS_KINDS = {"approval": "permission", "confirm": "permission", "quest
 class App:
     def __init__(self, cfg, hc, devices, pusher, runner=None, clock=time.monotonic, push_log=None):
         self.cfg = cfg
-        self.hc = hc
+        if not isinstance(hc, MultiBackend):
+            hc = MultiBackend(hc, HookBackend())
+        self.hc = hc  # hc 터미널과 훅 세션을 id로 나눠 준다
+        self.hooks = hc.hooks
+        self.hook_hold_sec = HOOK_HOLD_SEC
+        self.hook_clock = time.monotonic  # 테스트가 바꾼다(붙잡기 시간 초과)
         self.devices = devices
         self.pusher = pusher
         self.runner = runner or subprocess.run
@@ -3313,6 +3765,8 @@ class App:
 
     def _prompt_for_push(self, tid):
         """blocked 알림용 카드: hc read 한 번 + 파싱, PUSH_PROMPT_BUDGET 안에 못 끝나면 None."""
+        if self.hooks.has(tid):
+            return self.hooks.current_prompt(tid)  # 훅 세션: 붙잡은 요청의 카드(시간 초과면 None)
         box = {}
         agent = self._agent_kinds.get(tid)
         spec = agent_spec(agent)
@@ -3342,7 +3796,7 @@ class App:
     def _codex_plan_status(self, tid, info):
         """hc가 blocked로 보지 않는 Codex "Implement this plan?" 메뉴가 화면 끝에 살아 있으면
         (막힘 status, True). 메뉴는 없고 플랜 모드면 (None, True). 그 밖에는 (None, False)."""
-        if agent_spec(agent_kind(info))["screen"] != "codex_plan":
+        if self.hooks.has(tid) or agent_spec(agent_kind(info))["screen"] != "codex_plan":
             return None, False
         st = status_of(info)
         if st.get("state") not in ("done", "idle"):
@@ -3473,6 +3927,7 @@ class App:
         self._flush()
 
     def poll(self, initial=False):
+        self.hooks.prune()
         try:
             terms = self.hc.ls()
         except HcError as e:
@@ -3486,6 +3941,8 @@ class App:
             if t.get("state") not in (None, "live"):
                 continue
             live.add(tid)
+            if self.hooks.has(tid):
+                continue  # 훅 세션은 이벤트로만 판정한다
             self.refresh(tid, initial=initial, name=t.get("name"))
         for tid in self.tracker.known() - live:
             self.tracker.forget(tid)
@@ -3558,6 +4015,9 @@ class App:
         popen = popen or subprocess.Popen
         backoff = 1
         while not self.stop.is_set():
+            if not self.hc.hc_enabled():  # hc 없는 설치: 경고는 hc_enabled가 한 번만 남긴다
+                self.stop.wait(EVENTS_MAX_BACKOFF)
+                continue
             started = time.time()
             try:
                 proc = popen(self.hc.events_argv(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -3605,6 +4065,223 @@ class App:
             except Exception:  # noqa: BLE001
                 log.exception("다시 알림 오류")
 
+    # --- 훅 세션
+    def hook_event(self, agent, body, alive=lambda: True):
+        """POST /hook/<agent> 한 건. 반환: 응답 JSON(dict), None(빈 본문), HOOK_NO_REPLY(이미 끊김)."""
+        if agent not in HOOK_AGENTS:
+            raise ApiError(404, "no_route")
+        ev = body.get("hook_event_name")
+        tid = hook_session_tid(body.get("session_id"))
+        if not isinstance(ev, str) or tid is None or not ID_RE.match(tid):
+            raise ApiError(400, "bad_hook")
+        if self.hooks.has(tid) and self.hooks.get(tid)["agent"] != agent:
+            raise ApiError(409, "agent_mismatch")
+        if ev == "SessionEnd":
+            if self.hooks.has(tid):
+                self._hook_end(tid, body.get("reason"))
+            return None
+        new = self.hooks.touch(tid, agent, body, self.home)
+        if new:
+            self._hook_observe(tid)  # 기준선(idle): 알림 없음
+        if ev == "UserPromptSubmit":
+            self.hooks.set_base(tid, "working")
+            self._hook_observe(tid)
+            return None
+        if ev == "Stop":
+            # 턴 하나가 끝났다. UserPromptSubmit 없이 Stop만 연달아 와도(Codex) 턴 id(turn_id, Claude는 prompt_id)가
+            # 바뀌었으면 새 턴으로 보고 working을 먼저 넣어 끝남을 다시 알린다. 같은 턴의 Stop이 또 오면
+            # (다른 Stop 훅이 막아 이어 간 경우) Tracker가 같은 관측으로 무시한다.
+            if self.hooks.new_stop(tid, body.get("turn_id") or body.get("prompt_id")):
+                self.hooks.set_base(tid, "working")
+                self._hook_observe(tid)
+            self.hooks.set_base(tid, "done", new_turn=True)
+            self._hook_observe(tid)
+            return None
+        tool = body.get("tool_name")
+        if ev == "PermissionRequest":
+            if tool in HOOK_HOLD_TOOLS:
+                return {}  # 질문·계획은 PreToolUse가 붙잡는다
+            return self._hook_hold(tid, hook_permission_hold(agent, body), alive)
+        if ev == "PreToolUse":
+            hold = None
+            if agent == "claude" and tool == "AskUserQuestion":
+                hold = hook_question_hold(agent, body)
+            elif agent == "claude" and tool == "ExitPlanMode":
+                hold = hook_plan_hold(agent, body)
+            if hold is None:
+                return {}
+            return self._hook_hold(tid, hold, alive)
+        return None
+
+    def _hook_observe(self, tid):
+        """훅 세션의 지금 상태를 Tracker에 넣는다(막힘·끝남 알림, 재알림 일정)."""
+        with self._refresh_lock:
+            self._detected = self.clock()
+            try:
+                info = self.hooks.get(tid)
+            except HcError:
+                info = None
+            if info is not None:
+                if info["agent"] == "claude":
+                    self.tracker.mark_claude(tid, info["name"])
+                self._agent_kinds[tid] = info["agent"]
+                self.tracker.observe(tid, info["status"], turn=info["turn"], name=info["name"])
+            self._detected = None
+        self._flush()
+
+    def _hook_end(self, tid, reason):
+        """SessionEnd: 세션을 지우고, 붙잡힌 요청은 풀고, Claude가 끝난 것이면(/clear·/resume 제외) 종료 알림."""
+        s = self.hooks.remove(tid)
+        with self._refresh_lock:
+            self._detected = self.clock()
+            if reason not in ("clear", "resume") and tid in self.tracker.known_claude():
+                self.tracker.exited(tid, name=(s or {}).get("name"))
+            self.tracker.forget(tid)
+            with self.tracker.lock:
+                self.tracker.claude_seen.pop(tid, None)
+            self._agent_kinds.pop(tid, None)
+            self._detected = None
+        self._flush()
+        log.info("훅 세션 끝 %s (%s)", tid, reason)
+
+    def _hook_hold(self, tid, hold, alive):
+        """폰 답·연결 끊김·시간 초과 중 먼저 오는 것까지 이 요청(스레드)을 붙잡는다."""
+        if self.hooks.add_hold(tid, hold):
+            self._hook_observe(tid)
+        log.info("훅 붙잡기 %s %s %s", tid, hold.event_name, hold.tool_name)
+        end = self.hook_clock() + self.hook_hold_sec
+        while not hold.event.wait(HOOK_POLL):
+            if not alive():
+                if self.hooks.finish(hold, "gone"):
+                    break
+            elif self.hook_clock() >= end:
+                if self.hooks.finish(hold, "expired"):
+                    break
+        if hold.state == "expired":
+            # 결정 없이 돌려준다 → 터미널 대화상자. 막힘은 그대로 두고(PC에서 답해야 한다) 폰 답은 needs_pc.
+            log.info("훅 붙잡기 시간 초과 %s", tid)
+            if self.hooks.queued(tid) > 1:  # 뒤에 기다리는 요청이 있으면 그것을 지금 카드로
+                self.hooks.pop_hold(tid, hold)
+                self._hook_observe(tid)
+            return {}
+        self.hooks.pop_hold(tid, hold)
+        self._hook_observe(tid)
+        if hold.state == "gone":
+            log.info("훅 연결 끊김 %s (PC에서 답함)", tid)
+            return HOOK_NO_REPLY
+        return hold.result
+
+    def _hook_active(self, tid, pid=None):
+        """답할 붙잡기와 카드. guard: 없으면 not_blocked/prompt_changed, 시간 초과면 needs_pc, 카드 id가 다르면 prompt_changed."""
+        hold = self.hooks.active(tid)
+        if hold is None or hold.state == "gone":
+            if pid is not None:
+                raise ApiError(409, "prompt_changed", prompt=None)
+            raise ApiError(409, "not_blocked")
+        if hold.state == "expired":
+            raise ApiError(409, "needs_pc")
+        p = hold.prompt()
+        if pid is not None and (p is None or p["id"] != pid):
+            raise ApiError(409, "prompt_changed", prompt=p)
+        return hold, p
+
+    def _hook_decide(self, tid, hold, result):
+        if not self.hooks.finish(hold, "decided", result):
+            raise ApiError(409, "not_blocked")  # 그사이 PC에서 답했거나 시간이 지났다
+        log.info("훅 답 %s %s", tid, result["hookSpecificOutput"].get("permissionDecision")
+                 or result["hookSpecificOutput"]["decision"]["behavior"])
+
+    def hook_api_answer(self, tid, body):
+        """잠금화면 버튼(허락·계속 허용·거절). 키 대신 훅 결정으로 답한다."""
+        action = body.get("action")
+        pid = body.get("prompt_id")
+        if pid is not None and (not isinstance(pid, str) or not PROMPT_ID_RE.match(pid)):
+            raise ApiError(400, "bad_prompt_id")
+        if pid is None and action == "always":
+            raise ApiError(400, "needs_prompt_id")
+        expect = body.get("expect_msg")
+        if expect is not None and not isinstance(expect, str):
+            raise ApiError(400, "bad_expect_msg")
+        with self.term_lock(tid):
+            hold, p = self._hook_active(tid, pid)
+            msg = hold.status.get("msg")
+            if expect is not None and expect != msg:
+                raise ApiError(409, "changed", msg=msg)
+            if action == "reject":
+                result = hold.deny()
+            elif hold.kind == "question":
+                raise ApiError(409, "needs_manual", prompt=p)
+            elif action == "always":
+                if not hold.always_perms or hold.agent != "claude":
+                    raise ApiError(409, "no_always", prompt=p)
+                result = hold.allow(perms=hold.always_perms)
+            elif hold.kind == "plan":
+                result = hold.allow(updated_input=hold.tool_input)
+            else:
+                result = hold.allow()
+            self._hook_decide(tid, hold, result)
+        return {"ok": True, "keys": [], "decision": "deny" if action == "reject" else "allow"}
+
+    def hook_prompt_answer(self, tid, pid, oi, ois, text):
+        """카드 답(선택지·복수 선택·자유 입력). 검사는 api_prompt_answer가 이미 했다."""
+        with self.term_lock(tid):
+            hold, p = self._hook_active(tid, pid)
+            n = len(p["options"])
+            free = p.get("free_text_index")
+            if text is not None:
+                if free is None or p["multi_select"]:
+                    raise ApiError(400, "no_free_text")
+                if "\n" in text or "\t" in text:
+                    raise ApiError(400, "bad_text")
+            elif ois is not None:
+                if not p["multi_select"]:
+                    raise ApiError(400, "not_multi_select")
+                if not ois or any(not 0 <= i < n for i in ois):
+                    raise ApiError(400, "bad_option")
+            else:
+                if not 0 <= oi < n:
+                    raise ApiError(400, "bad_option")
+                if p["multi_select"]:
+                    raise ApiError(400, "use_option_indices")
+                if oi == free:
+                    raise ApiError(400, "needs_text")
+            if hold.kind == "question":
+                if text is not None:
+                    value = text
+                elif ois is not None:
+                    value = ", ".join(p["options"][i]["label"] for i in sorted(set(ois)))
+                else:
+                    value = p["options"][oi]["label"]
+                if not self.hooks.advance_question(hold, p["question"], value):
+                    log.info("훅 질문 %s %d/%d", tid, hold.qi, len(hold.prompts))
+                    return {"ok": True}
+                result = hold.allow(updated_input=dict(hold.tool_input, answers=dict(hold.answers)))
+            elif hold.kind == "plan":
+                if text is not None:
+                    result = hold.deny(text)  # "Tell Claude what to change": 계획을 고치라는 말로 돌려준다
+                elif oi == 0:
+                    result = hold.allow(updated_input=hold.tool_input)
+                else:
+                    result = hold.deny()
+            else:
+                if text is not None:
+                    raise ApiError(400, "no_free_text")
+                if oi == p.get("reject_index"):
+                    result = hold.deny()
+                elif oi == p.get("always_index"):
+                    if not hold.always_perms or hold.agent != "claude":
+                        raise ApiError(409, "no_always", prompt=p)
+                    result = hold.allow(perms=hold.always_perms)
+                else:
+                    result = hold.allow()
+            self._hook_decide(tid, hold, result)
+        return {"ok": True}
+
+    def _hook_preview(self, tid):
+        _, path = self.hooks.transcript(tid)
+        path = hook_transcript_path(path, self.home)
+        return preview_for_path(path) if path else None
+
     # --- API
     def term_lock(self, tid):
         """터미널별 잠금: 화면 재확인부터 키 전송 끝까지 한 요청만."""
@@ -3617,6 +4294,10 @@ class App:
     def require_terminal(self, tid):
         if not isinstance(tid, str) or not ID_RE.match(tid):
             raise ApiError(400, "bad_id")
+        if self.hooks.has(tid):
+            for t in self.hooks.ls():
+                if t.get("address") == tid:
+                    return t
         try:
             terms = self.hc.ls()
         except HcError:
@@ -3671,7 +4352,9 @@ class App:
                 item["agent_kind"] = agent_kind(info)
                 item["claude"] = item["agent_kind"] is not None
                 if item["claude"]:
-                    item["preview"] = terminal_preview(info, self.home, self.runner)
+                    item["preview"] = (self._hook_preview(tid) if self.hooks.has(tid)
+                                       else terminal_preview(info, self.home, self.runner))
+            item["caps"] = [] if self.hooks.has(tid) else list(HOOK_CAPS)
             out.append(item)
         since = self.blocked_since.update(
             {i["id"]: (i["status"] or {}).get("state") == "blocked" for i in out})
@@ -3698,6 +4381,8 @@ class App:
         action = body.get("action")
         if action not in ("approve", "always", "reject"):
             raise ApiError(400, "bad_action")
+        if self.hooks.has(tid):
+            return self.hook_api_answer(tid, body)
         pid = body.get("prompt_id")
         if pid is not None:
             if not isinstance(pid, str) or not PROMPT_ID_RE.match(pid):
@@ -3780,6 +4465,8 @@ class App:
         return sent
 
     def api_prompt(self, tid):
+        if self.hooks.has(tid):
+            return {"prompt": self.hooks.current_prompt(tid)}
         info = self.require_claude(tid)
         return {"prompt": self.current_prompt(tid, info)}
 
@@ -3801,6 +4488,8 @@ class App:
                 raise ApiError(400, "bad_option")
         if text is not None:
             validate_text(text)
+        if self.hooks.has(tid):
+            return self.hook_prompt_answer(tid, pid, oi, ois, text)
         with self.term_lock(tid):
             info = self.require_claude(tid)
             p = self._same_prompt(tid, info, pid)
@@ -3820,8 +4509,12 @@ class App:
             raise ApiError(400, "bad_limit")
         if not 1 <= n <= 200:
             raise ApiError(400, "bad_limit")
-        info = self.require_claude(tid)
-        sid, path = find_agent_transcript(info, self.home, runner=self.runner)
+        if self.hooks.has(tid):
+            sid, path = self.hooks.transcript(tid)
+            path = hook_transcript_path(path, self.home)
+        else:
+            info = self.require_claude(tid)
+            sid, path = find_agent_transcript(info, self.home, runner=self.runner)
         if not path:
             return {"session_id": sid, "turns": [], "truncated": False}
         try:
@@ -4530,6 +5223,7 @@ ROUTES = [
     ("GET", re.compile(r"^/api/usage$"), "usage"),
     ("GET", re.compile(r"^/api/push/status$"), "push_status"),
     ("POST", re.compile(r"^/api/push/test$"), "push_test"),
+    ("POST", re.compile(r"^/hook/(claude|codex)$"), "hook"),
 ]
 
 
@@ -4557,7 +5251,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return False
         return hmac.compare_digest(h[7:].strip().encode("utf-8"), expected.encode("utf-8"))
 
-    def _body(self):
+    def _reply_empty(self):
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
+    def _client_alive(self):
+        """붙잡은 훅 요청의 클라이언트가 아직 붙어 있나. 훅 프로세스가 죽으면(PC에서 먼저 답함) 소켓이 EOF로 읽힌다."""
+        sock = self.connection
+        try:
+            r, _, _ = select.select([sock], [], [], 0)
+            if not r:
+                return True
+            return bool(sock.recv(1, socket.MSG_PEEK))
+        except (OSError, ValueError):
+            return False
+
+    def _body(self, limit=MAX_BODY):
         cl = self.headers.get("Content-Length")
         if self.headers.get("Transfer-Encoding"):
             raise ApiError(400, "chunked_not_supported")
@@ -4569,7 +5280,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             raise ApiError(400, "bad_length")
         if n < 0:
             raise ApiError(400, "bad_length")
-        if n > MAX_BODY:
+        if n > limit:
             raise ApiError(413, "too_large")
         raw = self.rfile.read(n)
         if not raw:
@@ -4597,6 +5308,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     continue
                 if m != method:
                     continue
+                if name == "hook":
+                    # 훅은 이 PC의 에이전트만 보낸다: tailscale serve(폰 쪽 프록시)를 거쳐 온 요청은 거절
+                    if any(self.headers.get(h) is not None for h in HOOK_PROXY_HEADERS):
+                        self.close_connection = True
+                        return self._reply(403, {"error": "forbidden"})
+                    res = app.hook_event(mt.group(1), self._body(HOOK_MAX_BODY), self._client_alive)
+                    if res is HOOK_NO_REPLY:
+                        self.close_connection = True
+                        return None
+                    if res is None:
+                        return self._reply_empty()
+                    return self._reply(200, res)
                 body = self._body() if method in ("POST", "DELETE") else {}
                 tid = urllib.parse.unquote(mt.group(1)) if mt.groups() else None
                 if name == "health":
@@ -4816,9 +5539,49 @@ def cmd_pair(out=None, cfg=None, runner=None, enable_vt=None):
     return 0
 
 
+def cmd_hook(args, stdin=None, stdout=None, env=None, timeout=HOOK_CLIENT_TIMEOUT):
+    """`herdr_remote.py hook <claude|codex>`: 에이전트 훅이 부른다. stdin의 훅 JSON을 로컬 서버에 넘기고
+    서버 응답(JSON)을 그대로 stdout에 쓴다. herdr 안(HC_TERMINAL_ID)이거나 서버가 꺼져 있거나 어떤 오류든
+    아무것도 쓰지 않고 0으로 끝난다 → 에이전트가 평소 터미널 대화상자를 띄운다. 로그 파일은 열지 않는다."""
+    env = os.environ if env is None else env
+    try:
+        if env.get("HC_TERMINAL_ID"):
+            return 0
+        agent = args[0] if args else None
+        if agent not in HOOK_AGENTS:
+            return 0
+        raw = (stdin if stdin is not None else sys.stdin.buffer).read(HOOK_MAX_BODY + 1)
+        if not raw or len(raw) > HOOK_MAX_BODY:
+            return 0
+        cfg = load_config()
+        tok = cfg.get("token") or ""
+        if not tok:
+            return 0
+        conn = http.client.HTTPConnection(cfg.get("bind") or "127.0.0.1", cfg["port"], timeout=timeout)
+        try:
+            conn.request("POST", "/hook/" + agent, body=raw,
+                         headers={"Authorization": "Bearer " + tok, "Content-Type": "application/json"})
+            resp = conn.getresponse()
+            data = resp.read(HOOK_MAX_OUT)
+        finally:
+            conn.close()
+        if resp.status != 200 or not data.strip():
+            return 0
+        if not isinstance(json.loads(data.decode("utf-8")), dict):
+            return 0
+        out = stdout if stdout is not None else sys.stdout.buffer
+        out.write(data)
+        out.flush()
+    except Exception:  # noqa: BLE001 - 어떤 실패든 에이전트의 평소 흐름으로
+        pass
+    return 0
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     cmd = argv[0] if argv else "serve"
+    if cmd == "hook":  # 에이전트가 부른다: 로그 설정(파일 열기) 없이 빠르게
+        return cmd_hook(argv[1:])
     setup_logging()
     if cmd == "init":
         init_config()
@@ -4829,7 +5592,7 @@ def main(argv=None):
         return cmd_test_push()
     if cmd == "pair":
         return cmd_pair()
-    print("사용법: herdr_remote.py [init|serve|test-push|pair]", file=sys.stderr)
+    print("사용법: herdr_remote.py [init|serve|test-push|pair|hook <claude|codex>]", file=sys.stderr)
     return 2
 
 

@@ -1,0 +1,31 @@
+{
+  "session_id": "8880df4d-0730-494e-bb77-770cf18f2997",
+  "transcript_path": "/Users/me/.claude/projects/-Users-me-proj/8880df4d-0730-494e-bb77-770cf18f2997.jsonl",
+  "cwd": "/Users/me/proj",
+  "scratchpad_dir": "/private/tmp/claude-501/x/scratchpad",
+  "prompt_id": "9da05ed3-c99d-4b48-bb30-5332fec82689",
+  "permission_mode": "default",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "PermissionRequest",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "touch made_by_hook.txt",
+    "description": "Create empty file made_by_hook.txt"
+  },
+  "permission_suggestions": [
+    {
+      "type": "addDirectories",
+      "directories": [
+        "/Users/me/proj"
+      ],
+      "destination": "session"
+    },
+    {
+      "type": "setMode",
+      "mode": "acceptEdits",
+      "destination": "session"
+    }
+  ]
+}

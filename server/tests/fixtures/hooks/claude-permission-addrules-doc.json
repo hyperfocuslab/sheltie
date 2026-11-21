@@ -1,0 +1,37 @@
+{
+  "session_id": "8880df4d-0730-494e-bb77-770cf18f2997",
+  "transcript_path": "/Users/me/.claude/projects/-Users-me-proj/8880df4d-0730-494e-bb77-770cf18f2997.jsonl",
+  "cwd": "/Users/me/proj",
+  "permission_mode": "default",
+  "hook_event_name": "PermissionRequest",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "npm test",
+    "description": "Run test suite"
+  },
+  "permission_suggestions": [
+    {
+      "type": "addRules",
+      "rules": [
+        {
+          "toolName": "Bash",
+          "ruleContent": "npm test"
+        }
+      ],
+      "behavior": "allow",
+      "destination": "localSettings"
+    },
+    {
+      "type": "addDirectories",
+      "directories": [
+        "/Users/me/other"
+      ],
+      "destination": "session"
+    },
+    {
+      "type": "setMode",
+      "mode": "acceptEdits",
+      "destination": "session"
+    }
+  ]
+}

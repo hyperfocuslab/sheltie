@@ -1,0 +1,10 @@
+{
+  "session_id": "01a1fd03-ff88-7810-a577-953428a88a76",
+  "turn_id": "01a1fd03-ffc8-7453-a21c-272593e74813",
+  "transcript_path": "/Users/me/.codex/sessions/2026/11/21/rollout-2026-11-21T16-31-00-01a1fd03-ff88-7810-a577-953428a88a76.jsonl",
+  "cwd": "/Users/me/proj",
+  "hook_event_name": "UserPromptSubmit",
+  "model": "gpt-6-luna",
+  "permission_mode": "default",
+  "prompt": "touch made.txt"
+}

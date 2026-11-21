@@ -1,0 +1,28 @@
+{
+  "session_id": "8880df4d-0730-494e-bb77-770cf18f2997",
+  "transcript_path": "/Users/me/.claude/projects/-Users-me-proj/8880df4d-0730-494e-bb77-770cf18f2997.jsonl",
+  "cwd": "/Users/me/proj",
+  "permission_mode": "default",
+  "hook_event_name": "PreToolUse",
+  "tool_use_id": "toolu_01ABC",
+  "tool_name": "AskUserQuestion",
+  "tool_input": {
+    "questions": [
+      {
+        "question": "Which framework?",
+        "header": "Framework",
+        "options": [
+          {
+            "label": "React",
+            "description": "Component library"
+          },
+          {
+            "label": "Vue",
+            "description": "Progressive framework"
+          }
+        ],
+        "multiSelect": false
+      }
+    ]
+  }
+}
