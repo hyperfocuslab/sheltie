@@ -80,11 +80,13 @@ class GitBranchTest(unittest.TestCase):
         self.assertFalse(th.is_alive(), "git_branch가 멈췄다")
         return out.get("v")
 
+    @unittest.skipIf(os.name == "nt", "맥 전용: FIFO(os.mkfifo)는 Windows에 없다")
     def test_fifo_head_is_not_read(self):
         os.makedirs(os.path.join(self.tmp, "repo/.git"))
         os.mkfifo(os.path.join(self.tmp, "repo/.git/HEAD"))
         self.assertIsNone(self._branch_with_timeout(os.path.join(self.tmp, "repo")))
 
+    @unittest.skipIf(os.name == "nt", "맥 전용: FIFO(os.mkfifo)는 Windows에 없다")
     def test_fifo_gitdir_file_target_is_not_read(self):
         os.makedirs(os.path.join(self.tmp, "gd"))
         os.mkfifo(os.path.join(self.tmp, "gd/HEAD"))

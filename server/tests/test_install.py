@@ -37,6 +37,7 @@ def read_json(p):
     return json.loads(read(p))
 
 
+@unittest.skipIf(os.name == "nt", "맥 전용: install.sh(sh·launchd·plist). Windows 설치기는 test_install_ps1.py")
 class InstallTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()

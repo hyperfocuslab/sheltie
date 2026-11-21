@@ -40,7 +40,7 @@ def line(model, ts, mid, rid, i=0, o=0, cr=0, cw=0, typ="assistant"):
 class HomeCase(unittest.TestCase):
     def setUp(self):
         self.home = tempfile.mkdtemp()
-        self.env = mock.patch.dict(os.environ, {"HOME": self.home})
+        self.env = mock.patch.dict(os.environ, {"HOME": self.home, "USERPROFILE": self.home})
         self.env.start()
         hr._usage_file_cache.clear()
         hr._usage_limits_cache.update(at=0.0, next=0.0, value=None)
@@ -182,9 +182,11 @@ class LimitsTests(HomeCase):
     def test_no_credentials_and_locked(self):
         with self.keychain("missing"):
             self.assertEqual(hr.usage_find_credentials(), (None, "no_credentials"))
-        with self.keychain("locked"):
-            self.assertEqual(hr.usage_find_credentials(), (None, "keychain_locked"))
+        if sys.platform == "darwin":  # 키체인은 맥에만 있다
+            with self.keychain("locked"):
+                self.assertEqual(hr.usage_find_credentials(), (None, "keychain_locked"))
 
+    @unittest.skipIf(sys.platform != "darwin", "맥 전용: 키체인과 파일 자격 증명 비교")
     def test_keychain_vs_file_later_wins(self):
         self.creds(token="file-tok", expires=2000)
         kc = json.dumps({"claudeAiOauth": {"accessToken": "kc-tok", "expiresAt": 1000}})

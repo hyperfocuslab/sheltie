@@ -76,7 +76,8 @@ class PushLogTests(unittest.TestCase):
         self.log.record(TOK_A, 200, "")
         self.log.record(TOK_B, 0, "no_relay_sig")
         self.log.relay_limited()
-        self.assertEqual(stat.S_IMODE(os.stat(self.path).st_mode), 0o600)
+        if os.name != "nt":  # Windows는 POSIX 권한 비트가 없다
+            self.assertEqual(stat.S_IMODE(os.stat(self.path).st_mode), 0o600)
         with open(self.path) as f:
             raw = f.read()
         self.assertNotIn(TOK_A, raw)

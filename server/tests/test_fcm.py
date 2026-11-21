@@ -88,7 +88,9 @@ class FcmConfigTests(unittest.TestCase):
         self.assertEqual((cfg["push_relay_url"], cfg["fcm_relay_url"]), (hr.DEFAULT_RELAY_URL, hr.DEFAULT_RELAY_URL))
         # 키가 있어 APNs 직접이어도 fcm은 기본 중계
         cfg = self.load({}, key=True)
-        self.assertEqual((cfg["push_relay_url"], cfg["fcm_relay_url"]), ("", hr.DEFAULT_RELAY_URL))
+        # Windows는 APNs 직접 모드가 없어 키가 있어도 APNs도 기본 중계
+        apns = hr.DEFAULT_RELAY_URL if hr.IS_WINDOWS else ""
+        self.assertEqual((cfg["push_relay_url"], cfg["fcm_relay_url"]), (apns, hr.DEFAULT_RELAY_URL))
         cfg = self.load({"push_relay_url": "https://relay.example.com/"}, key=True)
         self.assertEqual((cfg["push_relay_url"], cfg["fcm_relay_url"]), ("https://relay.example.com",) * 2)
         for key in (False, True):

@@ -16,6 +16,7 @@ import unittest
 import urllib.error
 import urllib.parse
 import urllib.request
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import herdr_remote as hr  # noqa: E402
@@ -86,7 +87,7 @@ class FakeHc:
             return {"complete": True, "how": "screen", "text": self.screens[tid]}
         return {"complete": True, "how": "screen", "text": "screen of %s (%d)" % (tid, lines)}
 
-    def run_claude(self, cwd, prompt=None):
+    def run_claude(self, cwd, prompt=None, exe=None):
         self.run_calls.append((cwd, prompt))
         return {"address": "t99", "agent": "claude", "cwd": cwd, "state": "live", "turn": 0}
 
@@ -307,8 +308,9 @@ class BindAndConfigTests(unittest.TestCase):
         cfg = hr.load_config(path)
         self.assertGreaterEqual(len(cfg["token"]), 40)
         self.assertIn(cfg["token"], out.getvalue())
-        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
-        self.assertEqual(stat.S_IMODE(os.stat(os.path.dirname(path)).st_mode), 0o700)
+        if os.name != "nt":  # Windows는 POSIX 권한 비트가 없다(사용자 프로필 ACL을 따른다)
+            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(os.stat(os.path.dirname(path)).st_mode), 0o700)
         self.assertEqual(cfg["apns_key_id"], "5BN2SS5X65")
         self.assertEqual(cfg["team_id"], "2CU9248L85")
         out2 = io.StringIO()
@@ -322,7 +324,8 @@ class BindAndConfigTests(unittest.TestCase):
         ds.add("ab" * 32, "sandbox")
         ds.add("ab" * 32, "production")
         self.assertEqual([(d["token"], d["env"]) for d in ds.list()], [("ab" * 32, "production")])
-        self.assertEqual(stat.S_IMODE(os.stat(ds.path).st_mode), 0o600)
+        if os.name != "nt":
+            self.assertEqual(stat.S_IMODE(os.stat(ds.path).st_mode), 0o600)
         self.assertTrue(ds.remove("ab" * 32))
         self.assertEqual(ds.list(), [])
 
@@ -746,13 +749,13 @@ class RelayTests(unittest.TestCase):
                           ("https://relay.example.com/base", "https://relay.example.com/base"),
                           ("http://127.0.0.1:8787", "http://127.0.0.1:8787"),
                           ("http://localhost:8787/", "http://localhost:8787"),
-                          ("", "")):
+                          ("", hr.DEFAULT_RELAY_URL if os.name == "nt" else "")):  # Windows는 키 파일이 있어도 중계
             with open(path, "w") as f:
                 json.dump({"token": "x", "push_relay_url": url, "apns_key_path": key}, f)
             self.assertEqual(hr.load_config(path)["push_relay_url"], want)
         with open(path, "w") as f:
             json.dump({"token": "x", "apns_key_path": key}, f)
-        self.assertEqual(hr.load_config(path)["push_relay_url"], "")
+        self.assertEqual(hr.load_config(path)["push_relay_url"], hr.DEFAULT_RELAY_URL if os.name == "nt" else "")
         for bad in ("http://example.com", "ftp://relay.example.com", "https://", "relay.example.com",
                     "https://u:p@relay.example.com", "https://relay.example.com?x=1", "http://127.0.0.2",
                     "https://relay.example.com:abc", 5):
@@ -1287,7 +1290,17 @@ class TranscriptTests(unittest.TestCase):
         self.assertEqual(turns[0]["parts"][0]["output"], "✓ ok\nFAIL a\nb")
         self.assertNotIn("\x1b", turns[0]["parts"][0]["output"])
 
-    def _home(self, proc_start="Fri Nov 20 10:01:38 2026", kind="interactive"):
+    def setUp(self):
+        if os.name == "nt":  # Windows의 procStart는 프로세스 생성 FILETIME: ps 대신 이 값을 돌려주게 한다
+            p = mock.patch.object(hr, "proc_create_filetime", lambda pid: self.WIN_START)
+            p.start()
+            self.addCleanup(p.stop)
+
+    WIN_START = 134397050731892483
+
+    def _home(self, proc_start=None, kind="interactive"):
+        if proc_start is None:
+            proc_start = str(self.WIN_START) if os.name == "nt" else "Fri Nov 20 10:01:38 2026"
         home = tempfile.mkdtemp()
         os.makedirs(os.path.join(home, ".claude", "sessions"))
         cwd = "/Users/dev/_scratch/hrtest"
@@ -1314,13 +1327,16 @@ class TranscriptTests(unittest.TestCase):
         run = self.runner()
         sid, path = hr.find_transcript({"pid": 4242, "cwd": "/w"}, home, runner=run)
         self.assertEqual(sid, "577f6a83-38f4-419d-8e6c-7174fb0ce537")
-        self.assertTrue(path.endswith("-Users-dev--scratch-hrtest/577f6a83-38f4-419d-8e6c-7174fb0ce537.jsonl"))
-        argv, kw = run.calls[0]
-        self.assertEqual(argv, ["/bin/ps", "-o", "lstart=", "-p", "4242"])
-        self.assertEqual((kw["env"]["LC_ALL"], kw["env"]["TZ"], kw["shell"]), ("C", "UTC", False))
+        self.assertEqual(os.path.basename(os.path.dirname(path)), "-Users-dev--scratch-hrtest")
+        self.assertEqual(os.path.basename(path), "577f6a83-38f4-419d-8e6c-7174fb0ce537.jsonl")
+        if os.name != "nt":  # Windows는 ps를 부르지 않는다(test_windows.py가 FILETIME 경로를 본다)
+            argv, kw = run.calls[0]
+            self.assertEqual(argv, ["/bin/ps", "-o", "lstart=", "-p", "4242"])
+            self.assertEqual((kw["env"]["LC_ALL"], kw["env"]["TZ"], kw["shell"]), ("C", "UTC", False))
         # pid 재사용(시작 시각 다름) → 못 찾음
-        self.assertEqual(hr.find_transcript({"pid": 4242}, home, runner=self.runner("Sat Nov 21 00:00:00 2026\n")),
-                         (None, None))
+        with mock.patch.object(hr, "proc_create_filetime", lambda pid: self.WIN_START + 1):
+            self.assertEqual(hr.find_transcript({"pid": 4242}, home, runner=self.runner("Sat Nov 21 00:00:00 2026\n")),
+                             (None, None))
         self.assertEqual(hr.find_transcript({"pid": 1}, home, runner=run), (None, None))
         self.assertEqual(hr.find_transcript({}, home, runner=run), (None, None))
         self.assertEqual(hr.find_transcript({"pid": 4242}, self._home(kind="print"), runner=run), (None, None))
@@ -1330,7 +1346,7 @@ class TranscriptTests(unittest.TestCase):
         proj = os.path.join(home, ".claude", "projects")
         os.rename(os.path.join(proj, "-Users-dev--scratch-hrtest"), os.path.join(proj, "other"))
         sid, path = hr.find_transcript({"pid": 4242}, home, runner=self.runner())
-        self.assertTrue(path.endswith("other/577f6a83-38f4-419d-8e6c-7174fb0ce537.jsonl"))
+        self.assertEqual(os.path.relpath(path, proj), os.path.join("other", "577f6a83-38f4-419d-8e6c-7174fb0ce537.jsonl"))
         # 심볼릭 링크 jsonl은 안 연다
         link = os.path.join(home, "l.jsonl")
         os.symlink(path, link)
@@ -1851,6 +1867,10 @@ class DefaultRelayTests(unittest.TestCase):
 
     def test_key_without_setting_stays_apns(self):
         cfg, app = self.load({}, key=True)
+        if os.name == "nt":  # Windows는 APNs 직접 모드를 지원하지 않는다: 키 파일이 있어도 중계
+            self.assertEqual(cfg["push_relay_url"], hr.DEFAULT_RELAY_URL)
+            self.assertEqual(app.push_mode(), "relay")
+            return
         self.assertEqual(cfg["push_relay_url"], "")
         self.assertEqual(app.push_mode(), "apns")
         self.assertNotIsInstance(app.pusher, hr.RelayPusher)

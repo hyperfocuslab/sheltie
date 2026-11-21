@@ -30,6 +30,13 @@ Android(env "fcm") 기기는 APNs 키가 있어도 항상 중계로 보낸다: p
 환경변수
   HERDR_REMOTE_CONFIG  설정 파일(기본 ~/.config/herdr-remote/config.json). devices.json은 같은 폴더.
   HERDR_REMOTE_LOG     로그 파일(기본 ~/Library/Logs/herdr-remote.log, 1MB 회전)
+
+Windows(Python 3.9+, 표준 라이브러리만): 같은 파일 하나로 돈다. 맥과 다른 점만 적는다.
+  설정·devices.json은 맥과 같은 ~/.config/herdr-remote/ (토큰이 든 파일이라 로밍 %APPDATA%에 두지 않는다).
+  로그 기본 %LOCALAPPDATA%\\herdr-remote\\herdr-remote.log. hc 기본 %LOCALAPPDATA%\\Programs\\herdr-core\\hc.exe.
+  상시 실행은 작업 스케줄러(로그온 시)로 `pythonw.exe herdr_remote.py serve`(콘솔 없음 → 자식 프로세스는 CREATE_NO_WINDOW).
+  에이전트는 PATH·흔한 설치 폴더에서 .exe 우선으로 찾아 절대 경로로 hc에 넘긴다(hc 코어는 PATH를 띄운 환경에서 물려받는다).
+  APNs 직접 모드(curl·openssl)는 지원하지 않는다: 푸시는 중계 모드만 쓴다.
 """
 import base64
 import hashlib
@@ -40,6 +47,7 @@ import ipaddress
 import json
 import logging
 import logging.handlers
+import ntpath
 import os
 import re
 import secrets
@@ -54,13 +62,50 @@ import unicodedata
 import urllib.parse
 import uuid
 
+# 플랫폼 분기는 이 상수 하나로만 한다(테스트는 monkeypatch로 Windows 경로를 맥에서 돌린다).
+IS_WINDOWS = os.name == "nt"
+CREATE_NO_WINDOW = 0x08000000
+
 DEFAULT_CONFIG_PATH = "~/.config/herdr-remote/config.json"
 DEFAULT_LOG_PATH = "~/Library/Logs/herdr-remote.log"
+
+
+def _local_appdata():
+    return os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Local")
+
+
+def default_log_path():
+    if IS_WINDOWS:
+        return os.path.join(_local_appdata(), "herdr-remote", "herdr-remote.log")
+    return DEFAULT_LOG_PATH
+
+
+def default_hc_path():
+    if IS_WINDOWS:
+        return os.path.join(_local_appdata(), "Programs", "herdr-core", "hc.exe")
+    return "~/.local/bin/hc"
+
+
+def subprocess_kwargs(text=False):
+    """자식 프로세스 공용 인자. 맥은 빈 dict(주입된 runner의 kwargs가 그대로다).
+    Windows: pythonw에는 콘솔이 없어 콘솔 앱을 부를 때마다 창이 깜빡이므로 CREATE_NO_WINDOW,
+    텍스트 출력은 로케일(cp949)이 아니라 UTF-8로 읽는다."""
+    if not IS_WINDOWS:
+        return {}
+    kw = {"creationflags": CREATE_NO_WINDOW}
+    if text:
+        kw.update(encoding="utf-8", errors="replace")
+    return kw
+
+
+def is_abs_path(p):
+    """cwd가 절대 경로인가. Windows 규칙은 맥에서도 ntpath로 검사할 수 있다."""
+    return ntpath.isabs(p) or os.path.isabs(p) if IS_WINDOWS else os.path.isabs(p)
 DEFAULTS = {
     "bind": "127.0.0.1",
     "port": 8790,
     "token": "",
-    "hc_path": "~/.local/bin/hc",
+    "hc_path": default_hc_path(),
     "apns_key_path": "~/.config/herdr-remote/AuthKey.p8",
     "apns_key_id": "5BN2SS5X65",
     "team_id": "2CU9248L85",
@@ -114,6 +159,11 @@ def config_path():
 
 
 def ensure_private_dir(d):
+    if IS_WINDOWS:
+        # Windows는 사용자 프로필(홈) ACL을 그대로 물려받는다. Python 3.13+는 mode=0o700이면 "소유자만" ACL을 거는데,
+        # 관리자 PowerShell에서 설치하면 소유자가 Administrators가 되어 일반 권한 서비스가 설정을 못 읽는다(7950 실측).
+        os.makedirs(d, exist_ok=True)
+        return
     os.makedirs(d, mode=0o700, exist_ok=True)
     os.chmod(d, 0o700)
 
@@ -124,7 +174,7 @@ def write_private(path, data):
     tmp = "%s.tmp.%d" % (path, os.getpid())
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
-        with os.fdopen(fd, "w") as f:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
             f.write("\n")
         os.chmod(tmp, 0o600)
@@ -139,7 +189,7 @@ def write_private(path, data):
 
 def load_config(path=None):
     path = path or config_path()
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         raw = json.load(f)
     cfg = dict(DEFAULTS)
     cfg.update(raw)
@@ -161,7 +211,8 @@ def resolve_relay_url(url, apns_key_path):
     """실제로 쓸 중계 주소. "off"면 "", 비었고 APNs 키 파일이 없으면 기본 중계, 아니면 check_relay_url."""
     if url == RELAY_OFF:
         return ""
-    if (url is None or url == "") and not os.path.isfile(apns_key_path or ""):
+    # Windows는 APNs 직접 모드(curl·openssl)를 지원하지 않으므로 키 파일이 있어도 중계를 쓴다.
+    if (url is None or url == "") and (IS_WINDOWS or not os.path.isfile(apns_key_path or "")):
         return DEFAULT_RELAY_URL
     return check_relay_url(url)
 
@@ -206,9 +257,9 @@ def init_config(path=None, out=None):
 
 
 def setup_logging(path=None):
-    path = os.path.expanduser(path or os.environ.get("HERDR_REMOTE_LOG") or DEFAULT_LOG_PATH)
+    path = os.path.expanduser(path or os.environ.get("HERDR_REMOTE_LOG") or default_log_path())
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    h = logging.handlers.RotatingFileHandler(path, maxBytes=1024 * 1024, backupCount=2)
+    h = logging.handlers.RotatingFileHandler(path, maxBytes=1024 * 1024, backupCount=2, encoding="utf-8")
     h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     log.addHandler(h)
     log.setLevel(logging.INFO)
@@ -236,7 +287,8 @@ class Hc:
     def _run(self, args):
         argv = [self.path] + list(args)
         try:
-            p = self.runner(argv, capture_output=True, text=True, timeout=HC_TIMEOUT, shell=False)
+            p = self.runner(argv, capture_output=True, text=True, timeout=HC_TIMEOUT, shell=False,
+                            **subprocess_kwargs(text=True))
         except subprocess.TimeoutExpired:
             raise HcError("hc timeout: %s" % args[0])
         except OSError as e:
@@ -273,9 +325,10 @@ class Hc:
         # force: 메뉴의 자유 입력 줄에 쓸 때만(hc는 blocked 터미널에 쓰기를 기본으로 거부한다).
         self._run(["send"] + (["--force"] if force else []) + [tid, "--", text])
 
-    def run_claude(self, cwd, prompt=None):
-        """새 Claude 터미널. 실행 프로그램은 claude로 고정, prompt는 `--` 뒤라 옵션으로 읽히지 않는다(실측 2.1.329)."""
-        argv = ["run", "--bg", "--json", "--cwd", cwd, "claude"]
+    def run_claude(self, cwd, prompt=None, exe=None):
+        """새 Claude 터미널. 실행 프로그램은 claude로 고정, prompt는 `--` 뒤라 옵션으로 읽히지 않는다(실측 2.1.329).
+        exe: Windows에서 찾아 둔 claude 절대 경로(hc 코어가 PATH를 못 찾는다). 맥은 None이라 이름 그대로."""
+        argv = ["run", "--bg", "--json", "--cwd", cwd, exe or "claude"]
         if prompt:
             argv += ["--", prompt]
         return self._json(argv)
@@ -303,6 +356,15 @@ def live_cwd(info):
     return cwd if isinstance(cwd, str) else None
 
 
+def _is_claude_binary(arg0):
+    if IS_WINDOWS:  # C:\\...\\claude.exe: 구분자 두 가지, 확장자, 대소문자
+        base = ntpath.basename(arg0).lower()
+        if base.endswith(".exe"):
+            base = base[:-4]
+        return base == "claude"
+    return os.path.basename(arg0) == "claude"
+
+
 def is_claude(info):
     info = info or {}
     if info.get("agent") in ("claude", "claude-code"):
@@ -313,7 +375,7 @@ def is_claude(info):
     if isinstance(fg, dict):
         argv = fg.get("argv")
         if isinstance(argv, list) and argv and isinstance(argv[0], str):
-            if os.path.basename(argv[0]) == "claude":
+            if _is_claude_binary(argv[0]):
                 return True
     return False
 
@@ -841,9 +903,20 @@ def make_plan_reader(home):
     return read
 
 
+def is_reparse_point(path):
+    """Windows 심볼릭 링크·정션 등(FILE_ATTRIBUTE_REPARSE_POINT). 없는 경로는 False."""
+    try:
+        return bool(getattr(os.lstat(path), "st_file_attributes", 0) & 0x400)
+    except OSError:
+        return False
+
+
 def read_regular_file(path, max_bytes, tail=False):
     """O_NOFOLLOW로 열고 일반 파일만. tail이면 끝 max_bytes. 반환 bytes(잘렸으면 tail 모드에서 첫 줄 버림)."""
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    if IS_WINDOWS and is_reparse_point(path):  # Windows에는 O_NOFOLLOW가 없다: 심볼릭 링크·정션은 미리 거른다
+        raise OSError("reparse point")
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+                 | getattr(os, "O_BINARY", 0))
     try:
         st_ = os.fstat(fd)
         if not stat.S_ISREG(st_.st_mode):
@@ -949,9 +1022,11 @@ def _cap_obj(v):
 
 def _tilde(s):
     """홈 아래 절대 경로를 ~/...로 줄인다(폰 화면 폭이 좁아 /Users/<이름>/ 부분이 경로 끝을 밀어낸다)."""
+    seps = "\\/" if IS_WINDOWS else os.sep  # Windows는 도구가 "/"로 보낸 경로도 있다. 드라이브 문자 대소문자는 무시
+    fold = str.lower if IS_WINDOWS else (lambda x: x)
     for h in {os.path.expanduser("~"), home_real()}:
-        h = h.rstrip(os.sep)
-        if h and (s == h or s.startswith(h + os.sep)):
+        h = h.rstrip(seps)
+        if h and (fold(s) == fold(h) or (len(s) > len(h) and fold(s[:len(h)]) == fold(h) and s[len(h)] in seps)):
             return "~" + s[len(h):]
     return s
 
@@ -1080,7 +1155,41 @@ def ps_lstart(pid, runner=None):
     return _norm(p.stdout or "") or None
 
 
-def find_transcript(info, home, runner=None):
+def proc_create_filetime(pid):
+    """Windows: 프로세스 생성 시각 FILETIME(1601년부터 100ns, 정수). 못 얻으면 None. ~/.claude/sessions의 procStart와 같은 값."""
+    if not IS_WINDOWS:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k32.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+        k32.GetProcessTimes.restype = wintypes.BOOL
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        h = k32.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return None
+        try:
+            c, e, k, u = (wintypes.FILETIME() for _ in range(4))
+            if not k32.GetProcessTimes(h, ctypes.byref(c), ctypes.byref(e), ctypes.byref(k), ctypes.byref(u)):
+                return None
+            return (c.dwHighDateTime << 32) | c.dwLowDateTime
+        finally:
+            k32.CloseHandle(h)
+    except (OSError, ValueError, AttributeError, ImportError):
+        return None
+
+
+def _proc_start_matches(proc_start, pid, runner, filetime):
+    if IS_WINDOWS:
+        ft = (filetime or proc_create_filetime)(pid)
+        return ft is not None and proc_start.strip() == str(ft)
+    return _norm(proc_start) == ps_lstart(pid, runner)
+
+
+def find_transcript(info, home, runner=None, filetime=None):
     """hc get 결과 → (session_id, jsonl 경로) 또는 (None, None).
     pid → ~/.claude/sessions/<pid>.json(interactive, procStart가 ps lstart와 같아야 함) → projects/<cwd 변환>/<id>.jsonl."""
     info = info or {}
@@ -1100,7 +1209,7 @@ def find_transcript(info, home, runner=None):
     if not isinstance(sid, str) or not SESSION_ID_RE.match(sid):
         return None, None
     proc_start = sess.get("procStart")
-    if not isinstance(proc_start, str) or _norm(proc_start) != ps_lstart(pid, runner):
+    if not isinstance(proc_start, str) or not _proc_start_matches(proc_start, pid, runner, filetime):
         return None, None  # pid가 다른 프로세스로 재사용됐다
     cwd = sess.get("cwd") if isinstance(sess.get("cwd"), str) else live_cwd(info)
     projects = os.path.join(home, ".claude", "projects")
@@ -1208,7 +1317,11 @@ def terminal_preview(info, home, runner=None, now=None):
 # ---------------------------------------------------------------- 폴더
 
 # 홈 바로 아래에서 폴더 목록에 안 보이는 것(Finder도 숨긴다. 에이전트를 여기서 시작할 일이 없다)
-HIDDEN_HOME_DIRS = frozenset({"Library"})
+def hidden_home_dirs():
+    return frozenset({"Library", "AppData"}) if IS_WINDOWS else frozenset({"Library"})
+
+
+HIDDEN_HOME_DIRS = hidden_home_dirs()
 
 
 def home_real():
@@ -1220,6 +1333,8 @@ def resolve_home_path(rel, home):
     if rel is None:
         rel = ""
     if not isinstance(rel, str) or len(rel) > 1024 or "\x00" in rel or rel.startswith("/"):
+        raise ApiError(400, "bad_path")
+    if IS_WINDOWS and ("\\" in rel or ":" in rel):  # 앱은 "/" 구분만 보낸다. 역슬래시·드라이브 문자·대체 스트림 거부
         raise ApiError(400, "bad_path")
     parts = [x for x in rel.split("/") if x]
     if any(x.startswith(".") for x in parts):
@@ -1240,7 +1355,9 @@ def rel_to_home(p, home):
     if not p.startswith(home.rstrip(os.sep) + os.sep):
         return None
     r = os.path.relpath(p, home)
-    if any(x.startswith(".") for x in r.split(os.sep)):
+    if IS_WINDOWS:  # 앱과는 항상 "/" 구분
+        r = r.replace("\\", "/")
+    if any(x.startswith(".") for x in r.split("/" if IS_WINDOWS else os.sep)):
         return None
     return r
 
@@ -1497,7 +1614,8 @@ def qr_halfblocks(mod, quiet=2, ansi=True):
     return "\n".join(out)
 
 
-TAILSCALE_PATHS = ("/opt/homebrew/bin/tailscale", "/Applications/Tailscale.app/Contents/MacOS/Tailscale")
+TAILSCALE_PATHS = ("/opt/homebrew/bin/tailscale", "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+                   "C:\\Program Files\\Tailscale\\tailscale.exe")
 
 
 def find_tailscale():
@@ -1516,7 +1634,8 @@ def server_public_url(cfg, runner=None, tailscale=None):
     if not ts:
         return None
     try:
-        p = runner([ts, "status", "--json"], capture_output=True, text=True, timeout=HC_TIMEOUT, shell=False)
+        p = runner([ts, "status", "--json"], capture_output=True, text=True, timeout=HC_TIMEOUT, shell=False,
+                    **subprocess_kwargs(text=True))
         name = json.loads(p.stdout or "{}").get("Self", {}).get("DNSName")
     except (OSError, ValueError, subprocess.TimeoutExpired, AttributeError):
         return None
@@ -1596,7 +1715,8 @@ def make_jwt(key_path, key_id, team_id, now=None, openssl=None, runner=None):
     claims = b64url(json.dumps({"iss": team_id, "iat": now}, separators=(",", ":")).encode())
     signing_input = ("%s.%s" % (header, claims)).encode("ascii")
     p = runner([openssl or find_openssl(), "dgst", "-sha256", "-sign", key_path],
-               input=signing_input, capture_output=True, timeout=HC_TIMEOUT, shell=False)
+               input=signing_input, capture_output=True, timeout=HC_TIMEOUT, shell=False,
+               **subprocess_kwargs())
     if p.returncode != 0:
         raise RuntimeError("openssl sign failed (exit %d)" % p.returncode)
     sig = der_to_raw(p.stdout)
@@ -1697,7 +1817,7 @@ class DeviceStore:
 
     def _load(self):
         try:
-            with open(self.path) as f:
+            with open(self.path, encoding="utf-8") as f:
                 data = json.load(f)
             return [d for d in data if isinstance(d, dict) and d.get("token")]
         except FileNotFoundError:
@@ -1775,7 +1895,7 @@ class PushLog:
         if not self.path:
             return d
         try:
-            with open(self.path) as f:
+            with open(self.path, encoding="utf-8") as f:
                 raw = json.load(f)
         except FileNotFoundError:
             return d
@@ -1900,7 +2020,8 @@ class ApnsPusher:
         ]) + "\n"
         argv = [self.curl, "--http2", "-s", "--max-time", "15", "-o", "-",
                 "-w", "\n%{http_code}", "--config", "-"]
-        p = self.runner(argv, input=conf, capture_output=True, text=True, timeout=30, shell=False)
+        p = self.runner(argv, input=conf, capture_output=True, text=True, timeout=30, shell=False,
+                         **subprocess_kwargs(text=True))
         out = (p.stdout or "").rsplit("\n", 1)
         code = out[-1].strip() if out else ""
         reason = ""
@@ -2287,14 +2408,14 @@ def git_branch(cwd, max_up=40):
     git을 부르지 않고 .git/HEAD를 직접 읽는다(worktree의 `gitdir:` 파일도 따라간다).
     일반 파일만 읽고(FIFO 등에서 멈추지 않게), 결과는 브랜치 이름 형식이나 커밋 hex일 때만 돌려준다
     (심볼릭 링크가 저장소 밖 파일을 가리켜도 그 내용이 나가지 않게)."""
-    if not isinstance(cwd, str) or not cwd.startswith("/"):
+    if not isinstance(cwd, str) or not is_abs_path(cwd):
         return None
 
     def read_regular(path):
         # O_NONBLOCK: FIFO를 열 때 막히지 않는다. 연 뒤 fstat으로 일반 파일인지 본다(확인과 열기 사이 바꿔치기 방지).
         if not os.path.isfile(path):
             return None
-        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
         try:
             if not stat.S_ISREG(os.fstat(fd).st_mode):
                 return None
@@ -2554,7 +2675,8 @@ class App:
             started = time.time()
             try:
                 proc = popen(self.hc.events_argv(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                             stdin=subprocess.DEVNULL, text=True, bufsize=1, shell=False)
+                             stdin=subprocess.DEVNULL, text=True, bufsize=1, shell=False,
+                             **subprocess_kwargs(text=True))
                 log.info("hc events 연결")
                 for line in proc.stdout:
                     if self.stop.is_set():
@@ -2809,7 +2931,7 @@ class App:
         try:
             with os.scandir(p) as it:
                 for e in it:
-                    if e.name.startswith(".") or (p == self.home and e.name in HIDDEN_HOME_DIRS):
+                    if e.name.startswith(".") or (p == self.home and e.name in hidden_home_dirs()):
                         continue
                     try:
                         if not e.is_dir(follow_symlinks=True):
@@ -2853,7 +2975,8 @@ class App:
             argv = self.agent_catalog.launch_argv(agent_id, prompt)  # 400: unknown_agent·not_installed·prompt_unsupported
         try:
             if agent_id == "claude":
-                r = self.hc.run_claude(p, prompt)
+                r = (self.hc.run_claude(p, prompt, exe=self.agent_catalog.executable("claude"))
+                     if IS_WINDOWS else self.hc.run_claude(p, prompt))
             else:
                 r = self.hc.run_agent(p, argv)
         except HcError as e:
@@ -3017,18 +3140,30 @@ AGENT_CATALOG = (
     ("qwen", "Qwen Code", "qwen", False),
 )
 AGENT_BY_ID = {a[0]: a for a in AGENT_CATALOG}
-AGENT_EXTRA_DIRS = ("~/.local/bin", "/opt/homebrew/bin", "/usr/local/bin", "~/.bun/bin", "~/.npm-global/bin",
-                    "~/.volta/bin", "~/.cargo/bin", "~/.opencode/bin", "~/.grok/bin", "~/.cursor/bin")
+AGENT_EXTRA_DIRS_MAC = ("~/.local/bin", "/opt/homebrew/bin", "/usr/local/bin", "~/.bun/bin", "~/.npm-global/bin",
+                        "~/.volta/bin", "~/.cargo/bin", "~/.opencode/bin", "~/.grok/bin", "~/.cursor/bin")
+# Windows: ~/는 홈, %APPDATA%·%LOCALAPPDATA%는 환경변수(없으면 건너뛴다)
+AGENT_EXTRA_DIRS_WIN = ("~/.local/bin", "%APPDATA%/npm", "~/.bun/bin", "~/.cargo/bin", "~/.volta/bin",
+                        "~/.npm-global", "~/.opencode/bin", "~/.grok/bin", "~/.cursor/bin",
+                        "%LOCALAPPDATA%/Microsoft/WinGet/Links", "%LOCALAPPDATA%/Programs/cursor-agent")
+AGENT_EXTRA_DIRS = AGENT_EXTRA_DIRS_WIN if IS_WINDOWS else AGENT_EXTRA_DIRS_MAC
+WIN_EXEC_EXTS = (".exe", ".com", ".cmd", ".bat")  # .exe 우선(.cmd·.bat은 hc가 직접 못 띄울 수 있다: 미확인)
 AGENT_CATALOG_TTL = 30.0
 
 
 def find_executable(name, dirs):
-    for d in dirs:
-        if not d or not os.path.isabs(d):  # 상대 경로·빈 항목은 서버 작업 폴더의 파일을 실행하게 되므로 제외
-            continue
-        p = os.path.join(d, name)
-        if os.path.isfile(p) and os.access(p, os.X_OK):
-            return p
+    if IS_WINDOWS:
+        # 확장자별로 모든 폴더를 훑는다: PATH 앞쪽의 .cmd보다 뒤쪽의 .exe를 고른다.
+        exts = [""] if name.lower().endswith(WIN_EXEC_EXTS) else list(WIN_EXEC_EXTS)
+    else:
+        exts = [""]
+    for ext in exts:
+        for d in dirs:
+            if not d or not is_abs_path(d):  # 상대 경로·빈 항목은 서버 작업 폴더의 파일을 실행하게 되므로 제외
+                continue
+            p = os.path.join(d, name + ext)
+            if os.path.isfile(p) and os.access(p, os.X_OK):
+                return p
     return None
 
 
@@ -3036,6 +3171,12 @@ def agent_search_dirs(home, path_env=None, extra=AGENT_EXTRA_DIRS):
     path_env = os.environ.get("PATH", "") if path_env is None else path_env
     dirs = [d for d in path_env.split(os.pathsep) if d]
     for d in extra:
+        if d.startswith("%"):
+            var, _, rest = d[1:].partition("%")
+            base = os.environ.get(var)
+            if not base:
+                continue
+            d = os.path.join(base, rest.lstrip("/"))
         d = os.path.join(home, d[2:]) if d.startswith("~/") else d
         if d not in dirs:
             dirs.append(d)
@@ -3061,17 +3202,28 @@ class AgentCatalog:
         self.clock = clock
         self.ttl = ttl
         self._cache = None
+        self._paths = {}
         self._at = 0.0
         self._lock = threading.Lock()
 
+    def _scan(self):
+        now = self.clock()
+        if self._cache is None or now - self._at >= self.ttl:
+            dirs = agent_search_dirs(self.home, self.path_env, self.extra_dirs)
+            self._paths = {a[0]: find_executable(a[2], dirs) for a in AGENT_CATALOG}
+            self._cache = {k: v is not None for k, v in self._paths.items()}
+            self._at = now
+
     def installed(self):
         with self._lock:
-            now = self.clock()
-            if self._cache is None or now - self._at >= self.ttl:
-                dirs = agent_search_dirs(self.home, self.path_env, self.extra_dirs)
-                self._cache = {a[0]: find_executable(a[2], dirs) is not None for a in AGENT_CATALOG}
-                self._at = now
+            self._scan()
             return dict(self._cache)
+
+    def executable(self, agent_id):
+        """찾은 실행 파일 절대 경로(없으면 None)."""
+        with self._lock:
+            self._scan()
+            return self._paths.get(agent_id)
 
     def entries(self):
         inst = self.installed()
@@ -3082,7 +3234,10 @@ class AgentCatalog:
             raise ApiError(400, "unknown_agent")
         if not self.installed()[agent_id]:
             raise ApiError(400, "not_installed")
-        return agent_argv(agent_id, prompt)
+        argv = agent_argv(agent_id, prompt)
+        if IS_WINDOWS:  # hc 코어는 PATH를 띄운 환경에서 물려받아 이름만으로는 못 찾는다: 절대 경로로 넘긴다
+            argv[0] = self.executable(agent_id) or argv[0]
+        return argv
 
 
 # ---------------------------------------------------------------- 사용량 (Usage)
@@ -3601,7 +3756,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 class Server(http.server.ThreadingHTTPServer):
     daemon_threads = True
-    allow_reuse_address = True
+    # Windows의 SO_REUSEADDR는 다른 프로세스가 같은 포트를 같이 잡게 한다(포트 가로채기).
+    allow_reuse_address = not IS_WINDOWS
 
 
 def check_bind(bind):
@@ -3700,8 +3856,38 @@ def cmd_test_push():
     return 0 if sent == len(devs) and devs else 1
 
 
-def cmd_pair(out=None, cfg=None, runner=None):
+def enable_windows_vt():
+    """Windows 콘솔의 ANSI 처리(ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x4)를 켠다. 켜졌으면 True."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.GetStdHandle.restype = wintypes.HANDLE
+        h = k32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        mode = wintypes.DWORD()
+        if not h or not k32.GetConsoleMode(h, ctypes.byref(mode)):  # 콘솔이 아니면(리다이렉트) 실패
+            return False
+        return bool(k32.SetConsoleMode(h, mode.value | 0x4))
+    except (OSError, ValueError, AttributeError, ImportError):
+        return False
+
+
+def _ensure_utf8(stream):
+    """리다이렉트·cp949 파이프에서 █▀▄가 UnicodeEncodeError로 죽지 않게."""
+    enc = (getattr(stream, "encoding", None) or "").lower().replace("_", "-")
+    if enc not in ("utf-8", "utf8") and hasattr(stream, "reconfigure"):
+        try:
+            stream.reconfigure(encoding="utf-8")
+        except (OSError, ValueError):
+            pass
+
+
+def cmd_pair(out=None, cfg=None, runner=None, enable_vt=None):
     out = out or sys.stdout
+    ansi = True
+    if IS_WINDOWS:
+        _ensure_utf8(out)
+        ansi = (enable_vt or enable_windows_vt)()
     cfg = cfg or load_config()
     tok = cfg.get("token") or ""
     if len(tok) < 20:
@@ -3712,7 +3898,7 @@ def cmd_pair(out=None, cfg=None, runner=None):
         print("서버 주소를 못 정했다. 설정에 public_url을 넣거나 Tailscale을 켜라", file=sys.stderr)
         return 1
     link = pair_url(url, tok)
-    print(qr_halfblocks(qr_encode(link)), file=out)
+    print(qr_halfblocks(qr_encode(link), ansi=ansi), file=out)
     print("", file=out)
     print("아이폰 카메라로 QR을 찍거나 이 주소를 열어라(토큰이 들어 있다):", file=out)
     print(link, file=out)

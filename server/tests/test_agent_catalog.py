@@ -20,11 +20,17 @@ hr.log.propagate = False
 
 
 def touch_exe(d, name, mode=0o755):
-    p = os.path.join(d, name)
+    # Windows는 실행 비트가 없고 확장자로 찾는다(.exe 우선): 같은 이름의 .exe를 만든다
+    p = os.path.join(d, name + (".exe" if os.name == "nt" else ""))
     with open(p, "w") as f:
         f.write("#!/bin/sh\n")
     os.chmod(p, mode)
     return p
+
+
+def codex_cmd(catalog):
+    """hc에 넘기는 첫 인자: 맥은 이름, Windows는 찾은 실행 파일의 절대 경로."""
+    return catalog.executable("codex") if hr.IS_WINDOWS else "codex"
 
 
 class Clock:
@@ -53,10 +59,12 @@ class CatalogTests(unittest.TestCase):
         touch_exe(self.bin, "claude")
         touch_exe(self.bin, "codex")
         touch_exe(self.bin, "gemini", 0o644)  # 실행 권한 없음 → 미설치
-        inst = self.catalog(path="/nonexistent:" + self.bin).installed()
+        nonexistent = os.path.join(tempfile.gettempdir(), "no-such-dir-xyz")
+        inst = self.catalog(path=nonexistent + os.pathsep + self.bin).installed()
         self.assertTrue(inst["claude"])
         self.assertTrue(inst["codex"])
-        self.assertFalse(inst["gemini"])
+        if os.name != "nt":  # Windows는 실행 비트가 없어 권한으로 미설치를 가를 수 없다
+            self.assertFalse(inst["gemini"])
         self.assertFalse(inst["opencode"])
 
     def test_extra_dirs_under_home(self):
@@ -69,7 +77,7 @@ class CatalogTests(unittest.TestCase):
         os.chdir(self.bin)
         try:
             touch_exe(self.bin, "amp")
-            self.assertFalse(self.catalog(path=".:").installed()["amp"])
+            self.assertFalse(self.catalog(path="." + os.pathsep).installed()["amp"])
         finally:
             os.chdir(cwd)
 
@@ -103,7 +111,7 @@ class CatalogTests(unittest.TestCase):
     def test_launch_argv_errors(self):
         touch_exe(self.bin, "codex")
         c = self.catalog()
-        self.assertEqual(c.launch_argv("codex", "hi"), ["codex", "--", "hi"])
+        self.assertEqual(c.launch_argv("codex", "hi"), [codex_cmd(c), "--", "hi"])
         for bad, err in (("nope", "unknown_agent"), ("", "unknown_agent"), ("../codex", "unknown_agent"),
                          ("codex --yolo", "unknown_agent"), (3, "unknown_agent"), (["codex"], "unknown_agent"),
                          ("gemini", "not_installed")):
@@ -177,7 +185,8 @@ class HttpTests(unittest.TestCase):
     def test_codex_launch(self):
         code, body = self.req("POST", "/api/agents", {"path": "proj", "agent": "codex", "prompt": "-x 해줘"})
         self.assertEqual((code, body), (200, {"id": "t55"}))
-        self.assertEqual(self.hc.agent_calls, [(os.path.join(self.home, "proj"), ["codex", "--", "-x 해줘"])])
+        self.assertEqual(self.hc.agent_calls, [(os.path.join(self.home, "proj"),
+                                                [codex_cmd(self.app.agent_catalog), "--", "-x 해줘"])])
         self.assertEqual(self.hc.run_calls, [])
 
     def test_bad_agent_400(self):
