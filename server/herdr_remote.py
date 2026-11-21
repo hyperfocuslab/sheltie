@@ -1399,6 +1399,176 @@ def _copilot_overlay_card(p):
                                                         ("question", COPILOT_AUTOPILOT_TITLE))
 
 
+# ---- Qwen Code 대화 상자. 실측: qwen-code 0.28.3, 200열(tests/fixtures/qwen-*-0.28.3.txt).
+# 승인·계획·질문은 상자 없이 `? <도구 표시명> <요약> ←` 줄 아래에 본문, 질문 줄, 번호 메뉴(커서 승인 `›`, 질문 `❯`)가
+# 그려지고 화면 끝은 `⠏ Waiting for user confirmation...`이다. 숫자 키가 그 항목을 바로 고르고 제출한다.
+# "No, suggest changes (esc)"·"No, keep planning (esc)"는 esc와 같다(입력 칸 없이 턴이 끝난다).
+# 질문은 하나·단일 선택만 카드(숫자 키 제출). "Type something..."은 숫자 → 붙여넣기+enter.
+# 여러 질문(탭)·복수 선택은 카드 없음. 폴더 신뢰는 화면 끝 ╭…╰ 상자(Qwen이 permission "Approval needed"를 보낸다).
+QWEN_WAIT_RE = re.compile(r"^\S Waiting for user confirmation\.\.\.$")
+QWEN_HEAD_RE = re.compile(r"^\? (\S+)(?: (.*?))? ←$")
+QWEN_ESC_SUFFIX = " (esc)"
+QWEN_APPROVE_FIRST = "Yes, allow once"
+QWEN_REJECT = "No, suggest changes"
+QWEN_SHELL_PERSIST_RE = re.compile(r"^Always allow run .+ commands (?:in this project|for this user)$")
+QWEN_EDIT_TOOLS = ("WriteFile", "Edit")
+QWEN_EDIT_ALWAYS = "Yes, allow always"  # 파일 저장 없이 이 세션만 auto-accept edits로 바뀐다(실측)
+QWEN_PLAN_TOOL = "ExitPlanMode"
+QWEN_PLAN_Q = "Would you like to proceed?"
+QWEN_PLAN_EDITOR = "o open full plan in editor"
+QWEN_PLAN_LABELS = ("Yes, and auto-accept edits", "Yes, and manually approve edits", "No, keep planning")
+QWEN_PLAN_RESTORE = "Yes, restore previous mode ("
+QWEN_Q_TOOL = "AskUserQuestion"
+QWEN_Q_SUMMARY = "Ask user 1 question"
+QWEN_Q_HINT = "↑/↓: Navigate | Enter: Select | Esc: Cancel"
+QWEN_FREE = "Type something..."
+QWEN_TRUST_Q = "Do you trust this folder?"
+
+
+def _qwen_block(lines):
+    """화면 끝 대기 줄 위의 `? 도구 … ←` 블록 → (도구, 요약, 안쪽 줄) 또는 None."""
+    nz = [i for i, ln in enumerate(lines) if ln.strip()]
+    if not nz or not QWEN_WAIT_RE.match(lines[nz[-1]].strip()):
+        return None
+    end = nz[-1]
+    head = next((i for i in range(end - 1, max(-1, end - 400), -1) if QWEN_HEAD_RE.match(lines[i].strip())), -1)
+    if head < 0:
+        return None
+    m = QWEN_HEAD_RE.match(lines[head].strip())
+    return m.group(1), (m.group(2) or "").strip(), lines[head + 1:end]
+
+
+def _qwen_menu(inner, stop=None):
+    """번호 메뉴(커서 하나) → (rows, 라벨, 질문 줄 index) 또는 None. 라벨 끝 " (esc)"는 뗀다."""
+    rows = _menu_rows(inner, 0, len(inner) if stop is None else stop)
+    if len(rows) < 2 or sum(1 for r in rows if r["selected"]) != 1:
+        return None
+    q = next((i for i in range(rows[0]["line"] - 1, -1, -1) if inner[i].strip()), -1)
+    if q < 0:
+        return None
+    labels = []
+    for r in rows:
+        lb = _norm(r["label"])
+        labels.append(lb[:-len(QWEN_ESC_SUFFIX)] if lb.endswith(QWEN_ESC_SUFFIX) else lb)
+    return rows, labels, q
+
+
+def _qwen_finish(p, approve=None):
+    if approve is not None:
+        p["approve_index"] = approve
+    p["agent"] = "qwen"
+    return p
+
+
+def _parse_qwen_approval(tool, summary, inner):
+    menu = _qwen_menu(inner)
+    if menu is None:
+        return None
+    rows, labels, q = menu
+    question = inner[q].strip()
+    if labels[0] != QWEN_APPROVE_FIRST or labels[-1] != QWEN_REJECT or not question.endswith("?"):
+        return None
+    always = persist = None
+    if tool == "Shell":
+        # 2번 <cwd>/.qwen/settings.json, 3번 $QWEN_HOME/settings.json의 permissions.allow에 영구 저장(실측)
+        if len(rows) != 4 or not all(QWEN_SHELL_PERSIST_RE.match(lb) for lb in labels[1:3]):
+            return None
+        persist = 1
+    elif tool in QWEN_EDIT_TOOLS:
+        if len(rows) != 3 or labels[1] != QWEN_EDIT_ALWAYS:
+            return None
+        always = 1
+    else:
+        return None  # 캡처하지 않은 도구
+    block = _dedent_block(inner[:q])
+    body = "\n\n".join(x for x in (summary, block) if x) or None
+    opts = [(lb, None, r["num"]) for lb, r in zip(labels, rows)]
+    return _qwen_finish(_finish("approval", tool, question, body, opts,
+                                selected=next(k for k, r in enumerate(rows) if r["selected"]),
+                                always_index=always, reject_index=len(rows) - 1, persist_index=persist), approve=0)
+
+
+def _parse_qwen_plan(inner):
+    menu = _qwen_menu(inner)
+    if menu is None:
+        return None
+    rows, labels, q = menu
+    if inner[q].strip() != QWEN_PLAN_Q or len(rows) != 4 or not labels[0].startswith(QWEN_PLAN_RESTORE) \
+            or tuple(labels[1:]) != QWEN_PLAN_LABELS:
+        return None
+    body = _dedent_block([ln for ln in inner[:q] if ln.strip() != QWEN_PLAN_EDITOR])
+    opts = [(lb, None, r["num"]) for lb, r in zip(labels, rows)]
+    return _qwen_finish(_finish("plan", QWEN_PLAN_TOOL, QWEN_PLAN_Q, body, opts,
+                                selected=next(k for k, r in enumerate(rows) if r["selected"]), reject_index=3))
+
+
+def _parse_qwen_question(summary, inner):
+    nz = [i for i, ln in enumerate(inner) if ln.strip()]
+    if summary != QWEN_Q_SUMMARY or len(nz) < 4 or inner[nz[-1]].strip() != QWEN_Q_HINT:
+        return None  # 여러 질문(탭 막대·←/→ 힌트)·복수 선택·제출 탭은 힌트가 다르다
+    menu = _qwen_menu(inner, nz[-1])
+    if menu is None:
+        return None
+    rows, labels, _ = menu
+    if any(r["checkbox"] for r in rows) or any(lb.startswith(">") for lb in labels):
+        return None  # 복수 선택, 또는 PC에서 직접 입력 칸을 연 상태(`❯ 4. > Type something...`)
+    head = [inner[i].strip() for i in nz if i < rows[0]["line"]]
+    if len(head) < 2:
+        return None
+    opts = [(lb, _norm(" ".join(r["extra"])) or None, r["num"]) for lb, r in zip(labels, rows)]
+    free = labels.index(QWEN_FREE) if QWEN_FREE in labels else None
+    return _qwen_finish(_finish("question", head[0], _norm(" ".join(head[1:])), None, opts,
+                                selected=next(k for k, r in enumerate(rows) if r["selected"]),
+                                free_text_index=free))
+
+
+def _parse_qwen_trust(lines):
+    inner = _last_box(lines)
+    if inner is None:
+        return None
+    menu = _qwen_menu(inner)
+    if menu is None:
+        return None
+    rows, labels, _ = menu
+    nz = [i for i, ln in enumerate(inner) if ln.strip() and i < rows[0]["line"]]
+    if not nz or inner[nz[0]].strip() != QWEN_TRUST_Q or len(rows) != 3 \
+            or not labels[0].startswith("Trust folder") or not labels[1].startswith("Trust parent folder") \
+            or labels[2] != "Don't trust":
+        return None
+    body = _dedent_block(inner[nz[0] + 1:rows[0]["line"]])
+    opts = [(lb, None, r["num"]) for lb, r in zip(labels, rows)]
+    # 1번도 $QWEN_HOME/trustedFolders.json에 저장되지만 신뢰 화면의 기본 답이다. 2번(상위 폴더)은 더 넓은 영구 허용
+    return _qwen_finish(_finish("approval", None, QWEN_TRUST_Q, body, opts,
+                                selected=next(k for k, r in enumerate(rows) if r["selected"]),
+                                reject_index=2, persist_index=1), approve=0)
+
+
+def _parse_qwen_lines(lines, plan_reader=None):
+    blk = _qwen_block(lines)
+    if blk is None:
+        return _parse_qwen_trust(lines)
+    tool, summary, inner = blk
+    if tool == QWEN_PLAN_TOOL:
+        return _parse_qwen_plan(inner)
+    if tool == QWEN_Q_TOOL:
+        return _parse_qwen_question(summary, inner)
+    return _parse_qwen_approval(tool, summary, inner)
+
+
+def is_qwen(info):
+    """Qwen Code 터미널. hc agent·status.app("qwen-code")·`node …/qwen`, 또는 Qwen이 자기 자신을 다시 띄운
+    `node --expose-gc …/@qwen-code/qwen-code/cli.js`(실측 0.28.3)."""
+    if _agent_names(info) & {"qwen", "qwen-code"}:
+        return True
+    fg = (info or {}).get("foreground")
+    argv = fg.get("argv") if isinstance(fg, dict) else None
+    if isinstance(argv, list) and argv and all(isinstance(a, str) for a in argv) \
+            and _binary_base(argv[0]) in SCRIPT_HOSTS:
+        script = next((a for a in argv[1:] if not a.startswith("-")), "")
+        return script.replace("\\", "/").endswith("/@qwen-code/qwen-code/cli.js")
+    return False
+
+
 def _parse_codex_lines(lines, plan_reader=None):
     return _parse_codex_approval(lines) or _parse_codex_question(lines) or _parse_codex_plan(lines)
 
@@ -1842,8 +2012,72 @@ def _parse_copilot_transcript(recs, limit):
     return turns[-limit:] if limit else turns, cut
 
 
+QWEN_HIDDEN_USER_PREFIXES = ("<system-reminder>", "<session_context>")
+
+
+def _is_qwen_record(rec):
+    """Qwen 줄: message.parts(Gemini API 모양) 또는 systemPayload(system 줄). Claude message에는 content만 있다."""
+    msg = rec.get("message")
+    return (isinstance(msg, dict) and isinstance(msg.get("parts"), list)) or "systemPayload" in rec \
+        or rec.get("type") == "tool_result"
+
+
+def _parse_qwen_transcript(recs, limit):
+    """Qwen chats jsonl(실측 0.28.3): user(message.parts text), assistant(text·thought·functionCall),
+    tool_result(functionResponse + toolCallResult.status success|cancelled|error), system은 무시."""
+    turns, tools = [], {}
+    for rec in recs:
+        typ, msg = rec.get("type"), rec.get("message")
+        parts_in = msg.get("parts") if isinstance(msg, dict) and isinstance(msg.get("parts"), list) else []
+        if typ == "user":
+            parts = []
+            for pt in parts_in:
+                t = pt.get("text") if isinstance(pt, dict) else None
+                if isinstance(t, str) and t.strip() and not t.lstrip().startswith(QWEN_HIDDEN_USER_PREFIXES):
+                    parts.append({"kind": "text", "text": _cap(t)})
+            if parts:
+                turns.append({"role": "user", "parts": parts})
+        elif typ == "assistant":
+            parts = []
+            for pt in parts_in:
+                if not isinstance(pt, dict):
+                    continue
+                fc = pt.get("functionCall")
+                if isinstance(fc, dict):
+                    name = fc.get("name") if isinstance(fc.get("name"), str) else "?"
+                    inp = fc.get("args") if isinstance(fc.get("args"), dict) else {}
+                    t = {"kind": "tool", "name": name, "summary": _tool_summary(name, inp), "input": _cap_obj(inp),
+                         "output": None, "state": "pending"}
+                    if isinstance(fc.get("id"), str):
+                        tools[fc["id"]] = t
+                    parts.append(t)
+                elif isinstance(pt.get("text"), str) and pt["text"].strip():
+                    parts.append({"kind": "thinking" if pt.get("thought") else "text", "text": _cap(pt["text"])})
+            _codex_add(turns, "assistant", parts)
+        elif typ == "tool_result":
+            res = rec.get("toolCallResult") if isinstance(rec.get("toolCallResult"), dict) else {}
+            for pt in parts_in:
+                fr = pt.get("functionResponse") if isinstance(pt, dict) else None
+                if not isinstance(fr, dict):
+                    continue
+                t = tools.get(fr.get("id")) or tools.get(res.get("callId"))
+                if t is None:
+                    continue
+                resp = fr.get("response") if isinstance(fr.get("response"), dict) else {}
+                v = resp.get("output", resp.get("error"))
+                if v is not None and not isinstance(v, str):
+                    v = json.dumps(v, ensure_ascii=False)
+                t["output"] = _cap(_strip_ansi(v)) if isinstance(v, str) else None
+                status = res.get("status")
+                ok = status == "success" if status else "output" in resp
+                t["state"] = "ok" if ok else "error"
+    cut = len(turns) > limit
+    return turns[-limit:] if limit else turns, cut
+
+
 def parse_transcript(lines, limit=50):
-    """Claude Code 세션 jsonl(또는 Codex rollout jsonl, Gemini chats jsonl, Copilot events.jsonl) 줄들 → (turns, 잘렸는지)."""
+    """Claude Code 세션 jsonl(또는 Codex rollout jsonl, Gemini chats jsonl, Copilot events.jsonl,
+    Qwen chats jsonl) 줄들 → (turns, 잘렸는지)."""
     recs = []
     for line in lines:
         line = line.strip()
@@ -1859,6 +2093,8 @@ def parse_transcript(lines, limit=50):
         return _parse_gemini_transcript(recs, limit)
     if any(_is_copilot_record(r) for r in recs[:50]):
         return _parse_copilot_transcript(recs, limit)
+    if any(_is_qwen_record(r) for r in recs[:50]):
+        return _parse_qwen_transcript(recs, limit)
     turns = []
     tools = {}
     for rec in recs:
@@ -2258,6 +2494,87 @@ def find_copilot_transcript(info, home, runner=None):
         if _copilot_workspace_cwd(os.path.join(base, name)) in want:
             return name, os.path.join(base, name, "events.jsonl")
     return None, None
+
+
+QWEN_CHAT_RE = re.compile(r"^([0-9A-Za-z-]{8,64})\.jsonl$")
+
+
+def qwen_dir(home):
+    env = os.environ.get("QWEN_HOME")
+    return os.path.expanduser(env) if env else os.path.join(home, ".qwen")
+
+
+def _qwen_project(cwd):
+    """Qwen sanitizeCwd: 영숫자가 아닌 글자를 모두 '-'로(윈도우는 소문자로 먼저). 실측 0.28.3."""
+    return re.sub(r"[^a-zA-Z0-9]", "-", cwd.lower() if IS_WINDOWS else cwd)
+
+
+def _qwen_chats(base, cwd):
+    out = []
+    for c in (cwd, os.path.realpath(cwd)):
+        d = os.path.join(base, "projects", _qwen_project(c), "chats")
+        if d not in out:
+            out.append(d)
+    return out
+
+
+def find_qwen_transcript(info, home, runner=None):
+    """Qwen 터미널 → (session_id, 기록 경로). 실측 0.28.3: $QWEN_HOME(기본 ~/.qwen)/projects/<cwd 변환>/chats/<id>.jsonl.
+    실행 중에는 $QWEN_HOME/sessions/<pid>.json(sessionId, cwd)이 지금 세션을 알려 준다(/clear 뒤 새 세션도).
+    파일을 열어 두지 않는다. 세션 파일이 없거나 그 기록이 아직 없으면 그 폴더의 가장 최근 기록."""
+    info = info or {}
+    base = qwen_dir(home)
+    fg = info.get("foreground")
+    pids = [v for v in (info.get("pid"), fg.get("pid") if isinstance(fg, dict) else None)
+            if isinstance(v, int) and not isinstance(v, bool) and v > 0]
+    cwd = live_cwd(info)
+
+    def session_of(pid):
+        try:
+            rec = json.loads(read_regular_file(os.path.join(base, "sessions", "%d.json" % pid), 64 * 1024)
+                             .decode("utf-8", "replace"))
+        except (OSError, ValueError):
+            return None
+        return rec if isinstance(rec, dict) else None
+    sess = next((s for s in (session_of(p) for p in dict.fromkeys(pids)) if s), None)
+    if sess is None and pids and os.path.isdir(os.path.join(base, "sessions")):
+        # node 런처가 자기 자신을 자식으로 다시 띄우면 세션 파일은 자식 pid다(실측 0.28.3)
+        kids = [c for p in dict.fromkeys(pids) for c in _child_pids(p, runner or subprocess.run)]
+        sess = next((s for s in (session_of(c) for c in kids) if s), None)
+    if sess is not None:
+        sid, scwd = sess.get("sessionId"), sess.get("cwd")
+        if isinstance(sid, str) and SESSION_ID_RE.match(sid) and isinstance(scwd, str) and scwd:
+            for d in _qwen_chats(base, scwd):
+                path = os.path.join(d, sid + ".jsonl")
+                try:
+                    if stat.S_ISREG(os.stat(path, follow_symlinks=False).st_mode):
+                        return sid, path
+                except OSError:
+                    continue
+        if isinstance(scwd, str) and scwd:
+            cwd = scwd
+    if not cwd:
+        return None, None
+    best = None
+    for d in _qwen_chats(base, cwd):
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for f in names:
+            m = QWEN_CHAT_RE.match(f)
+            if not m:
+                continue
+            path = os.path.join(d, f)
+            try:
+                st_ = os.stat(path, follow_symlinks=False)
+            except OSError:
+                continue
+            if stat.S_ISREG(st_.st_mode) and (best is None or st_.st_mtime > best[0]):
+                best = (st_.st_mtime, path, m.group(1))
+    if best is None:
+        return None, None
+    return best[2], best[1]
 
 
 def find_agent_transcript(info, home, runner=None):
@@ -4007,6 +4324,8 @@ CODEX_PUSH_PROMPT_WAIT = 2.0
 CODEX_PUSH_PROMPT_RETRY = 0.15
 # Copilot ask_user 질문 상자는 blocked 이벤트 직후 수십 ms 늦게 그려질 때가 있다(맥북 실측 1.0.114, 4번 중 2번 카드 없이 감).
 COPILOT_PUSH_PROMPT_WAIT = 1.0
+# Qwen 시작 폴더 신뢰 상자는 blocked 이벤트 뒤 30~50ms 지나 그려진다(맥북 실측 0.28.3, 5번 중 5번).
+QWEN_PUSH_PROMPT_WAIT = 1.0
 
 
 # ---------------------------------------------------------------- 에이전트 표
@@ -4050,8 +4369,13 @@ AGENTS = {
                 "overlay": {"states": ("idle", "working", "done"), "card": _copilot_overlay_card,
                             "plan_mode_re": None, "poll": True},
                 "send_guard": True},
+    # Qwen Code는 OSC 7501로 승인·계획(permission)·질문(question)·폴더 신뢰(permission "Approval needed")를 다 보낸다
+    # (실측 0.28.3): 화면 덧씌우기가 필요 없다. 시작 신뢰 상자는 blocked 뒤 30~50ms 늦게 그려져 다시 읽는다.
+    "qwen": {"match": is_qwen, "parse": _parse_qwen_lines, "free_text": _free_text_digit,
+             "transcript": lambda info, home, runner=None: find_qwen_transcript(info, home, runner=runner),
+             "push_wait": lambda: QWEN_PUSH_PROMPT_WAIT, "retry": True, "screen": None, "send_guard": True},
 }
-AGENT_ORDER = ("claude", "codex", "gemini", "copilot")
+AGENT_ORDER = ("claude", "codex", "gemini", "copilot", "qwen")
 SCREEN_POLL_INTERVAL = 3.0  # "full" 에이전트 화면 판정 주기(초). 제목 이벤트가 먼저 오면 그때 바로 본다
 SCREEN_SETTLE = 0.6  # 제목은 막힘인데 메뉴를 못 읽었을 때 다시 볼 때까지(초)
 PROMPT_STATUS_KINDS = {"approval": "permission", "confirm": "permission", "question": "question", "plan": "plan"}

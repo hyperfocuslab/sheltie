@@ -1,0 +1,28 @@
+
+   ▄▄▄▄▄▄  ▄▄     ▄▄ ▄▄▄▄▄▄▄ ▄▄▄    ▄▄   ┌──────────────────────────────────────────────────────────┐
+  ██╔═══██╗██║    ██║██╔════╝████╗  ██║  │ >_ Qwen Code (v0.28.3)                                   │
+  ██║   ██║██║ █╗ ██║█████╗  ██╔██╗ ██║  │                                                          │
+  ██║▄▄ ██║██║███╗██║██╔══╝  ██║╚██╗██║  │ API Key | mock-model (/model to change)                  │
+  ╚██████╔╝╚███╔███╔╝███████╗██║ ╚████║  │ ~/work/demo           │
+   ╚══▀▀═╝  ╚══╝╚══╝ ╚══════╝╚═╝  ╚═══╝  └──────────────────────────────────────────────────────────┘
+
+  Tips: You can resume a previous conversation by running qwen --continue or qwen --resume.
+  ● Read context files: ~/.qwen/output-language.md
+
+  > make notes
+  - Shell touch notes.txt (Create notes.txt)
+
+  > write hello
+  ? WriteFile Writing to hello.txt ←
+
+   1 hello
+   2 world
+
+   Apply this change?
+
+   › 1. Yes, allow once
+     2. Yes, allow always
+     3. No, suggest changes (esc)
+
+
+  ⠏ Waiting for user confirmation...

@@ -1,0 +1,16 @@
+  ██║▄▄ ██║██║███╗██║██╔══╝  ██║╚██╗██║  │ API Key | mock-model (/model to change)                  │
+  ╚██████╔╝╚███╔███╔╝███████╗██║ ╚████║  │ ~/work/demo           │
+   ╚══▀▀═╝  ╚══╝╚══╝ ╚══════╝╚═╝  ╚═══╝  └──────────────────────────────────────────────────────────┘
+
+  Tips: Type / to open the command popup; Tab autocompletes slash commands and saved prompts.
+   ╭──────────────────────────────────────────────────────────────────────────────────────────────────
+   │
+   │ Do you trust this folder?
+   │ Trusting a folder allows Qwen Code to execute commands it suggests. This is a security feature
+   │ to prevent accidental execution in untrusted directories.
+   │
+   │ › 1. Trust folder (demo)
+   │   2. Trust parent folder (lab)
+   │   3. Don't trust (esc)
+   │
+   ╰──────────────────────────────────────────────────────────────────────────────────────────────────

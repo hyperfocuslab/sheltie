@@ -1,0 +1,61 @@
+
+   ▄▄▄▄▄▄  ▄▄     ▄▄ ▄▄▄▄▄▄▄ ▄▄▄    ▄▄   ┌──────────────────────────────────────────────────────────┐
+  ██╔═══██╗██║    ██║██╔════╝████╗  ██║  │ >_ Qwen Code (v0.28.3)                                   │
+  ██║   ██║██║ █╗ ██║█████╗  ██╔██╗ ██║  │                                                          │
+  ██║▄▄ ██║██║███╗██║██╔══╝  ██║╚██╗██║  │ API Key | mock-model (/model to change)                  │
+  ╚██████╔╝╚███╔███╔╝███████╗██║ ╚████║  │ ~/work/demo           │
+   ╚══▀▀═╝  ╚══╝╚══╝ ╚══════╝╚═╝  ╚═══╝  └──────────────────────────────────────────────────────────┘
+
+  Tips: You can resume a previous conversation by running qwen --continue or qwen --resume.
+  ● Read context files: ~/.qwen/output-language.md
+
+  > make notes
+  - Shell touch notes.txt (Create notes.txt)
+
+  > write hello
+  - WriteFile Writing to hello.txt
+    1 hello
+    2 world
+
+  > write hello again
+  ✓ WriteFile Writing to hello.txt
+    1 hello
+    2 world
+
+  ◆ Written.
+
+  > edit hello
+  ✓ Edit hello.txt
+    1   hello
+    2 - world
+    2 + qwen
+
+  ◆ Edited.
+
+  > plan a greet feature
+  ✓ ExitPlanMode Plan:
+    User approved.
+
+    Plan
+     1. Add greet.py with a greet() function
+     2. Add a test for greet()
+     3. Run the test
+
+  ◆ Plan approved, starting.
+
+  > enter plan mode please
+  ✓ EnterPlanMode Enter plan mode
+    Entered plan mode.
+
+  ◆ In plan mode.
+
+
+● How is Qwen doing this session? (optional)
+
+1: Good 2: Bad 3: Fine 0: Dismiss
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+>   Type your message or @path/to/file
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ➜ demo · git:(main) · mock-model
+  plan mode (shift + tab to cycle)

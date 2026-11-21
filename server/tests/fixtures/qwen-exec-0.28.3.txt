@@ -1,0 +1,25 @@
+
+   ▄▄▄▄▄▄  ▄▄     ▄▄ ▄▄▄▄▄▄▄ ▄▄▄    ▄▄   ┌──────────────────────────────────────────────────────────┐
+  ██╔═══██╗██║    ██║██╔════╝████╗  ██║  │ >_ Qwen Code (v0.28.3)                                   │
+  ██║   ██║██║ █╗ ██║█████╗  ██╔██╗ ██║  │                                                          │
+  ██║▄▄ ██║██║███╗██║██╔══╝  ██║╚██╗██║  │ API Key | mock-model (/model to change)                  │
+  ╚██████╔╝╚███╔███╔╝███████╗██║ ╚████║  │ ~/work/demo           │
+   ╚══▀▀═╝  ╚══╝╚══╝ ╚══════╝╚═╝  ╚═══╝  └──────────────────────────────────────────────────────────┘
+
+  Tips: Type / to open the command popup; Tab autocompletes slash commands and saved prompts.
+  ● Read context files: ~/.qwen/output-language.md
+
+  > make notes file
+  ? Shell touch notes.txt (Create notes.txt) ←
+
+     touch notes.txt
+
+   Allow execution of: 'touch'?
+
+   › 1. Yes, allow once
+     2. Always allow run 'touch *' commands in this project
+     3. Always allow run 'touch *' commands for this user
+     4. No, suggest changes (esc)
+
+
+  ⠏ Waiting for user confirmation...

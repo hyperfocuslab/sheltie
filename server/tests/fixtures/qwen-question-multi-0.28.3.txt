@@ -1,0 +1,87 @@
+
+   ▄▄▄▄▄▄  ▄▄     ▄▄ ▄▄▄▄▄▄▄ ▄▄▄    ▄▄   ┌──────────────────────────────────────────────────────────┐
+  ██╔═══██╗██║    ██║██╔════╝████╗  ██║  │ >_ Qwen Code (v0.28.3)                                   │
+  ██║   ██║██║ █╗ ██║█████╗  ██╔██╗ ██║  │                                                          │
+  ██║▄▄ ██║██║███╗██║██╔══╝  ██║╚██╗██║  │ API Key | mock-model (/model to change)                  │
+  ╚██████╔╝╚███╔███╔╝███████╗██║ ╚████║  │ ~/work/demo           │
+   ╚══▀▀═╝  ╚══╝╚══╝ ╚══════╝╚═╝  ╚═══╝  └──────────────────────────────────────────────────────────┘
+
+  Tips: You can resume a previous conversation by running qwen --continue or qwen --resume.
+  ● Read context files: ~/.qwen/output-language.md
+
+  > make notes
+  - Shell touch notes.txt (Create notes.txt)
+
+  > write hello
+  - WriteFile Writing to hello.txt
+    1 hello
+    2 world
+
+  > write hello again
+  ✓ WriteFile Writing to hello.txt
+    1 hello
+    2 world
+
+  ◆ Written.
+
+  > edit hello
+  ✓ Edit hello.txt
+    1   hello
+    2 - world
+    2 + qwen
+
+  ◆ Edited.
+
+  > plan a greet feature
+  ✓ ExitPlanMode Plan:
+    User approved.
+
+    Plan
+     1. Add greet.py with a greet() function
+     2. Add a test for greet()
+     3. Run the test
+
+  ◆ Plan approved, starting.
+
+  > enter plan mode please
+  ✓ EnterPlanMode Enter plan mode
+    Entered plan mode.
+
+  ◆ In plan mode.
+
+  > ask me db
+  ✓ AskUserQuestion Ask user 1 question
+    User has provided the following answers:
+
+    **Database**: MySQL 8
+
+  ◆ Got it.
+
+  > ask again
+  ✓ AskUserQuestion Ask user 1 question
+    User has provided the following answers:
+
+    **Database**: Postgres
+
+  ◆ Got it.
+
+  > ask multi
+  ? AskUserQuestion Ask user 2 questions ←
+
+   ▸ Features   Deploy  Submit
+
+   Which features do you want?
+
+   ❯ [ ] 1. Auth
+            Login and signup
+     [ ] 2. Search
+            Full-text search
+     [ ] 3. Export
+            CSV export
+     [ ] 4. Type something...
+
+
+   ↑/↓: Navigate | ←/→: Switch tabs | Space: Toggle | Enter: Confirm | Esc: Cancel
+
+
+  ⠏ Waiting for user confirmation...
