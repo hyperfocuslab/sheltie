@@ -542,6 +542,17 @@ class HookCommandTests(HookBase):
         self.assertEqual((rc, out), (0, b""))
         self.assertEqual(self.app.hooks.sessions, {})
 
+    def test_grok_borrowing_claude_hooks_ignored(self):
+        # Grok Build는 ~/.claude 훅을 같이 부른다: 환경변수로도, 입력 필드로도 걸러져 세션이 생기지 않는다.
+        rc, out = self.run_cmd("claude", load("claude-permission-bash-2.1.329.json"),
+                               env={"GROK_SESSION_ID": "01a1fd55-ac01-7f50-854c-d469f50e165c"})
+        self.assertEqual((rc, out), (0, b""))
+        grok = dict(load("claude-permission-bash-2.1.329.json"), hookEventName="permission_request",
+                    sessionId="01a1fd55-ac01-7f50-854c-d469f50e165c", workspaceRoot="/tmp/w")
+        rc, out = self.run_cmd("claude", grok)
+        self.assertEqual((rc, out), (0, b""))
+        self.assertEqual(self.app.hooks.sessions, {})
+
     def test_server_down_prints_nothing(self):
         s = socket.socket()
         s.bind(("127.0.0.1", 0))

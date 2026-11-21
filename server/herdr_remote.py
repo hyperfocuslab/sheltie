@@ -4626,6 +4626,10 @@ class BranchCache:
 # hc 터미널과 같은 자리에서 다룬다. 화면·키·글 보내기·새 작업은 없다(caps []).
 
 HOOK_AGENTS = ("claude", "codex")
+# Claude·Codex가 아닌 에이전트가 우리 훅을 부를 때의 표시(Grok Build 1.0.77 실측: GROK_* 환경변수,
+# camelCase 필드 hookEventName·sessionId·workspaceRoot를 snake_case와 같이 보낸다).
+FOREIGN_HOOK_ENV = ("GROK_SESSION_ID", "GROK_HOOK_EVENT")
+FOREIGN_HOOK_KEYS = ("workspaceRoot", "hookEventName")
 HOOK_APPS = {"claude": "claude-code", "codex": "codex"}
 HOOK_HOLD_SEC = 540           # 훅 타임아웃(600초)보다 짧게. 지나면 결정 없이 {} → 터미널 대화상자로
 HOOK_CLIENT_TIMEOUT = 590     # hook 하위 명령이 서버 답을 기다리는 상한(초)
@@ -5535,6 +5539,8 @@ class App:
         """POST /hook/<agent> 한 건. 반환: 응답 JSON(dict), None(빈 본문), HOOK_NO_REPLY(이미 끊김)."""
         if agent not in HOOK_AGENTS:
             raise ApiError(404, "no_route")
+        if any(k in body for k in FOREIGN_HOOK_KEYS):
+            return None  # Claude 훅을 빌려 부르는 다른 에이전트(Grok 등): 등록·붙잡기 없이 넘긴다
         ev = body.get("hook_event_name")
         tid = hook_session_tid(body.get("session_id"))
         if not isinstance(ev, str) or tid is None or not ID_RE.match(tid):
@@ -7023,6 +7029,9 @@ def cmd_hook(args, stdin=None, stdout=None, env=None, timeout=HOOK_CLIENT_TIMEOU
     env = os.environ if env is None else env
     try:
         if env.get("HC_TERMINAL_ID"):
+            return 0
+        # Grok Build는 ~/.claude의 훅을 같이 읽어 부른다(1.0.77 실측). Claude 세션이 아니니 넘긴다.
+        if any(env.get(k) for k in FOREIGN_HOOK_ENV):
             return 0
         agent = args[0] if args else None
         if agent not in HOOK_AGENTS:
