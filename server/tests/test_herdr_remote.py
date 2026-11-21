@@ -923,10 +923,66 @@ class HttpTests(unittest.TestCase):
         self.assertTrue(by["t12"]["claude"])
         self.assertFalse(by["sh1"]["claude"])
         self.assertEqual(self.req("GET", "/api/terminals/t12/screen?lines=50"),
-                         (200, {"text": "screen of t12 (50)", "complete": True}))
+                         (200, {"text": "screen of t12 (50)", "complete": True,
+                                "hash": hashlib.sha1(b"screen of t12 (50)").hexdigest()[:16]}))
         self.assertEqual(self.req("GET", "/api/terminals/t12/screen?lines=301")[0], 400)
         self.assertEqual(self.req("GET", "/api/terminals/t12/screen?lines=-1")[0], 400)
         self.assertEqual(self.req("GET", "/api/terminals/nope/screen")[0], 404)
+
+    def test_screen_long_poll(self):
+        import time
+        self.hc.screens["t12"] = "one"
+        h1 = self.req("GET", "/api/terminals/t12/screen")[1]["hash"]
+        # since가 다르면 바로 돌려준다
+        code, body = self.req("GET", "/api/terminals/t12/screen?since=zzz&wait=5")
+        self.assertEqual((code, body["text"], body["hash"]), (200, "one", h1))
+        # since가 같고 wait 없으면 바로 unchanged
+        self.assertEqual(self.req("GET", "/api/terminals/t12/screen?since=%s" % h1),
+                         (200, {"unchanged": True, "hash": h1}))
+        # 시간 초과
+        t0 = time.monotonic()
+        self.assertEqual(self.req("GET", "/api/terminals/t12/screen?since=%s&wait=1" % h1),
+                         (200, {"unchanged": True, "hash": h1}))
+        self.assertGreaterEqual(time.monotonic() - t0, 0.9)
+        # 기다리는 중 바뀌면 바로 돌려준다
+        threading.Timer(0.5, lambda: self.hc.screens.__setitem__("t12", "two")).start()
+        t0 = time.monotonic()
+        code, body = self.req("GET", "/api/terminals/t12/screen?since=%s&wait=10" % h1)
+        self.assertEqual((code, body["text"]), (200, "two"))
+        self.assertNotEqual(body["hash"], h1)
+        self.assertLess(time.monotonic() - t0, 3)
+        self.assertEqual(self.req("GET", "/api/terminals/t12/screen?wait=21")[0], 400)
+        self.assertEqual(self.req("GET", "/api/terminals/t12/screen?wait=x")[0], 400)
+
+    def test_screen_long_poll_slot_limit(self):
+        import time
+        self.hc.screens["t12"] = "one"
+        h1 = self.req("GET", "/api/terminals/t12/screen")[1]["hash"]
+        with self.app._screen_wait_lock:
+            self.app._screen_waiters = hr.SCREEN_WAIT_SLOTS
+        t0 = time.monotonic()
+        code, body = self.req("GET", "/api/terminals/t12/screen?since=%s&wait=10" % h1)
+        self.assertEqual((code, body["unchanged"], body["busy"]), (200, True, True))
+        self.assertLess(time.monotonic() - t0, 2)
+        with self.app._screen_wait_lock:
+            self.app._screen_waiters = 0
+
+    def test_new_keys_allowed_and_mapped(self):
+        for k in ("tab", "shift-tab", "ctrl-c", "ctrl-d", "left", "right"):
+            self.assertEqual(self.req("POST", "/api/terminals/t12/keys", {"keys": [k]}), (200, {"ok": True}))
+        self.assertEqual([c[1] for c in self.hc.keys_calls],
+                         [["tab"], ["shift-tab"], ["ctrl-c"], ["ctrl-d"], ["left"], ["right"]])
+        for k in ("ctrl-z", "ctrl+c", "f5", "alt-x", "ctrl-a"):
+            self.assertEqual(self.req("POST", "/api/terminals/t12/keys", {"keys": [k]})[0], 400)
+        self.assertEqual(len(self.hc.keys_calls), 6)
+
+    def test_hc_key_name_mapping(self):
+        calls = []
+        def runner(argv, **kw):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, "{}", "")
+        hr.Hc("/x/hc", runner=runner).keys("t1", ["ctrl-c", "shift-tab", "enter"])
+        self.assertEqual(calls[0], ["/x/hc", "keys", "t1", "ctrl+c", "shift+tab", "enter"])
 
     def test_live_cwd_prefers_foreground(self):
         # Herdr에서 새 Space를 ~에서 열고 cd한 뒤 claude를 띄운 경우: 터미널 cwd는 ~, 지금 폴더는 foreground.cwd

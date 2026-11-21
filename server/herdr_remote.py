@@ -147,8 +147,13 @@ FCM_ENV = "fcm"
 FCM_RELAY_OFF_REASON = "fcm_relay_off"
 RELAY_SIG_RE = re.compile(r"^v1\.[A-Za-z0-9_-]{43}$")
 DEVICE_ID_RE = re.compile(r"^[0-9a-f]{16}$")
-ALLOWED_KEYS = frozenset(["enter", "esc", "up", "down", "left", "right", "tab", "space"]
-                         + [str(i) for i in range(1, 10)])
+ALLOWED_KEYS = frozenset(["enter", "esc", "up", "down", "left", "right", "tab", "space",
+                          "shift-tab", "ctrl-c", "ctrl-d"] + [str(i) for i in range(1, 10)])
+# API 키 이름 → hc 키 이름(hc는 `ctrl+c`처럼 + 로 잇는다). 여기 없는 이름은 그대로 넘긴다.
+HC_KEY_NAMES = {"shift-tab": "shift+tab", "ctrl-c": "ctrl+c", "ctrl-d": "ctrl+d"}
+SCREEN_WAIT_MAX = 20          # screen long-poll 최대 대기(초)
+SCREEN_WAIT_INTERVAL = 0.3    # 서버 안에서 화면이 바뀌었는지 보는 간격
+SCREEN_WAIT_SLOTS = 8         # 동시에 기다릴 수 있는 long-poll 수(넘으면 기다리지 않고 바로 돌려준다)
 MAX_KEYS = 10
 MAX_TEXT = 4000
 TRUST_MSG = "trust this folder"
@@ -338,7 +343,7 @@ class Hc:
         return out.decode("utf-8", "replace") if isinstance(out, bytes) else out
 
     def keys(self, tid, keys):
-        self._run(["keys", tid] + list(keys))
+        self._run(["keys", tid] + [HC_KEY_NAMES.get(k, k) for k in keys])
 
     def send(self, tid, text, force=False):
         # `--` 로 끝맺어 '-'로 시작하는 문장이 옵션(--force 등)으로 읽히지 않게 한다.
@@ -6980,6 +6985,8 @@ class App:
         self._refresh_lock = threading.Lock()
         self._term_locks = {}
         self._term_locks_guard = threading.Lock()
+        self._screen_wait_lock = threading.Lock()
+        self._screen_waiters = 0
         self._pending = []
         self._detected = None
         self.stop = threading.Event()
@@ -7714,7 +7721,16 @@ class App:
             i["branch"] = self.branches.get(i.get("cwd"))
         return {"terminals": out}
 
-    def api_screen(self, tid, lines):
+    def _read_screen(self, tid, n):
+        try:
+            r = self.hc.read(tid, n)
+        except HcError:
+            raise ApiError(502, "hc_failed")
+        text = r.get("text", "")
+        return {"text": text, "complete": r.get("complete"),
+                "hash": hashlib.sha1(text.encode("utf-8", "replace")).hexdigest()[:16]}
+
+    def api_screen(self, tid, lines, since=None, wait=None):
         self.require_terminal(tid)
         try:
             n = int(lines) if lines not in (None, "") else 0
@@ -7723,10 +7739,34 @@ class App:
         if not 0 <= n <= 300:
             raise ApiError(400, "bad_lines")
         try:
-            r = self.hc.read(tid, n)
-        except HcError:
-            raise ApiError(502, "hc_failed")
-        return {"text": r.get("text", ""), "complete": r.get("complete")}
+            w = float(wait) if wait not in (None, "") else 0.0
+        except ValueError:
+            raise ApiError(400, "bad_wait")
+        if not 0 <= w <= SCREEN_WAIT_MAX:
+            raise ApiError(400, "bad_wait")
+        res = self._read_screen(tid, n)
+        if not since or res["hash"] != since:
+            return res
+        if w <= 0:
+            return {"unchanged": True, "hash": since}
+        # since와 같다: 바뀔 때까지 기다린다. 스레드 하나를 잡으므로 동시 수를 제한한다.
+        with self._screen_wait_lock:
+            if self._screen_waiters >= SCREEN_WAIT_SLOTS:
+                return {"unchanged": True, "hash": since, "busy": True}
+            self._screen_waiters += 1
+        try:
+            deadline = time.monotonic() + w
+            while True:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return {"unchanged": True, "hash": since}
+                time.sleep(min(SCREEN_WAIT_INTERVAL, left))
+                res = self._read_screen(tid, n)
+                if res["hash"] != since:
+                    return res
+        finally:
+            with self._screen_wait_lock:
+                self._screen_waiters -= 1
 
     def api_answer(self, tid, body):
         action = body.get("action")
@@ -8740,7 +8780,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 elif name == "terminals":
                     res = app.api_terminals()
                 elif name == "screen":
-                    res = app.api_screen(tid, (query.get("lines") or [None])[0])
+                    res = app.api_screen(tid, (query.get("lines") or [None])[0],
+                                         (query.get("since") or [None])[0], (query.get("wait") or [None])[0])
                 elif name == "answer":
                     res = app.api_answer(tid, body)
                 elif name == "prompt":
