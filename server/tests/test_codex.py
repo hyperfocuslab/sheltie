@@ -76,7 +76,7 @@ class CodexParseTests(unittest.TestCase):
 
     def test_unknown_or_inactive_screens_have_no_card(self):
         # 메모 입력 중, 계획 실행 묻기(hc가 blocked로 보지 않는다), 평소 화면, 폴더 신뢰, 모델 바꾸기 권유
-        for name in ("question-notes", "plan", "idle", "trust"):
+        for name in ("question-notes", "idle", "trust"):
             self.assertIsNone(card(name), name)
         self.assertIsNone(hr.parse_prompt(fixture("codex-ratelimit-0.166.0.txt"), agent="codex"))
 
@@ -89,6 +89,101 @@ class CodexParseTests(unittest.TestCase):
     def test_stale_menu_above_new_output_is_not_active(self):
         lines = cx("exec").rstrip("\n").split("\n") + ["", "• Ran touch b.txt", "", "› Ask Codex to do anything"]
         self.assertIsNone(hr.parse_prompt("\n".join(lines), agent="codex"))
+
+
+def plan_mode_idle():
+    """플랜 모드 턴이 끝났는데 메뉴가 아직 안 그려진 화면(입력창 아래 줄에 Plan mode)."""
+    lines = cx("idle").rstrip("\n").split("\n")
+    i = max(k for k, ln in enumerate(lines) if "for shortcuts" in ln)
+    lines[i] = "  ← for agents · ? for shortcuts" + " " * 100 + "Plan mode (⇧tab to cycle) · ⚠ 2 warnings · f2 to view"
+    return "\n".join(lines) + "\n"
+
+
+class CodexPlanParseTests(unittest.TestCase):
+    def test_plan_menu(self):
+        p = card("plan")
+        self.assertEqual((p["kind"], p["question"], p["agent"]), ("plan", "Implement this plan?", "codex"))
+        self.assertEqual([(o["label"], o["description"]) for o in p["options"]],
+                         [("Yes, implement this plan", "Switch to Default and start coding"),
+                          ("Yes, clear context and implement", "Fresh thread with this plan"),
+                          ("No, stay in Plan mode", "Continue planning with the model")])
+        self.assertIn("• Create b.txt with hello", p["body"])
+        self.assertTrue(p["body"].startswith("# Add b.txt"))
+        self.assertEqual((p["selected"], p["reject_index"], p["always_index"]), (0, 2, None))
+        self.assertEqual(hr.push_category("blocked", {"app": "codex", "state": "blocked", "kind": "plan"}, p),
+                         "HR_BLOCKED")  # Claude 계획처럼 잠금화면 허락 버튼은 없다(앱에서 고른다)
+
+    def test_answered_plan_menu_is_gone(self):
+        lines = cx("plan").rstrip("\n").split("\n") + ["", "› Ask Codex to do anything"]
+        self.assertIsNone(hr.parse_prompt("\n".join(lines), agent="codex"))
+        self.assertIsNone(hr.parse_prompt(plan_mode_idle(), agent="codex"))
+
+
+class CodexPlanApiTests(unittest.TestCase):
+    def setUp(self):
+        self.app, self.hc, self.pusher = make_app()
+        self.later = []
+        self.app._later = lambda sec, fn: self.later.append((sec, fn))
+        self.hc.add("c1", {"app": "codex", "state": "working"}, agent="codex", name="cx")
+        self.hc.screens["c1"] = cx("idle")
+        self.app.poll(initial=True)
+
+    def err(self, fn, *a):
+        with self.assertRaises(hr.ApiError) as cm:
+            fn(*a)
+        return cm.exception.code, cm.exception.body["error"]
+
+    def finish(self, screen):
+        self.hc.screens["c1"] = screen
+        done = {"app": "codex", "state": "done"}
+        self.hc.set_status("c1", done, turn=2)
+        self.app.handle_event_line(status_ev("c1", done))
+
+    def test_plan_menu_counts_as_blocked_for_card_answer_and_list(self):
+        self.finish(cx("plan"))
+        p = self.app.api_prompt("c1")["prompt"]
+        self.assertEqual(p["kind"], "plan")
+        by = {t["id"]: t for t in self.app.api_terminals()["terminals"]}
+        self.assertEqual(by["c1"]["status"]["state"], "blocked")
+        self.assertIsNotNone(by["c1"]["blocked_since"])
+        for action in ("approve", "always"):
+            self.assertEqual(self.err(self.app.api_answer, "c1", {"action": action, "prompt_id": p["id"]}),
+                             (409, "needs_manual"))
+        self.assertEqual(self.app.api_answer("c1", {"action": "reject", "prompt_id": p["id"]})["keys"], ["3"])
+        self.app.api_prompt_answer("c1", {"prompt_id": p["id"], "option_index": 0})
+        self.app.api_prompt_answer("c1", {"prompt_id": p["id"], "option_index": 1})
+        self.assertEqual(self.hc.keys_calls, [("c1", ["3"]), ("c1", ["1"]), ("c1", ["2"])])
+        # 메뉴가 사라지면(답한 뒤) 막힘도 카드도 아니다
+        self.hc.screens["c1"] = cx("idle")
+        self.assertIsNone(self.app.api_prompt("c1")["prompt"])
+        self.assertEqual(self.err(self.app.api_answer, "c1", {"action": "reject", "prompt_id": p["id"]}),
+                         (409, "prompt_changed"))
+
+    def test_push_blocked_instead_of_done(self):
+        self.finish(cx("plan"))
+        self.assertEqual([(x["state"], x["category"], x["kind"]) for x in self.pusher.payloads],
+                         [("blocked", "HR_BLOCKED", "plan")])
+        self.assertEqual(self.pusher.payloads[0]["prompt_id"], card("plan")["id"])
+        self.assertEqual(self.later, [])
+
+    def test_plan_mode_done_waits_for_late_menu(self):
+        self.finish(plan_mode_idle())
+        self.assertEqual(self.pusher.payloads, [])  # 끝남을 바로 보내지 않는다
+        self.assertEqual(len(self.later), 1)
+        self.hc.screens["c1"] = cx("plan")
+        self.later.pop()[1]()
+        self.assertEqual([(x["state"], x["kind"]) for x in self.pusher.payloads], [("blocked", "plan")])
+
+    def test_plan_mode_done_without_menu_sends_done_once(self):
+        self.finish(plan_mode_idle())
+        self.later.pop()[1]()
+        self.assertEqual([x["state"] for x in self.pusher.payloads], ["done"])
+        self.assertEqual(self.later, [])
+
+    def test_default_mode_done_is_immediate(self):
+        self.finish(cx("idle"))
+        self.assertEqual([x["state"] for x in self.pusher.payloads], ["done"])
+        self.assertEqual(self.later, [])
 
 
 class CodexAnswerStepsTests(unittest.TestCase):

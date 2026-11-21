@@ -990,9 +990,48 @@ def _parse_codex_question(lines):
     return p
 
 
+CODEX_PLAN_HINT_RE = re.compile(r"^enter select · esc back$")
+CODEX_PLAN_Q = "Implement this plan?"
+CODEX_PLAN_HEAD = "• Proposed Plan"
+CODEX_PLAN_WORKED_RE = re.compile(r"^Worked for .+")
+CODEX_PLAN_MODE_RE = re.compile(r"\bPlan mode \(")  # 입력창 아래 줄: "Plan mode (⇧tab to cycle)"
+CODEX_PLAN_SETTLE = 1.5  # 플랜 모드 턴이 끝난 뒤 메뉴를 다시 볼 때까지(초)
+
+
+def _parse_codex_plan(lines):
+    """플랜 모드 끝 "Implement this plan?" 메뉴(실측 0.171.0). hc는 이 화면을 blocked로 보지 않는다."""
+    h = _codex_hint(lines, CODEX_PLAN_HINT_RE)
+    if h < 0:
+        return None
+    q = _find_above(lines, h, re.compile(r"^%s$" % re.escape(CODEX_PLAN_Q)), span=8)
+    if q < 0:
+        return None
+    rows = _menu_rows(lines, q + 1, h)
+    if len(rows) != 3 or sum(1 for r in rows if r["selected"]) != 1:
+        return None
+    opts = []
+    for r in rows:
+        parts = re.split(r"\s{2,}", r["label"], maxsplit=1)
+        opts.append((parts[0].strip(), _norm(" ".join(parts[1:] + r["extra"])) or None, r["num"]))
+    if not (opts[0][0].lower().startswith("yes") and opts[2][0].lower().startswith("no")):
+        return None
+    body = None
+    for i in range(q - 1, max(-1, q - 400), -1):
+        if lines[i].strip() == CODEX_PLAN_HEAD:
+            seg = [ln for ln in lines[i + 1:q] if not CODEX_PLAN_WORKED_RE.match(ln.strip())]
+            body = _dedent_block(seg)
+            break
+        if lines[i].strip().startswith("› ") and not NUM_ROW_RE.match(lines[i]):
+            break  # 사용자 입력 줄을 넘어가면 이번 계획이 아니다
+    p = _finish("plan", None, CODEX_PLAN_Q, body, opts,
+                selected=next(k for k, r in enumerate(rows) if r["selected"]), reject_index=2)
+    p["agent"] = "codex"
+    return p
+
+
 def parse_codex_prompt(screen_text):
     lines = screen_lines(screen_text)
-    return _parse_codex_approval(lines) or _parse_codex_question(lines)
+    return _parse_codex_approval(lines) or _parse_codex_question(lines) or _parse_codex_plan(lines)
 
 
 def parse_prompt(screen_text, plan_reader=None, agent=None):
@@ -2839,6 +2878,7 @@ class App:
         self.home = os.path.realpath(os.path.expanduser(cfg.get("home") or "~"))
         self.plan_reader = make_plan_reader(self.home)
         self.reminders = Reminders(reminder_intervals(cfg))
+        self._later = lambda sec, fn: threading.Timer(sec, fn).start()  # 테스트가 바꾼다
         self._agent_kinds = {}  # tid → agent_kind(마지막 hc get). 알림 카드를 어느 화면으로 읽을지 정한다
         self.tracker = Tracker(self._notify, prompt_for=self._prompt_for_push, reminders=self.reminders)
         self.blocked_since = BlockedSince()
@@ -2897,7 +2937,33 @@ class App:
             return None
         return box.get("p")
 
-    def refresh(self, tid, event_state=None, initial=False, name=None, detected=None):
+    def _codex_plan_status(self, tid, info):
+        """hc가 blocked로 보지 않는 Codex "Implement this plan?" 메뉴가 화면 끝에 살아 있으면
+        (막힘 status, True). 메뉴는 없고 플랜 모드면 (None, True). 그 밖에는 (None, False)."""
+        if agent_kind(info) != "codex":
+            return None, False
+        st = status_of(info)
+        if st.get("state") not in ("done", "idle"):
+            return None, False
+        try:
+            text = (self.hc.read(tid, 0) or {}).get("text", "")
+        except HcError:
+            return None, False
+        p = parse_prompt(text, agent="codex")
+        if p and p["kind"] == "plan":
+            return dict(st, state="blocked", kind="plan", msg=None), True
+        tail = [ln for ln in screen_lines(text) if ln.strip()][-1:]
+        return None, bool(tail and CODEX_PLAN_MODE_RE.search(tail[0]))
+
+    def effective_info(self, tid, info):
+        """Codex 계획 메뉴가 떠 있으면 status를 막힘으로 바꾼 사본(카드·답·목록이 막힘으로 다룬다)."""
+        plan_st, _ = self._codex_plan_status(tid, info)
+        if plan_st:
+            info = dict(info)
+            info["status"] = plan_st
+        return info
+
+    def refresh(self, tid, event_state=None, initial=False, name=None, detected=None, settle=False):
         """hc get으로 현재 상태를 다시 읽어 판정한다. event_state가 done이면 그것도 먼저 넣는다."""
         with self._refresh_lock:
             self._detected = detected if detected is not None else self.clock()
@@ -2913,7 +2979,15 @@ class App:
                 self._agent_kinds[tid] = agent_kind(info)
                 turn = info.get("turn")
                 st = status_of(info)
-                if event_state == "done" and st.get("state") != "done":
+                plan_st, plan_mode = self._codex_plan_status(tid, info)
+                if plan_st:
+                    st = plan_st  # 계획 실행 메뉴: 끝남 대신 막힘으로(끝남 알림을 따로 보내지 않는다)
+                elif plan_mode and st.get("state") == "done" and not settle:
+                    # 플랜 모드 턴이 끝났는데 메뉴가 아직 안 그려졌다(맥미니는 늦게 그린다): 끝남 판정을 잠깐 미룬다
+                    self._later(CODEX_PLAN_SETTLE, lambda: self.refresh(tid, name=name, settle=True))
+                    self._detected = None
+                    return
+                if event_state == "done" and st.get("state") not in ("done", "blocked"):
                     self.tracker.observe(tid, {"state": "done"}, turn=turn, name=name)
                 self.tracker.observe(tid, st, turn=turn, name=name, initial=initial)
             elif event_state == "done":
@@ -2970,6 +3044,7 @@ class App:
                 except HcError as e:
                     log.warning("다시 알림 %s: hc get 실패: %s", tid, e)
                     continue
+                info = self.effective_info(tid, info)
                 st = status_of(info)
                 if (st.get("state"), st.get("msg")) != key:
                     continue  # 그 사이 풀렸거나 바뀌었다: 다음 폴링이 판정한다
@@ -3101,6 +3176,7 @@ class App:
             except HcError:
                 info = None
             if isinstance(info, dict):
+                info = self.effective_info(tid, info)
                 for k in ("name", "agent", "state"):
                     if info.get(k) is not None:
                         item[k] = info.get(k)
@@ -3176,13 +3252,14 @@ class App:
             raise ApiError(400, "bad_expect_msg")
         with self.term_lock(tid):
             info = self.require_claude(tid)
-            keys = decide_answer(info, action, expect)
+            keys = decide_answer(self.effective_info(tid, info), action, expect)
             self._keys(tid, keys)
         log.info("answer %s %s", tid, action)
         return {"ok": True, "keys": keys}
 
     # --- 메뉴 카드
     def current_prompt(self, tid, info):
+        info = self.effective_info(tid, info)
         if status_of(info).get("state") != "blocked":
             return None
         try:
