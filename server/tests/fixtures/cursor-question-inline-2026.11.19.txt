@@ -1,0 +1,109 @@
+Tip: You can start the Cursor CLI with `agent` (same as `cursor-agent`).
+
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │                                                                                                                                                                                                  │
+  │  ⚠ Workspace Trust Required                                                                                                                                                                      │
+  │                                                                                                                                                                                                  │
+  │  Cursor Agent can execute code and access files in this directory.                                                                                                                               │
+  │                                                                                                                                                                                                  │
+  │  Do you trust the contents of this directory?                                                                                                                                                    │
+  │                                                                                                                                                                                                  │
+  │    /Users/me/work/demo                                                                                                                       │
+  │                                                                                                                                                                                                  │
+  │                                                                                                                                                                                                  │
+  │    [a] Trust this workspace                                                                                                                                                                      │
+  │    [q] Quit                                                                                                                                                                                      │
+  │                                                                                                                                                                                                  │
+  │  ⏳ Trusting workspace...                                                                                                                                                                        │
+  │                                                                                                                                                                                                  │
+  ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+
+  Cursor Agent
+  v2026.11.19-f005e9d
+  Tip: Use /plan to iterate on an implementation plan before code changes.
+
+
+  Run the shell command: touch notes.txt
+
+
+  Running that command now.
+
+  $ touch notes.txt Rejected
+   Never mind, do not run anything. Just reply with the word SKIPPED.
+
+  SKIPPED
+
+
+  OK now actually run: touch notes.txt
+
+
+  $ touch notes.txt 1.3s
+
+  Created notes.txt.
+
+
+  Create a new file hello.py containing: print('hello')
+
+
+    Edited hello.py +1
+
+    ▎+ print('hello')
+
+  Created hello.py with print('hello').
+
+
+  Edit README.md: change the first line to '# cursor demo (edited)'
+
+
+    Read README.md
+
+    Edited README.md +1 -1
+
+    ▎- # cursor demo
+    ▎+ # cursor demo (edited)
+
+  Updated the first line of README.md to # cursor demo (edited).
+
+
+  Using your file edit tool (not shell), create the file ../cursor-outside.txt with the text: hi
+
+
+    Edited cursor-outside.txt +1
+
+    ▎+ hi
+
+  Created ../cursor-outside.txt with hi.
+
+
+  Plan adding a greet(name) function to hello.py. Before writing the plan, ask me two clarifying questions with your question tool: (1) a single-choice question about greeting style with 3
+  options, (2) a multi-select question about extras (type hints, docstring, tests).
+
+
+  I'll look up the question tool, then ask your two clarifying questions before drafting the plan.
+
+    Explored available MCP tools pattern AskQuestion|question
+
+    Read hello.py
+
+    Explored available MCP tools cursor
+
+  I don’t have a separate question tool in this session, so here are the two clarifying questions inline. Reply with your picks and I’ll write the plan.
+
+  1. Greeting style (pick one)
+  • A. Casual — Hi, {name}!
+  • B. Formal — Hello, {name}.
+  • C. Excited — Hey {name}!!!
+
+  2. Extras (pick any that apply)
+  • Type hints
+  • Docstring
+  • Tests
+
+
+ ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
+  → Add a follow-up
+ ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+  Plan (shift+tab to cycle)
+  Auto · 9% · 3 files edited
+  ~/work/demo · main

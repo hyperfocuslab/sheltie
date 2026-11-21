@@ -1973,6 +1973,258 @@ def _free_text_grok(p, num, text):
     raise ApiError(400, "no_free_text")
 
 
+def is_cursor(info):
+    """Cursor Agent CLI 터미널. 앞 프로그램 `~/.local/bin/cursor-agent`(node 실행 파일, 실측 2026.11.19), hc agent
+    "cursor-agent", 또는 `node …/cursor-agent/versions/<버전>/index.js`. 같은 것인 `agent` 이름은 다른 CLI(Grok 등)와
+    겹쳐 보지 않는다."""
+    if _agent_names(info) & {"cursor-agent"}:
+        return True
+    fg = (info or {}).get("foreground")
+    argv = fg.get("argv") if isinstance(fg, dict) else None
+    if isinstance(argv, list) and argv and all(isinstance(a, str) for a in argv) \
+            and _binary_base(argv[0]) in SCRIPT_HOSTS:
+        script = next((a for a in argv[1:] if not a.startswith("-")), "")
+        return "/cursor-agent/versions/" in script.replace("\\", "/")
+    return False
+
+
+# ---- Cursor Agent CLI. 실측: cursor-agent 2026.11.19-f005e9d, 200열(tests/fixtures/cursor-*-2026.11.19.txt).
+# OSC 7501을 안 보내고 제목은 AI가 붙인 대화 제목으로 고정이라 막힘·작업 중은 화면으로만 안다(screen "full").
+# 셸 승인(`Run this command?`)·작업 폴더 밖 파일 쓰기 승인(`Write to this file?`)·모드 전환 승인(`Switch to … mode?`)은
+# 화면 맨 아래 `→ 라벨 (키)` 줄들이다. 숫자 표시가 없고 괄호 안 글자 키가 바로 고른다: y 실행, tab 허용 목록 추가
+# (전역 ~/.cursor/cli-config.json permissions.allow에 영구 저장 → persist만), esc/n 거절 → "대신 할 말" 입력칸
+# (붙여넣기+enter를 모델이 "Rejected: <글>"로 받는다). "Run Everything"(shift+tab)은 저장 방식을 모르고 키를 안 써 봐
+# 카드에서 뺀다. 계획 승인(`Ready to build?`)은 박스 안 번호 줄이고 숫자 키가 바로 제출한다(3은 수정 입력칸, 빈 칸
+# enter는 무시, esc는 메뉴로: 글 없는 거절이 없다).
+# 폴더 신뢰는 `[a] Trust this workspace / [q] Quit` 박스(a 신뢰, q 종료). 질문 도구(AskQuestion) 화면은 캡처 못 해 카드 없음.
+CURSOR_ROW_RE = re.compile(r"^(→\s+)?(\S.*?) \(([^()]+)\)$")
+CURSOR_SHELL_Q = "Run this command?"
+CURSOR_WRITE_Q = "Write to this file?"
+CURSOR_SWITCH_Q_RE = re.compile(r"^Switch to (\S.*) mode\?$")
+CURSOR_MENU_HINTS = ("↑/↓ to navigate • Enter to select • auto-rejects when the bar runs out",
+                     "ctrl+r to review changed files")
+CURSOR_RUN_EVERYTHING = "Run Everything"
+CURSOR_SHELL_LABELS = (re.compile(r"^Run \(once\)$"), re.compile(r"^Add Shell\(.+\) to allowlist\?$"),
+                       re.compile(r"^Run Everything$"), re.compile(r"^Skip & tell the agent what to do instead$"))
+CURSOR_WRITE_LABELS = (re.compile(r"^Proceed$"), re.compile(r"^Reject & propose changes$"),
+                       re.compile(r"^Add Write\(.+\) to allowlist\?$"), re.compile(r"^Run Everything$"))
+CURSOR_SWITCH_LABELS = (re.compile(r"^Approve mode switch$"), re.compile(r"^Reject$"))
+CURSOR_WRITE_IN_RE = re.compile(r"^in (\S.*)$")
+CURSOR_PLAN_Q = "Ready to build?"
+CURSOR_PLAN_HEAD = "Suggested Plan"
+CURSOR_PLAN_ROW_RE = re.compile(r"^(→\s+)?([1-9])\.\s+(\S.*?) \(([^()]+)\)$")
+CURSOR_PLAN_SAVED_RE = re.compile(r"^Saved to (\S.*)$")
+CURSOR_PLAN_REVISE = "No, propose changes"
+CURSOR_TRUST_HEAD = "⚠ Workspace Trust Required"
+CURSOR_TRUST_Q = "Do you trust the contents of this directory?"
+CURSOR_TRUST_ROW_RE = re.compile(r"^(▶\s+)?\[([a-z])\] (\S.*)$")
+CURSOR_TRUST_HINT = "Use arrow keys to navigate, Enter to select, or press the key shown"
+CURSOR_TRUST_MSG_RE = re.compile(r"^approve Workspace Trust Required$")  # 신뢰 카드의 막힘 msg(_card_status)
+# 작업 중: 입력줄 오른쪽 "ctrl+c to stop", 또는 그 위 스피너 줄 "⠀⠞ Working"
+CURSOR_BUSY_RE = re.compile(r"ctrl\+c to stop$|^\s*[⠀-⣿]+\s+Working\b")
+# 카드를 못 읽어도 막힘: 거절 뒤 "대신 할 말"·계획 수정 입력칸, 모드 전환·신뢰 힌트, 메뉴 줄의 거절·Run Everything 키
+CURSOR_DIALOG_RE = re.compile(
+    r"→ Tell the agent what to do instead \(|→ Describe how to revise the plan \("
+    r"|auto-rejects when the bar runs out|Use arrow keys to navigate, Enter to select, or press the key shown"
+    r"|\((?:esc or n(?: or p)?|n or esc|p or Esc|shift\+tab)\)")
+
+
+def _cursor_key(spec):
+    """괄호 안 키 설명("y", "tab", "esc or n", "n or esc") → 보낼 키 하나(글자 우선). 모르면 None."""
+    toks = [t.strip() for t in spec.split(" or ")]
+    for t in toks:
+        if len(t) == 1 and t.isalpha():
+            return t.lower()
+    return "tab" if toks == ["tab"] else None
+
+
+def _cursor_body_above(lines, qi):
+    """질문 줄 위, 가장 가까운 가로줄 아래의 줄들(명령·파일 미리보기)과 그 가로줄 index."""
+    for r in range(qi - 1, max(-1, qi - 80), -1):
+        if SOLID_RULE_RE.match(lines[r].strip()):
+            return lines[r + 1:qi], r
+    return None, -1
+
+
+def _parse_cursor_approval(lines):
+    nz = [i for i, ln in enumerate(lines) if ln.strip()]
+    if nz and lines[nz[-1]].strip() in CURSOR_MENU_HINTS:
+        nz = nz[:-1]
+    rows = []
+    for i in reversed(nz):
+        m = CURSOR_ROW_RE.match(lines[i].strip())
+        if not m:
+            break
+        rows.insert(0, (i, m))
+    if len(rows) < 2 or rows[-1][0] - rows[0][0] != len(rows) - 1:
+        return None
+    first = rows[0][0]
+    qi = next((j for j in range(first - 1, max(-1, first - 6), -1)
+               if lines[j].strip() in (CURSOR_SHELL_Q, CURSOR_WRITE_Q) or CURSOR_SWITCH_Q_RE.match(lines[j].strip())),
+              -1)
+    if qi < 0 or any(not lines[j].strip() for j in range(qi + 1, first)):
+        return None
+    question = lines[qi].strip()
+    info = [lines[j].strip() for j in range(qi + 1, first)]
+    labels = [_norm(m.group(2)) for _, m in rows]
+    keys = [_cursor_key(m.group(3)) for _, m in rows]
+    want = CURSOR_SHELL_LABELS if question == CURSOR_SHELL_Q else \
+        CURSOR_WRITE_LABELS if question == CURSOR_WRITE_Q else CURSOR_SWITCH_LABELS
+    if len(labels) != len(want) or any(not rx.match(lb) for rx, lb in zip(want, labels)):
+        return None  # 캡처하지 않은 모양(항목이 다르다)
+    keep = [k for k, lb in enumerate(labels) if lb != CURSOR_RUN_EVERYTHING]
+    if any(keys[k] is None for k in keep):
+        return None
+    selected = next((n for n, k in enumerate(keep) if rows[k][1].group(1)), None)
+    opts = [(labels[k], None, None) for k in keep]
+    okeys = [keys[k] for k in keep]
+    if question == CURSOR_SHELL_Q:
+        above, _ = _cursor_body_above(lines, qi)
+        cmd = _dedent_block(above or [])
+        if not cmd or not cmd.startswith("$"):
+            return None
+        body = re.sub(r"^\$\s+", "", cmd) + ("\n\n" + "\n".join(info) if info else "")
+        # 거절 줄은 입력 항목: 고르면 "대신 할 말" 입력칸이 열린다(직접 입력). 거절 버튼은 reject_keys
+        p = _finish("approval", "Shell", question, body, opts, selected=selected, free_text_index=2, persist_index=1)
+    elif question == CURSOR_WRITE_Q:
+        m = CURSOR_WRITE_IN_RE.match(info[0]) if len(info) == 1 else None
+        if not m:
+            return None
+        above, rule = _cursor_body_above(lines, qi)
+        pv = _dedent_block(above or [])
+        body = m.group(1) + ("\n\n" + pv if pv and rule >= 0 else "")
+        p = _finish("approval", "Write", question, body[:MAX_PROMPT_BODY], opts, selected=selected,
+                    free_text_index=1, persist_index=2)
+    else:
+        # 모드 전환(SwitchMode 도구): 줄어드는 바가 다 되면 자동 거절. y 승인, n 거절
+        p = _finish("approval", "SwitchMode", question, " ".join(info) or question, opts, selected=selected,
+                    reject_index=1)
+    p["approve_index"] = 0
+    p["option_keys"] = okeys
+    return p
+
+
+def _cursor_box(lines, bottom, side):
+    """화면 맨 아래 박스(맨 끝 줄이 bottom 글자로 시작)의 안쪽 줄들. 맨 위 테두리가 화면 밖이면 보이는 데까지."""
+    nz = [i for i, ln in enumerate(lines) if ln.strip()]
+    if not nz or not lines[nz[-1]].strip().startswith(bottom):
+        return None
+    inner = []
+    i = nz[-1] - 1
+    while i >= 0 and lines[i].strip().startswith(side):
+        s = lines[i].strip()[1:]
+        inner.append((s[:-1] if s.endswith(side) else s).rstrip())
+        i -= 1
+    inner.reverse()
+    return inner or None
+
+
+def _parse_cursor_plan(lines):
+    inner = _cursor_box(lines, "└", "│")
+    if not inner:
+        return None
+    nz = [k for k, s in enumerate(inner) if s.strip()]
+    qi = next((k for k in nz if inner[k].strip() == CURSOR_PLAN_Q), -1)
+    if qi < 0:
+        return None
+    rows = [CURSOR_PLAN_ROW_RE.match(inner[k].strip()) for k in nz if k > qi]
+    if not rows or any(m is None for m in rows) or [int(m.group(2)) for m in rows] != list(range(1, len(rows) + 1)):
+        return None
+    labels = [_norm(m.group(3)) for m in rows]
+    if labels[-1] != CURSOR_PLAN_REVISE or not all(lb.startswith("Yes, ") for lb in labels[:-1]):
+        return None
+    before = [k for k in nz if k < qi]
+    if len(before) < 2 or not SOLID_RULE_RE.match(inner[before[-1]].strip()):
+        return None
+    saved = CURSOR_PLAN_SAVED_RE.match(inner[before[-2]].strip())
+    if not saved:
+        return None
+    head = next((k for k in nz if inner[k].strip() == CURSOR_PLAN_HEAD), -1)
+    body = _dedent_block([s for s in inner[head + 1:before[-2]] if not SOLID_RULE_RE.match(s.strip())])
+    if not body:
+        return None
+    # 숫자 키가 그 항목을 바로 제출한다(실측). 3은 "어떻게 고칠지" 입력칸을 연다(직접 입력)
+    return _finish("plan", saved.group(1).rsplit("/", 1)[-1], CURSOR_PLAN_Q, body[:MAX_PROMPT_BODY],
+                   [(lb, None, int(m.group(2))) for lb, m in zip(labels, rows)],
+                   selected=next((k for k, m in enumerate(rows) if m.group(1)), None),
+                   free_text_index=len(rows) - 1)
+
+
+def _parse_cursor_trust(lines):
+    inner = _cursor_box(lines, "╰", "│")
+    if not inner:
+        return None
+    nz = [inner[k].strip() for k, s in enumerate(inner) if s.strip()]
+    if len(nz) < 6 or nz[0] != CURSOR_TRUST_HEAD or nz[-1] != CURSOR_TRUST_HINT:
+        return None
+    r1, r2 = (CURSOR_TRUST_ROW_RE.match(s) for s in nz[-3:-1])
+    if not r1 or not r2 or (r1.group(2), r1.group(3), r2.group(2), r2.group(3)) != (
+            "a", "Trust this workspace", "q", "Quit"):
+        return None
+    if CURSOR_TRUST_Q not in nz:
+        return None
+    path = nz[nz.index(CURSOR_TRUST_Q) + 1:-3]
+    if len(path) != 1:
+        return None
+    p = _finish("approval", CURSOR_TRUST_HEAD[2:], CURSOR_TRUST_Q, path[0],
+                [("Trust this workspace", None, None), ("Quit", None, None)],
+                selected=0 if r1.group(1) else 1 if r2.group(1) else None, reject_index=1)
+    # 신뢰는 ~/.cursor/projects/<폴더>/.workspace-trusted에 저장되지만 이 화면의 기본 답이다. q는 cursor-agent를 끝낸다
+    p["approve_index"] = 0
+    p["option_keys"] = ["a", "q"]
+    return p
+
+
+def _parse_cursor_lines(lines, plan_reader=None):
+    p = _parse_cursor_approval(lines) or _parse_cursor_plan(lines) or _parse_cursor_trust(lines)
+    if p:
+        p["agent"] = "cursor"
+    return p
+
+
+def _pick_cursor(p, option_index):
+    """승인·신뢰 항목은 괄호 안 글자 키(바로 고른다). 계획은 기본(숫자 키 = 고르고 제출)."""
+    keys = p.get("option_keys")
+    if p["kind"] != "approval" or not keys or not keys[option_index]:
+        return None
+    return [("keys", [keys[option_index]])]
+
+
+def _reject_keys_cursor(p):
+    """reject_index가 없는 카드의 거절: 승인은 거절 줄 키(n) → 빈 "대신 할 말" 칸에 enter(그냥 거절, 실측).
+    계획은 글 없는 거절이 없다(3 → 빈 칸 enter는 아무 일도 없고 esc는 메뉴로 돌아온다, 실측): 앱에서 수정 글로."""
+    fi = p.get("free_text_index")
+    if p["kind"] != "approval" or fi is None:
+        raise ApiError(409, "needs_manual", prompt=p)
+    return [p["option_keys"][fi], "enter"]
+
+
+def _free_text_cursor(p, num, text):
+    """승인 거절 메모: 거절 줄 키(n)로 "대신 할 말" 입력칸을 연 뒤 붙여넣기+enter(모델이 "Rejected: <글>"로 받는다, 실측).
+    계획 수정: 3 → 붙여넣기+enter(실측)."""
+    if p["kind"] == "approval":
+        return [("keys", [p["option_keys"][p["free_text_index"]]]), ("text", text)]
+    return _free_text_digit(p, num, text)
+
+
+def _cursor_status_approve(p):
+    """카드 없이(prompt_id 없이) 승인: 지금 화면 카드의 승인 키. 카드를 못 읽으면 None(앱에서 직접)."""
+    if not p or p["kind"] != "approval" or p.get("approve_index") is None:
+        return None
+    return [p["option_keys"][p["approve_index"]]]
+
+
+def _cursor_status_reject(p):
+    if not p or p["kind"] != "approval":
+        return None
+    if p.get("reject_index") is not None:
+        return [s for _, v in answer_steps(p, option_index=p["reject_index"]) for s in v]
+    try:
+        return _reject_keys_cursor(p)
+    except ApiError:
+        return None
+
+
 def _parse_codex_lines(lines, plan_reader=None):
     return _parse_codex_approval(lines) or _parse_codex_question(lines) or _parse_codex_plan(lines)
 
@@ -3320,6 +3572,276 @@ def find_grok_transcript(info, home, runner=None):
             if best is None or mt > best[0]:
                 best = (mt, hit)
     return best[1] if best else (None, None)
+
+
+# Cursor 기록(실측 2026.11.19): ~/.cursor/chats/<md5(cwd)>/<chatId>/store.db(SQLite, WAL, 세션 동안 열어 둔다).
+# blobs(id = 내용 sha256 hex, data), meta(key '0' = hex로 적은 JSON {latestRootBlobId, name, mode, …}).
+# root blob(protobuf)의 field 1 반복이 메시지 blob id(32바이트) 순서 목록이고 메시지 blob은 AI SDK 모양 JSON
+# (role system/user/assistant/tool, content: text·reasoning·tool-call·tool-result). 읽기 전용으로만 연다.
+# 같은 대화의 agent-transcripts/<id>.jsonl은 도구 결과·거절이 없어 쓰지 않는다.
+CURSOR_CHAT_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+CURSOR_MAX_MESSAGES = 1000
+CURSOR_PREVIEW_MESSAGES = 40
+CURSOR_USER_QUERY_RE = re.compile(r"<user_query>\n?(.*?)\n?</user_query>", re.S)
+_cursor_preview_cache = {}  # (db 경로, 대화) → ((db·wal 크기·시각), 미리보기)
+
+
+def cursor_dir(home):
+    return os.path.join(home, ".cursor")
+
+
+def _cursor_chat_dirs(base, cwd):
+    out = []
+    for c in dict.fromkeys((cwd, os.path.realpath(cwd))):
+        out.append(os.path.join(base, "chats", hashlib.md5(c.encode("utf-8")).hexdigest()))
+    return out
+
+
+def _cursor_store(d):
+    """대화 폴더 → (chatId, store.db 경로) 또는 None."""
+    cid = os.path.basename(d)
+    path = os.path.join(d, "store.db")
+    if not CURSOR_CHAT_RE.match(cid):
+        return None
+    try:
+        if not stat.S_ISREG(os.stat(path, follow_symlinks=False).st_mode):
+            return None
+    except OSError:
+        return None
+    return cid, path
+
+
+def _lsof_cursor(pid, base, runner):
+    exe = next((p for p in ("/usr/sbin/lsof", "/usr/bin/lsof") if os.path.exists(p)), None)
+    if not exe:
+        return None
+    try:
+        r = runner([exe, "-a", "-p", str(int(pid)), "-Fn"], capture_output=True, text=True,
+                   timeout=HC_TIMEOUT, shell=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    root = os.path.realpath(os.path.join(base, "chats"))
+    for ln in (r.stdout or "").splitlines():
+        if not ln.startswith("n") or os.path.basename(ln[1:]) != "store.db":
+            continue
+        d = os.path.dirname(ln[1:])
+        if os.path.realpath(os.path.dirname(os.path.dirname(d))) != root:
+            continue
+        hit = _cursor_store(d)
+        if hit:
+            return hit
+    return None
+
+
+def _mtime_with_wal(path):
+    best = None
+    for f in (path, path + "-wal"):
+        try:
+            mt = os.stat(f, follow_symlinks=False).st_mtime
+        except OSError:
+            continue
+        best = mt if best is None else max(best, mt)
+    return best
+
+
+def find_cursor_transcript(info, home, runner=None):
+    """Cursor 터미널 → (chatId, store.db 경로). 지금 대화는 cursor-agent가 열어 둔 store.db(lsof)로,
+    못 보면 그 폴더(md5(cwd)) 대화 중 가장 최근에 바뀐 것."""
+    info = info or {}
+    runner = runner or subprocess.run
+    base = cursor_dir(home)
+    fg = info.get("foreground")
+    pids = [v for v in (info.get("pid"), fg.get("pid") if isinstance(fg, dict) else None)
+            if isinstance(v, int) and not isinstance(v, bool) and v > 0]
+    if not IS_WINDOWS:
+        for pid in dict.fromkeys(pids):
+            hit = _lsof_cursor(pid, base, runner)
+            if hit:
+                return hit
+    cwd = live_cwd(info)
+    if not cwd:
+        return None, None
+    best = None
+    for cd in _cursor_chat_dirs(base, cwd):
+        try:
+            names = os.listdir(cd)
+        except OSError:
+            continue
+        for name in names:
+            hit = _cursor_store(os.path.join(cd, name))
+            mt = _mtime_with_wal(hit[1]) if hit else None
+            if mt is not None and (best is None or mt > best[0]):
+                best = (mt, hit)
+    return best[1] if best else (None, None)
+
+
+def _pb_fields(buf):
+    """protobuf 메시지를 얕게 훑는다: [(field, wire type, 값)]. 깨졌으면 거기까지."""
+    out = []
+    i, n = 0, len(buf)
+
+    def varint(i):
+        v = shift = 0
+        while i < n:
+            b = buf[i]
+            i += 1
+            v |= (b & 0x7F) << shift
+            if not b & 0x80:
+                return v, i
+            shift += 7
+            if shift > 63:
+                break
+        raise ValueError("varint")
+    try:
+        while i < n:
+            key, i = varint(i)
+            field, wt = key >> 3, key & 7
+            if wt == 0:
+                v, i = varint(i)
+            elif wt == 1:
+                v, i = buf[i:i + 8], i + 8
+            elif wt == 2:
+                ln, i = varint(i)
+                if i + ln > n:
+                    break
+                v, i = buf[i:i + ln], i + ln
+            elif wt == 5:
+                v, i = buf[i:i + 4], i + 4
+            else:
+                break
+            out.append((field, wt, v))
+    except ValueError:
+        pass
+    return out
+
+
+def _cursor_user_text(content):
+    """사용자 메시지에서 <user_query> 안 글만(시스템이 넣은 user_info·system_reminder·첨부는 숨김)."""
+    if isinstance(content, str):
+        raw = content
+    elif isinstance(content, list):
+        raw = "\n".join(c.get("text") for c in content
+                        if isinstance(c, dict) and c.get("type") == "text" and isinstance(c.get("text"), str))
+    else:
+        return None
+    qs = [q.strip() for q in CURSOR_USER_QUERY_RE.findall(raw) if q.strip()]
+    return "\n\n".join(qs) or None
+
+
+def _parse_cursor_messages(msgs, limit):
+    """AI SDK 모양 메시지 목록 → (turns, 잘렸는지). 도구 결과(role tool)는 같은 toolCallId 호출에 붙인다.
+    거절은 결과 "Rejected: <사용자 글>"과 highLevelToolCallResult.output.rejected(실측)."""
+    turns = []
+    calls = {}
+    for m in msgs:
+        if not isinstance(m, dict):
+            continue
+        role, content = m.get("role"), m.get("content")
+        if role == "user":
+            text = _cursor_user_text(content)
+            if text:
+                turns.append({"role": "user", "parts": [{"kind": "text", "text": _cap(text)}]})
+        elif role == "assistant" and isinstance(content, list):
+            out = []
+            for c in content:
+                if not isinstance(c, dict):
+                    continue
+                typ = c.get("type")
+                if typ in ("text", "reasoning") and isinstance(c.get("text"), str) and c["text"].strip():
+                    out.append({"kind": "text" if typ == "text" else "thinking", "text": _cap(c["text"])})
+                elif typ == "tool-call":
+                    name = c.get("toolName") if isinstance(c.get("toolName"), str) else "?"
+                    args = c.get("args") if isinstance(c.get("args"), dict) else {}
+                    if name == "CallDynamicTool" and isinstance(args.get("toolName"), str):
+                        name = args["toolName"]  # TodoWrite·SwitchMode 등은 CallDynamicTool로 불린다
+                        args = args.get("arguments") if isinstance(args.get("arguments"), dict) else {}
+                    part = {"kind": "tool", "name": name, "summary": _tool_summary(name, args),
+                            "input": _cap_obj(args), "output": None, "state": "pending"}
+                    if isinstance(c.get("toolCallId"), str):
+                        calls[c["toolCallId"]] = part
+                    out.append(part)
+            _codex_add(turns, "assistant", out)
+        elif role == "tool" and isinstance(content, list):
+            hl = ((m.get("providerOptions") or {}).get("cursor") or {}).get("highLevelToolCallResult") \
+                if isinstance(m.get("providerOptions"), dict) else None
+            hl = hl if isinstance(hl, dict) else {}
+            outp = hl.get("output") if isinstance(hl.get("output"), dict) else {}
+            bad = bool(hl.get("isError")) or "rejected" in outp or "error" in outp
+            for c in content:
+                if not isinstance(c, dict) or c.get("type") != "tool-result":
+                    continue
+                part = calls.get(c.get("toolCallId"))
+                if part is None:
+                    continue
+                res = c.get("result")
+                if not isinstance(res, str):
+                    res = json.dumps(res, ensure_ascii=False) if res is not None else None
+                part["output"] = _cap(_strip_ansi(res)) if res is not None else None
+                part["state"] = "error" if bad or (res or "").startswith("Rejected") else "ok"
+    cut = len(turns) > limit
+    return turns[-limit:] if limit else turns, cut
+
+
+def read_cursor_transcript(path, sid, limit=50, max_messages=CURSOR_MAX_MESSAGES):
+    if not isinstance(sid, str) or not CURSOR_CHAT_RE.match(sid):
+        return [], False
+    rows = _opencode_query(path, "SELECT value FROM meta WHERE key = '0'")
+    try:
+        raw = rows[0][0]
+        raw = raw.decode("ascii") if isinstance(raw, bytes) else raw
+        meta = json.loads(bytes.fromhex(raw).decode("utf-8"))
+        root_id = meta["latestRootBlobId"]
+        if not isinstance(root_id, str) or not re.match(r"^[0-9a-fA-F]{64}$", root_id):
+            return [], False
+    except (TypeError, IndexError, ValueError, KeyError, AttributeError):
+        return [], False
+    rows = _opencode_query(path, "SELECT data FROM blobs WHERE id = ?", (root_id,))
+    if not rows or not isinstance(rows[0][0], (bytes, bytearray)):
+        return [], False
+    ids = [bytes(v).hex() for f, wt, v in _pb_fields(bytes(rows[0][0])) if f == 1 and wt == 2 and len(v) == 32]
+    more = len(ids) > max_messages
+    ids = ids[-max_messages:]
+    data = {}
+    uniq = list(dict.fromkeys(ids))
+    for k in range(0, len(uniq), 500):
+        chunk = uniq[k:k + 500]
+        for bid, blob in _opencode_query(path, "SELECT id, data FROM blobs WHERE id IN (%s)"
+                                         % ",".join("?" * len(chunk)), chunk) or []:
+            data[bid] = blob
+    msgs = []
+    for bid in ids:
+        blob = data.get(bid)
+        try:
+            msgs.append(json.loads(bytes(blob).decode("utf-8") if isinstance(blob, (bytes, bytearray)) else blob))
+        except (TypeError, ValueError, UnicodeDecodeError):
+            continue
+    turns, cut = _parse_cursor_messages(msgs, limit)
+    return turns, cut or more
+
+
+def cursor_preview(path, sid):
+    """목록 미리보기: 최근 메시지 몇 개만 읽어 마지막 assistant 글. db·wal이 안 바뀌었으면 기억한 값."""
+    key = []
+    for f in (path, path + "-wal"):
+        try:
+            st_ = os.stat(f, follow_symlinks=False)
+            key.append((st_.st_mtime_ns, st_.st_size))
+        except OSError:
+            key.append(None)
+    hit = _cursor_preview_cache.get((path, sid))
+    if hit and hit[0] == key:
+        return hit[1]
+    turns, _ = read_cursor_transcript(path, sid, 0, max_messages=CURSOR_PREVIEW_MESSAGES)
+    pv = None
+    for turn in reversed(turns):
+        texts = [p["text"] for p in turn["parts"] if p.get("kind") == "text"] if turn["role"] == "assistant" else []
+        if texts:
+            pv = preview_clean(texts[-1])
+            break
+    if len(_cursor_preview_cache) > 200:
+        _cursor_preview_cache.clear()
+    _cursor_preview_cache[(path, sid)] = (key, pv)
+    return pv
 
 
 def find_agent_transcript(info, home, runner=None):
@@ -5097,11 +5619,15 @@ QWEN_PUSH_PROMPT_WAIT = 1.0
 #   send_guard             화면으로 판정한 막힘이면 메시지 보내기를 409로 막는다(hc는 그 상자를 몰라 글자가 들어간다)
 #   title_blocked/title_working  "full"에서 터미널 제목으로 막힘·작업 중을 아는 정규식(없으면 None)
 #   busy_re                "full"에서 제목이 없을 때 화면 끝 줄로 작업 중을 아는 정규식(없으면 None)
+#   done_settle            (선택) "full"에서 막힘 뒤 바로 끝남으로 보일 때 SCREEN_SETTLE 뒤 한 번 더 본다(답 직후 작업 표시 전 장면)
+#   idle_after_re          (선택) "full"에서 이 msg의 막힘(시작 화면) 뒤에는 끝남이 아니라 idle
 #   dialog_re              "full"에서 카드를 못 읽어도 화면 끝 줄이 이 힌트면 막힘(제목으로 막힘을 모르는 에이전트, 없으면 None)
 #   pick(p, i)             (선택) 그 항목을 고르는 키 단계. None을 주면 숫자·커서 이동 기본 방식
 #   reject_keys(p)         (선택) reject_index가 없는 카드의 거절 키(기본 esc)
-#   approve_keys           (선택) 카드 없이(prompt_id 없이) 승인할 때 "1" 대신 보낼 키
-#   reject_status_keys     (선택) 카드 없이 거절할 때 esc 대신 보낼 키. None이면 거절을 앱에서 직접(409 needs_manual)
+#   approve_keys           (선택) 카드 없이(prompt_id 없이) 승인할 때 "1" 대신 보낼 키. 함수면 지금 화면 카드(또는 None)로
+#                          키를 정한다(None이면 409 needs_manual)
+#   reject_status_keys     (선택) 카드 없이 거절할 때 esc 대신 보낼 키. None이면 거절을 앱에서 직접(409 needs_manual).
+#                          함수면 approve_keys처럼 지금 화면 카드로 정한다
 #   read(path, sid, n)     (선택) 기록이 jsonl이 아닐 때 (turns, 잘렸는지). preview(path, sid)는 목록 미리보기
 AGENTS = {
     "claude": {"match": is_claude, "parse": _parse_claude_lines, "free_text": _free_text_digit,
@@ -5150,8 +5676,20 @@ AGENTS = {
              "transcript": lambda info, home, runner=None: find_grok_transcript(info, home, runner=runner),
              "push_wait": lambda: PUSH_PROMPT_BUDGET, "retry": False, "screen": None,
              "pick": _pick_grok, "reject_keys": _reject_keys_grok, "reject_status_keys": None, "send_guard": True},
+    # Cursor Agent는 OSC 7501을 안 보내고 제목도 AI가 붙인 대화 제목으로 고정이다(실측 2026.11.19): 막힘은 화면 메뉴,
+    # 작업 중은 입력줄 "ctrl+c to stop"·"Working" 줄로만 안다. 승인 메뉴는 글자 키라 카드 없는 답도 지금 화면 카드의
+    # 키로 보낸다(esc는 거절이 아니라 "대신 할 말" 입력칸을 연다). 기록은 SQLite(store.db).
+    "cursor": {"match": is_cursor, "parse": _parse_cursor_lines, "free_text": _free_text_cursor,
+               "transcript": lambda info, home, runner=None: find_cursor_transcript(info, home, runner=runner),
+               "read": lambda path, sid, n: read_cursor_transcript(path, sid, n),
+               "preview": lambda path, sid: cursor_preview(path, sid),
+               "push_wait": lambda: PUSH_PROMPT_BUDGET, "retry": False, "screen": "full",
+               "title_blocked": None, "title_working": None, "busy_re": CURSOR_BUSY_RE,
+               "dialog_re": CURSOR_DIALOG_RE, "pick": _pick_cursor, "reject_keys": _reject_keys_cursor,
+               "approve_keys": _cursor_status_approve, "reject_status_keys": _cursor_status_reject,
+               "done_settle": True, "idle_after_re": CURSOR_TRUST_MSG_RE, "send_guard": True},
 }
-AGENT_ORDER = ("claude", "codex", "gemini", "copilot", "qwen", "opencode", "grok")
+AGENT_ORDER = ("claude", "codex", "gemini", "copilot", "qwen", "opencode", "grok", "cursor")
 SCREEN_POLL_INTERVAL = 3.0  # "full" 에이전트 화면 판정 주기(초). 제목 이벤트가 먼저 오면 그때 바로 본다
 SCREEN_SETTLE = 0.6  # 제목은 막힘인데 메뉴를 못 읽었을 때 다시 볼 때까지(초)
 PROMPT_STATUS_KINDS = {"approval": "permission", "confirm": "permission", "question": "question", "plan": "plan"}
@@ -5311,7 +5849,13 @@ class App:
                 busy = any(spec["busy_re"].search(ln) for ln in tail)
             if busy:
                 st = {"app": kind, "state": "working"}
+            elif prev == "blocked" and spec.get("idle_after_re") \
+                    and spec["idle_after_re"].search(prev_st.get("msg") or ""):
+                st = {"app": kind, "state": "idle"}  # 시작 화면(폴더 신뢰)에 답한 뒤: 끝난 작업이 없다
             elif prev in ("working", "blocked", "done"):
+                if prev == "blocked" and spec.get("done_settle") and commit and not settle:
+                    # 답 직후 작업 표시가 그려지기 전 한 장면(실측 Cursor): 알림 판정만 잠깐 뒤 한 번 더 보고 끝남으로
+                    return None
                 st = {"app": kind, "state": "done"}
             else:
                 st = {"app": kind, "state": "idle"}
@@ -5896,11 +6440,18 @@ class App:
             spec = agent_spec(agent_kind(info))
             if action == "reject" and "reject_status_keys" in spec:
                 keys = spec["reject_status_keys"]  # esc가 거절이 아닌 에이전트(Grok: 포커스만 옮긴다)
+                if callable(keys):
+                    keys = keys(self.current_prompt(tid, info))  # 글자 키 메뉴(Cursor): 지금 화면 카드의 거절 키
                 if not keys:
                     raise ApiError(409, "needs_manual", msg=status_of(self.effective_info(tid, info)).get("msg"))
                 keys = list(keys)
             if keys == ["1"]:
-                keys = list(agent_spec(agent_kind(info)).get("approve_keys") or keys)  # 숫자 키를 무시하는 승인 메뉴
+                ak = agent_spec(agent_kind(info)).get("approve_keys")
+                if callable(ak):
+                    ak = ak(self.current_prompt(tid, info))  # 글자 키 메뉴(Cursor): 지금 화면 카드의 승인 키
+                    if not ak:
+                        raise ApiError(409, "needs_manual", msg=status_of(self.effective_info(tid, info)).get("msg"))
+                keys = list(ak or keys)  # 숫자 키를 무시하는 승인 메뉴
             self._keys(tid, keys)
         log.info("answer %s %s", tid, action)
         return {"ok": True, "keys": keys}
