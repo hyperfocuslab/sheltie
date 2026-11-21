@@ -1223,7 +1223,13 @@ def _parse_gemini_lines(lines, plan_reader=None):
 # 바로 고르고 제출한다. "No, and tell Copilot…"·"Suggest changes"는 입력 항목이라 숫자는 커서만 옮기고 글자를 치면
 # 라벨이 입력값으로 바뀐다(빈 enter는 무시): 숫자 → 붙여넣기+enter. esc는 거절과 함께 턴 전체를 멈춘다.
 # ask_user 질문은 가로줄 두 개 사이 대화 상자이고 번호가 없다(숫자 키 무시): ↑/↓ + enter. "Other"로 커서를 옮기면
-# 상자 아래 입력 칸이 열린다. 여러 칸 폼(탭)·복수 선택은 카드 없음.
+# 상자 아래 입력 칸이 열린다.
+# 여러 칸 폼은 메시지 아래 탭 막대(`  Language   Features   Project name   Public repo?`, 지금 탭·답한 탭 표시는 글자로
+# 안 보인다)가 있고 칸 제목으로 지금 탭을 안다. 카드는 지금 칸 하나. 키(실측 1.0.114): enter가 그 칸을 확정하고 다음
+# 탭(마지막 탭이면 폼 전체 제출). 단일 선택은 ↑/↓ + enter, 답한 항목은 커서가 없을 때 `✓ TypeScript`. 복수 선택
+# (`❯ • lint`, 체크 `✓ ci`)은 ↑/↓ + space 토글 후 enter(안 골라도 넘어가고, 질문 하나면 빈 답으로 제출된다).
+# 복수 선택의 "Other"는 커서가 오면 입력 칸이 열리고 space가 글자로 들어가 카드에서 뺀다. 글 입력 칸은 붙여넣기+enter
+# (빈 enter도 다음 탭). PC에서 글을 넣었거나(`❯ demo`, `Other: Rust`) 복수 선택 커서가 Other에 있으면 카드 없음.
 COPILOT_HINT_RE = re.compile(r"^↑/↓ to navigate · enter to select(?: · ctrl\+e to show full plan)? · esc to cancel$")
 COPILOT_APPROVAL_Q_RE = re.compile(r"^Do you (?:want to .+|trust the files in this folder)\?$")
 COPILOT_ESC_SUFFIX_RE = re.compile(r"\s*\(Esc(?: to stop)?\)$")
@@ -1234,11 +1240,13 @@ COPILOT_PLAN_TITLE = "Plan Ready for Review"
 COPILOT_PLAN_FREE = "Suggest changes"
 COPILOT_AUTOPILOT_TITLE = "Enable autopilot mode"
 COPILOT_Q_HEAD = "Copilot needs information."
-COPILOT_Q_HINT_RE = re.compile(r"^(?:↑/↓ select · )?enter accept · ctrl\+d decline · esc cancel$")
+COPILOT_Q_HINT_RE = re.compile(r"^(↑/↓ select · )?(space toggle · )?enter accept · (tab next · )?(shift\+tab prev · )?"
+                               r"ctrl\+d decline · esc cancel$")
 COPILOT_OTHER = "Other (type your answer)"
 COPILOT_OTHER_RE = re.compile(r"^Other \(type your answer(?: below)?\)$")
 COPILOT_OTHER_INPUT = "┃ Type your answer..."
-COPILOT_CHOICE_RE = re.compile(r"^(\s*)(❯| ) (\S.*)$")
+COPILOT_CHOICE_RE = re.compile(r"^(\s*?)(❯|✓| ) (\S.*)$")  # ✓: 여러 칸 폼에서 답한 단일 선택 항목(커서가 없을 때)
+COPILOT_MULTI_ROW_RE = re.compile(r"^([•✓]) (\S.*)$")
 
 
 def _copilot_box(lines):
@@ -1327,24 +1335,48 @@ def _copilot_question_dialog(lines):
     return lines[top + 1:bottom], other_open
 
 
+def _copilot_tab_bar(line):
+    """여러 칸 폼의 탭 막대(`  Language   Features   Project name`, 두 칸 들여쓰기·칸 사이 공백 여럿) → 라벨 목록 또는 None."""
+    if not line.startswith("  ") or line.startswith("   "):
+        return None
+    items = re.split(r"\s{2,}", line.strip())
+    return items if len(items) >= 2 and len(set(items)) == len(items) else None
+
+
 def _parse_copilot_question(lines):
     got = _copilot_question_dialog(lines)
     if got is None:
         return None
     inner, other_open = got
     idx = [i for i, ln in enumerate(inner) if ln.strip()]
-    if len(idx) < 4 or inner[idx[0]].strip() != COPILOT_Q_HEAD or not COPILOT_Q_HINT_RE.match(inner[idx[-1]].strip()):
+    if len(idx) < 4 or inner[idx[0]].strip() != COPILOT_Q_HEAD:
         return None
+    hint = COPILOT_Q_HINT_RE.match(inner[idx[-1]].strip())
+    if not hint:
+        return None
+    choice, multi, tab_next, tab_prev = (bool(hint.group(k)) for k in (1, 2, 3, 4))
     msg = []
     j = idx[0] + 1
     while j < len(inner) and inner[j].strip():
         msg.append(inner[j].strip())
         j += 1
+    # 여러 칸 폼: 메시지 아래 탭 막대(빈 줄 사이). 힌트의 tab next / shift+tab prev와 함께 있어야 한다
+    tab_labels = None
+    k = j
+    while k < idx[-1] and not inner[k].strip():
+        k += 1
+    if k < idx[-1] and k + 1 < len(inner) and not inner[k + 1].strip():
+        tab_labels = _copilot_tab_bar(inner[k])
+        if tab_labels is not None:
+            j = k + 1
+    if (tab_labels is not None) != (tab_next or tab_prev):
+        return None
     field = [ln for ln in inner[j:idx[-1]]]
     ms = [COPILOT_CHOICE_RE.match(ln) for ln in field]
     cur = [k for k, m in enumerate(ms) if m and m.group(2) == "❯"]
     text_in = [k for k, ln in enumerate(field) if ln.strip() == "❯"]
-    if len(cur) == 1 and not text_in:
+    checked = []
+    if choice and len(cur) == 1 and not text_in:
         col = len(ms[cur[0]].group(1))
         a = b = cur[0]
         while a > 0 and ms[a - 1] and len(ms[a - 1].group(1)) == col:
@@ -1352,12 +1384,25 @@ def _parse_copilot_question(lines):
         while b + 1 < len(field) and ms[b + 1] and len(ms[b + 1].group(1)) == col:
             b += 1
         labels = [m.group(3).strip() for m in ms[a:b + 1]]
-        if len(labels) < 2 or any(lb.startswith(("•", "✓")) for lb in labels):
-            return None  # 복수 선택
-        labels = [COPILOT_OTHER if COPILOT_OTHER_RE.match(lb) else lb for lb in labels]
-        free = labels.index(COPILOT_OTHER) if COPILOT_OTHER in labels else None
-        if other_open != (free is not None and cur[0] - a == free):
-            return None  # 입력 칸은 커서가 "Other"에 있을 때만 열린다
+        sel = cur[0] - a
+        if multi:
+            # 복수 선택 `❯ • lint` / `  ✓ ci`, 끝 줄은 "Other". 커서가 Other에 오면 입력 칸이 열려 카드 없음
+            rows = [COPILOT_MULTI_ROW_RE.match(lb) for lb in labels]
+            if not all(rows) or any(m.group(2) == "✓" for m in ms[a:b + 1]) or other_open \
+                    or rows[-1].group(1) != "•" or rows[-1].group(2) != COPILOT_OTHER or sel == len(rows) - 1:
+                return None
+            labels = [r.group(2) for r in rows[:-1]]
+            checked = [k for k, r in enumerate(rows[:-1]) if r.group(1) == "✓"]
+            free = None
+        else:
+            if any(lb.startswith(("•", "✓")) for lb in labels) or labels[-1].startswith("Other: "):
+                return None  # 모르는 줄 모양, PC에서 Other에 답을 넣었다
+            labels = [COPILOT_OTHER if COPILOT_OTHER_RE.match(lb) else lb for lb in labels]
+            free = labels.index(COPILOT_OTHER) if COPILOT_OTHER in labels else None
+            if other_open != (free is not None and sel == free):
+                return None  # 입력 칸은 커서가 "Other"에 있을 때만 열린다
+        if len(labels) < 2 - multi:
+            return None
         head = [ln.strip() for ln in field[:a] if ln.strip()]
         t = next((k for k in range(len(head) - 1, -1, -1) if head[k].endswith(":")), None)
         if t is None:
@@ -1365,8 +1410,7 @@ def _parse_copilot_question(lines):
         msg += head[:t]
         title, desc = head[t][:-1].strip(), _norm(" ".join(head[t + 1:])) or None
         opts = [(lb, None, None) for lb in labels]
-        sel = cur[0] - a
-    elif len(text_in) == 1 and not cur and not other_open:
+    elif not choice and not multi and len(text_in) == 1 and not cur and not other_open:
         k = text_in[0]
         if k < 1 or not field[k - 1].strip().startswith("▄") or k + 1 >= len(field) \
                 or not field[k + 1].strip().startswith("▀"):
@@ -1384,10 +1428,19 @@ def _parse_copilot_question(lines):
         opts, free, sel = [(title, None, None)], 0, None
     else:
         return None
+    if tab_labels is not None:
+        # 지금 탭은 칸 제목으로 안다. 첫 탭엔 shift+tab prev, 마지막 탭엔 tab next가 없다
+        if tab_labels.count(title) != 1:
+            return None
+        n = tab_labels.index(title)
+        if tab_prev != (n > 0) or tab_next != (n < len(tab_labels) - 1):
+            return None
     question = _norm(" ".join(msg))
     if not question:
         return None
-    p = _finish("question", title or None, question, desc, opts, selected=sel, free_text_index=free)
+    # 지금 탭이 아닌 칸에 답했는지는 화면 글자로 안 보여 tabs는 채우지 않는다(제목이 지금 칸)
+    p = _finish("question", title or None, question, desc, opts, selected=sel, multi=multi, checked=checked,
+                free_text_index=free)
     p["agent"] = "copilot"
     return p
 
@@ -1402,6 +1455,19 @@ def _pick_copilot(p, option_index):
     if p["kind"] == "approval" and option_index == p.get("reject_index") and o.get("number") is None:
         return [("keys", ["esc"])]
     return None
+
+
+def _multi_copilot(p, num, want):
+    """복수 선택: 숫자 키를 무시한다. ↑/↓로 항목마다 가서 space 토글, enter 확정(다음 탭, 마지막 탭·질문 하나면 제출).
+    안 골라도 enter가 넘어간다(실측 1.0.114). 커서가 Other에 가면 space가 글자로 들어가 Other는 건너뛴다(카드에 없다)."""
+    cur = p.get("selected")
+    if cur is None:
+        raise ApiError(409, "no_cursor")
+    keys = []
+    for i in sorted(want.symmetric_difference(set(p["checked"]))):
+        keys += nav_keys(cur, i) + ["space"]
+        cur = i
+    return [("keys", keys + ["enter"])]
 
 
 def _copilot_overlay_card(p):
@@ -6219,7 +6285,7 @@ AGENTS = {
     # Copilot은 OSC 7501로 승인(permission)·질문·계획(question) 막힘을 보낸다. 폴더 신뢰(idle)·autopilot 권한(working)
     # 상자만 hc가 모른다(실측 1.0.114). 질문 상자는 blocked 직후 조금 늦게 그려질 때가 있어 다시 읽는다.
     "copilot": {"match": _named("copilot"), "parse": _parse_copilot_lines, "free_text": _free_text_copilot,
-                "pick": _pick_copilot,
+                "pick": _pick_copilot, "multi": _multi_copilot,
                 "transcript": lambda info, home, runner=None: find_copilot_transcript(info, home, runner=runner),
                 "push_wait": lambda: COPILOT_PUSH_PROMPT_WAIT, "retry": True, "screen": "overlay",
                 "overlay": {"states": ("idle", "working", "done"), "card": _copilot_overlay_card,

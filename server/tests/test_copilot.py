@@ -125,8 +125,9 @@ class CopilotParseTests(unittest.TestCase):
         self.assertIsNone(p["free_text_index"])
 
     def test_unknown_screens_have_no_card(self):
-        # 여러 칸 폼(탭)·복수 선택, 3번에 PC에서 글자를 치는 중, 평소 화면
-        for name in ("question-multi", "question-multi-tab2", "edit-3-typed", "idle", "working", "hello"):
+        # 3번에 PC에서 글자를 치는 중, 폼 글 칸에 PC에서 글을 넣었다, 복수 선택 커서가 Other(입력 칸), 평소 화면
+        for name in ("edit-3-typed", "question-multi-text-filled", "question-multi-one-other", "idle", "working",
+                     "hello"):
             self.assertIsNone(card(name), name)
 
     def test_parsers_do_not_cross(self):
@@ -159,6 +160,85 @@ class CopilotParseTests(unittest.TestCase):
         self.assertEqual(hr.answer_steps(card("question-other"), text="CockroachDB"), [("text", "CockroachDB")])
         self.assertEqual(hr.answer_steps(card("question-text"), text="notes.md"), [("text", "notes.md")])
         self.assertEqual(hr.answer_steps(card("autopilot-perm"), option_index=2), [("keys", ["3"])])
+
+
+class CopilotMultiTests(unittest.TestCase):
+    """ask_user 여러 칸 폼(탭)·복수 선택. 실측 1.0.114: 숫자 키 무시, ↑/↓ + space 토글, enter = 그 칸 확정 + 다음 탭
+    (마지막 탭이면 제출), 글 칸은 붙여넣기+enter."""
+
+    def test_form_single_select_tab(self):
+        p = card("question-multi")
+        self.assertEqual((p["kind"], p["title"], p["question"], p["body"], p["multi_select"], p["tabs"]),
+                         ("question", "Language", "Project setup", None, False, None))
+        self.assertEqual(labels(p), ["Python", "TypeScript", "Other (type your answer)"])
+        self.assertEqual((p["selected"], p["free_text_index"], p["checked"]), (0, 2, []))
+        # 답한 뒤 돌아온 화면: 답한 항목은 커서가 없으면 `✓ TypeScript`
+        a = card("question-multi-answered")
+        self.assertEqual((labels(a), a["selected"], a["free_text_index"]), (labels(p), 0, 2))
+        last = card("question-multi-tab4")  # 마지막 탭(boolean): tab next 없음
+        self.assertEqual((last["title"], labels(last), last["free_text_index"]),
+                         ("Public repo?", ["Yes", "No", "Other (type your answer)"], 2))
+
+    def test_form_multi_select_tab(self):
+        p = card("question-multi-tab2")
+        self.assertEqual((p["title"], p["question"], p["body"], p["multi_select"]),
+                         ("Features", "Project setup", "Pick any", True))
+        self.assertEqual((labels(p), p["checked"], p["selected"], p["free_text_index"]),
+                         (["lint", "tests", "ci"], [], 0, None))  # 복수 선택의 Other는 카드에서 뺀다
+        c = card("question-multi-tab2-checked")
+        self.assertEqual((labels(c), c["checked"], c["selected"]), (["lint", "tests", "ci"], [0], 1))
+        self.assertEqual(c["id"], p["id"])  # 체크·커서는 id에 안 든다: 답 키는 답 직전 화면으로 다시 계산한다
+
+    def test_form_text_tab(self):
+        p = card("question-multi-tab3")
+        self.assertEqual((p["title"], p["question"], p["body"], labels(p), p["free_text_index"], p["selected"]),
+                         ("Project name", "Project setup", "Short name", ["Project name"], 0, None))
+
+    def test_single_field_multi_select(self):
+        p = card("question-multi-one")
+        self.assertEqual((p["title"], p["question"], p["multi_select"], labels(p), p["checked"], p["selected"]),
+                         ("Checks", "Which checks should run?", True, ["lint", "tests", "ci"], [], 0))
+        self.assertEqual(card("question-multi-one-checked")["checked"], [1])
+
+    def test_unknown_form_screens(self):
+        # PC에서 단일 선택 Other에 답을 넣었다(`✓ Other: Rust`)
+        txt = cp("question-multi-answered").replace("   Other (type your answer)", " ✓ Other: Rust            ")
+        self.assertIsNone(hr.parse_prompt(txt, agent="copilot"))
+        # 탭 막대와 힌트가 안 맞는다(첫 탭인데 shift+tab prev)
+        txt = cp("question-multi").replace("enter accept · tab next ·", "enter accept · tab next · shift+tab prev ·")
+        self.assertIsNone(hr.parse_prompt(txt, agent="copilot"))
+        # 칸 제목이 탭 라벨에 없다
+        self.assertIsNone(hr.parse_prompt(cp("question-multi").replace(" Language:", " Lang:    "), agent="copilot"))
+        # 탭 힌트는 있는데 탭 막대가 없다
+        txt = cp("question-multi-one").replace("enter accept · ctrl", "enter accept · tab next · ctrl")
+        self.assertIsNone(hr.parse_prompt(txt, agent="copilot"))
+        for name in ("question-multi", "question-multi-tab2", "question-multi-tab3", "question-multi-one"):
+            for agent in (None, "codex", "gemini", "qwen", "opencode", "grok"):
+                self.assertIsNone(hr.parse_prompt(cp(name), agent=agent), (name, agent))
+
+    def test_answer_steps(self):
+        # 단일 선택 탭: 커서 이동 + enter(다음 탭), Other는 커서 → 붙여넣기+enter
+        self.assertEqual(hr.answer_steps(card("question-multi"), option_index=1), [("keys", ["down", "enter"])])
+        self.assertEqual(hr.answer_steps(card("question-multi"), text="Rust"),
+                         [("keys", ["down", "down"]), ("text", "Rust")])
+        self.assertEqual(hr.answer_steps(card("question-multi-tab4"), option_index=1), [("keys", ["down", "enter"])])
+        # 복수 선택: 항목마다 ↑/↓ + space, enter
+        p = card("question-multi-tab2")
+        self.assertEqual(hr.answer_steps(p, option_indices=[0, 2]),
+                         [("keys", ["space", "down", "down", "space", "enter"])])
+        self.assertEqual(hr.answer_steps(p, option_indices=[]), [("keys", ["enter"])])  # 안 골라도 넘어간다
+        c = card("question-multi-tab2-checked")  # lint 체크, 커서 tests
+        self.assertEqual(hr.answer_steps(c, option_indices=[0, 2]), [("keys", ["down", "space", "enter"])])
+        self.assertEqual(hr.answer_steps(c, option_indices=[1]), [("keys", ["up", "space", "down", "space", "enter"])])
+        o = card("question-multi-one-checked")  # tests 체크, 커서 tests
+        self.assertEqual(hr.answer_steps(o, option_indices=[0]), [("keys", ["up", "space", "down", "space", "enter"])])
+        for bad in ({"text": "x"}, {"option_index": 0}, {"option_indices": [3]}):
+            with self.assertRaises(hr.ApiError):
+                hr.answer_steps(p, **bad)
+        # 글 칸: 붙여넣기+enter
+        self.assertEqual(hr.answer_steps(card("question-multi-tab3"), text="demo-x"), [("text", "demo-x")])
+        with self.assertRaises(hr.ApiError):
+            hr.answer_steps(card("question-multi"), option_indices=[0])
 
 
 class CopilotApiTests(unittest.TestCase):
@@ -229,8 +309,37 @@ class CopilotApiTests(unittest.TestCase):
         q = self.app.api_prompt("p1")["prompt"]
         self.app.api_prompt_answer("p1", {"prompt_id": q["id"], "text": "notes.md"})
         self.assertEqual(self.hc.send_calls[-1], ("p1", "notes.md", "force"))
-        self.hc.screens["p1"] = cp("question-multi")  # 여러 칸 폼: 막힘이지만 카드 없음
+        self.hc.screens["p1"] = cp("question-multi-text-filled")  # 폼 글 칸에 PC에서 글을 넣었다: 막힘이지만 카드 없음
         self.assertIsNone(self.app.api_prompt("p1")["prompt"])
+
+    def test_form_cards_answer_through_api(self):
+        self.set(QUESTION, cp("question-multi"))
+        self.assertEqual([(x["category"], x["kind"]) for x in self.pusher.payloads], [("HR_BLOCKED", "question")])
+        p = self.app.api_prompt("p1")["prompt"]
+        self.assertEqual(p["title"], "Language")
+        self.app.api_prompt_answer("p1", {"prompt_id": p["id"], "option_index": 1})
+        # 다음 탭(복수 선택)이 그려지면 새 카드. hc status는 그대로라 알림은 처음 한 번뿐
+        self.hc.screens["p1"] = cp("question-multi-tab2")
+        q = self.app.api_prompt("p1")["prompt"]
+        self.assertEqual((q["title"], q["multi_select"]), ("Features", True))
+        self.assertEqual(self.err(self.app.api_prompt_answer, "p1", {"prompt_id": p["id"], "option_index": 0}),
+                         (409, "prompt_changed"))
+        self.assertEqual(self.err(self.app.api_prompt_answer, "p1", {"prompt_id": q["id"], "text": "x"}),
+                         (400, "no_free_text"))
+        # 답 직전 화면으로 키를 계산한다: PC에서 lint를 체크하고 커서를 tests로 옮겼으면 ci만 더 토글
+        self.hc.screens["p1"] = cp("question-multi-tab2-checked")
+        self.app.api_prompt_answer("p1", {"prompt_id": q["id"], "option_indices": [0, 2]})
+        self.hc.screens["p1"] = cp("question-multi-tab3")
+        t = self.app.api_prompt("p1")["prompt"]
+        self.app.api_prompt_answer("p1", {"prompt_id": t["id"], "text": "demo-x"})
+        self.hc.screens["p1"] = cp("question-multi-tab4")
+        b = self.app.api_prompt("p1")["prompt"]
+        self.app.api_prompt_answer("p1", {"prompt_id": b["id"], "option_index": 1})
+        self.assertEqual(self.hc.keys_calls, [("p1", ["down", "enter"]),
+                                              ("p1", ["down", "space", "enter"]),
+                                              ("p1", ["down", "enter"])])
+        self.assertEqual(self.hc.send_calls, [("p1", "demo-x", "force")])
+        self.assertEqual(len(self.pusher.payloads), 1)
 
     def test_push_waits_for_question_drawn_after_blocked(self):
         # 실측: ask_user 상자가 blocked 이벤트보다 조금 늦게 그려질 때가 있다
