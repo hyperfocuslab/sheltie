@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -78,7 +79,16 @@ class DecisionTests(unittest.TestCase):
         self.assertEqual(act({"activity_token": ACT, "start_token": START}, 1), "update")
         # start 직후에는 다시 start하지 않는다
         self.assertIsNone(act({"start_token": START, "started_at": 80.0}, 1))
-        self.assertEqual(act({"start_token": START, "started_at": 30.0}, 1), "start")
+        # 같은 막힘 동안은 토큰이 끝내 안 와도(사용자가 실시간 현황을 허용 안 함) 다시 start하지 않는다. 중복 Activity가 생긴다.
+        self.assertIsNone(act({"start_token": START, "started_at": 30.0}, 1))
+
+    def test_start_again_after_blocked_clears(self):
+        store = hr.LiveActivityStore.__new__(hr.LiveActivityStore)
+        store.lock = threading.Lock()
+        store.data = {DEV: {"start_token": START, "started_at": 10.0}}
+        store._save = lambda: None
+        store.clear_started(DEV)
+        self.assertEqual(store.data[DEV], {"start_token": START})
 
     def test_min_gap_waits(self):
         s = self.state(1)
@@ -176,7 +186,8 @@ class FlowTests(unittest.TestCase):
         self.wall.t += 30
         self.block("t1", base.st("working"))
         self.assertEqual(len(self.pusher.la), 1)
-        self.assertEqual(self.app.live_activity.get(DEV), {"start_token": START, "started_at": self.wall.t - 30})
+        # 막힘이 풀리면 started_at을 지워 다음 막힘에 새로 start할 수 있게 한다
+        self.assertEqual(self.app.live_activity.get(DEV), {"start_token": START})
 
     def test_start_then_token_then_end(self):
         """start 뒤 앱이 Activity 토큰을 올리면 update가 그 토큰으로 가고, 막힘이 풀리면 end(즉시 내림)가 간다."""

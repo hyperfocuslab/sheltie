@@ -140,7 +140,7 @@ PUSH_LOG_MAX_DEVICES = 64
 PUSH_TEST_MIN_GAP = 10.0  # 같은 기기 시험 알림 최소 간격(초)
 LIVE_ACTIVITY_FILE = "live_activity.json"
 LIVE_ACTIVITY_MIN_GAP = 5.0  # 같은 기기 Live Activity 푸시 최소 간격(초). 그 안의 변화는 한 번으로 합친다
-LIVE_ACTIVITY_START_WAIT = 60.0  # start를 보낸 뒤 앱이 Activity 토큰을 올릴 때까지 다시 start하지 않는 시간(초)
+LIVE_ACTIVITY_START_WAIT = 60.0  # 예전 재시도 간격(초). 지금은 막힘 한 번에 start 한 번이라 쓰지 않는다
 LIVE_ACTIVITY_ATTRIBUTES_TYPE = "SheltieActivityAttributes"  # 앱 확장의 ActivityAttributes 타입 이름
 LIVE_ACTIVITY_TTL = 3600  # 갱신 푸시 유효기간(초)
 LIVE_ACTIVITY_END_LINGER = 0  # 끝(end) 뒤 잠금화면에 남기는 시간(초). 0이면 바로 내린다
@@ -7258,6 +7258,13 @@ class LiveActivityStore:
                 self.data[device]["started_at"] = wall
                 self._save()
 
+    def clear_started(self, device):
+        """막힘이 다 풀렸다. 다음 막힘에 다시 start할 수 있게 한다."""
+        with self.lock:
+            e = self.data.get(device)
+            if e is not None and e.pop("started_at", None) is not None:
+                self._save()
+
     def remove_device(self, device):
         with self.lock:
             if self.data.pop(device, None) is not None:
@@ -7297,7 +7304,7 @@ def live_activity_action(entry, state, last_sig, last_at, now, min_gap=LIVE_ACTI
             action = "update"
         else:
             return None
-    elif n > 0 and entry.get("start_token") and now - entry.get("started_at", -1e18) >= start_wait:
+    elif n > 0 and entry.get("start_token") and "started_at" not in entry:
         action = "start"
     else:
         return None
@@ -7374,6 +7381,9 @@ class LiveActivityManager:
                     self.store.remove_device(dev)
                     self.sent.pop(dev, None)
                     continue
+                if state["blockedCount"] == 0 and "started_at" in entry and not entry.get("activity_token"):
+                    # 토큰 없이 띄운 Activity는 서버가 못 끈다(stale-date·앱이 정리). 다음 막힘에 새로 start하게만 한다.
+                    self.store.clear_started(dev)
                 prev = self.sent.get(dev)
                 act = live_activity_action(entry, state, prev[0] if prev else None, prev[1] if prev else None,
                                            now, min_gap=self.min_gap)
