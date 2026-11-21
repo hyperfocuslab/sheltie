@@ -2225,6 +2225,147 @@ def _cursor_status_reject(p):
         return None
 
 
+# ---- Amp CLI. 실측: amp 0.0.1795233642-g42d75f, 200열(tests/fixtures/amp-*-0.0.1795233642.txt).
+# OSC 7501로 막힘을 보내지만 kind가 없다: 승인·질문 모두 {"msg": "Input needed", "state": "blocked"}. 종류는 화면 상자
+# 제목으로 가른다. 대화 상자는 입력 상자 위 `╭─ 제목 ─╮` 상자이고 아래 테두리에 힌트가 있다(그 아래 "Up next (N)" 요약
+# 줄과 입력 상자만 올 수 있다). 메뉴에 번호가 없고 숫자 키는 아무것도 안 한다: 커서(‣, 늘 0에서 시작) ↓/↑ + enter.
+# 승인: Allow Once / Reject with feedback(입력칸 "Tell Amp what to do differently") / Allow All for This Session(메모리만,
+# 파일 변화 없음) / Allow All for Every Session(settings.json에 "amp.dangerouslyAllowAll": true를 써서 모든 도구가 영구
+# 무승인이 된다: 카드에서 뺀다). Esc는 거절(도구 결과가 거절이 되고 모델이 이어 간다). 셸(`Bash:`)·패치(`Apply Patch:`)만
+# 캡처했다. 질문(ask_user_choice `Choose an option`)은 단일 선택, 직접 입력 없음, Esc는 고르지 않고 닫기. 계획 모드 없음.
+AMP_DIALOG_HINT_RE = re.compile(r"^╰─+ (↑/↓/j/k move · Enter select(?: · Ctrl\+E/Ctrl\+Y scroll)? · Esc cancel) ─╯$")
+AMP_TOP_RE = re.compile(r"^╭─ (\S.*?) ─+╮?$")
+AMP_UP_NEXT_RE = re.compile(r"^  (?:Up next \(\d+\)|\d+\. \S.*)$")
+AMP_SCROLLBAR_RE = re.compile(r"\s+[▀-▟]$")
+AMP_APPROVAL_HEAD = "Approval Required"
+AMP_QUESTION_HEAD = "Choose an option"
+AMP_APPROVAL_TOOLS = {"Bash:": "Bash", "Apply Patch:": "Apply Patch"}
+AMP_RULE_RE = re.compile(r"^Matches (?:built-in|user) permissions rule \d+: ")
+AMP_APPROVAL_LABELS = ("Allow Once", "Reject with feedback", "Allow All for This Session",
+                       "Allow All for Every Session")
+AMP_ROW_RE = re.compile(r"^(‣| ) (\S.*)$")
+AMP_FEEDBACK_WAIT = 0.5  # 피드백 입력칸이 그려지는 시간(실측 0.1~0.2초)
+
+
+def _amp_dialog(lines):
+    """화면 끝의 활성 Amp 대화 상자 → (제목, 안쪽 줄들). 아래 테두리 힌트 뒤에 "Up next" 요약 줄과 입력 상자(╭│╰ 줄)만
+    있어야 한다(대화가 그 아래로 이어지면 지난 상자다). 없으면 None."""
+    nz = [i for i, ln in enumerate(lines) if ln.strip()]
+    bottom = None
+    for i in reversed(nz):
+        s = lines[i]
+        if AMP_DIALOG_HINT_RE.match(s):
+            bottom = i
+            break
+        if not (s.startswith(("╭", "│", "╰")) or AMP_UP_NEXT_RE.match(s)):
+            return None
+    if bottom is None:
+        return None
+    after = [lines[i] for i in nz if i > bottom]
+    if not after or not after[-1].startswith("╰") or AMP_DIALOG_HINT_RE.match(after[-1]):
+        return None  # 입력 상자가 화면 맨 아래에 있어야 한다
+    top = next((i for i in range(bottom - 1, max(-1, bottom - 400), -1) if lines[i].startswith("╭")), -1)
+    m = AMP_TOP_RE.match(lines[top]) if top >= 0 else None
+    if not m:
+        return None
+    inner = []
+    for ln in lines[top + 1:bottom]:
+        u = _box_unwrap(ln)
+        if u is None:
+            return None
+        inner.append(AMP_SCROLLBAR_RE.sub("", u).rstrip())
+    return m.group(1), inner
+
+
+def _amp_rows(inner):
+    """메뉴 줄(`‣ 라벨` / `  라벨`)은 상자 안 마지막 글자 줄들이다. → (첫 메뉴 줄 index, 라벨들, 커서 index)."""
+    idx = [i for i, ln in enumerate(inner) if ln.strip()]
+    rows = []
+    for i in reversed(idx):
+        m = AMP_ROW_RE.match(inner[i])
+        if not m or (rows and i != rows[0][0] - 1):
+            break
+        rows.insert(0, (i, m.group(1) == "‣", m.group(2).strip()))
+    if not rows or sum(1 for r in rows if r[1]) != 1:
+        return None
+    return rows[0][0], [r[2] for r in rows], next(k for k, r in enumerate(rows) if r[1])
+
+
+def _parse_amp_approval(inner):
+    got = _amp_rows(inner)
+    if not got:
+        return None
+    first, labels, cur = got
+    if tuple(labels) != AMP_APPROVAL_LABELS:
+        return None
+    head = [i for i in range(first) if inner[i].strip()]
+    if not head or inner[head[0]].strip() not in AMP_APPROVAL_TOOLS:
+        return None  # 캡처하지 않은 도구(create_file·edit_file 등)
+    title = AMP_APPROVAL_TOOLS[inner[head[0]].strip()]
+    body = [ln for ln in inner[head[0] + 1:first] if not AMP_RULE_RE.match(ln.strip())]
+    lead = next((k for k, ln in enumerate(body) if ln.strip()), None)
+    if lead is not None and body[lead].strip() == "Patchtext:":
+        body = body[lead + 1:]  # 패치 원문 위 인자 이름 줄
+    body = _dedent_block(body)
+    if not body:
+        return None
+    # "Allow All for Every Session"은 전역 영구 무승인 스위치라 카드에서 뺀다(마지막 줄이라 앞 항목의 커서 이동은 같다)
+    p = _finish("approval", title, AMP_APPROVAL_HEAD, body, [(lb, None, None) for lb in labels[:3]],
+                selected=cur if cur < 3 else None, free_text_index=1, always_index=2)
+    p["approve_index"] = 0
+    return p
+
+
+def _parse_amp_question(inner):
+    got = _amp_rows(inner)
+    if not got:
+        return None
+    first, labels, cur = got
+    head = [inner[i].strip() for i in range(first) if inner[i].strip()]
+    if not head:
+        return None
+    return _finish("question", None, _norm(" ".join(head)), None, [(lb, None, None) for lb in labels], selected=cur)
+
+
+def _parse_amp_lines(lines, plan_reader=None):
+    got = _amp_dialog(lines)
+    if not got:
+        return None
+    title, inner = got
+    p = (_parse_amp_approval(inner) if title == AMP_APPROVAL_HEAD
+         else _parse_amp_question(inner) if title == AMP_QUESTION_HEAD else None)
+    if p:
+        p["agent"] = "amp"
+    return p
+
+
+def _free_text_amp(p, num, text):
+    """승인 거절 메모: 커서를 "Reject with feedback"으로 옮겨 enter(입력칸이 열린다) → 칸이 그려질 때까지 잠깐 →
+    붙여넣기+enter(실측: 도구 결과가 "Tool rejected by plugin: <글>". 바로 붙여넣으면 글이 사라지고 빈 거절이 된다)."""
+    if p["kind"] != "approval":
+        raise ApiError(400, "no_free_text")
+    keys = nav_keys(None if p.get("selected") is None else num(p["selected"]), num(p["free_text_index"]))
+    if keys is None:
+        raise ApiError(409, "no_cursor")
+    return [("keys", keys + ["enter"]), ("wait", AMP_FEEDBACK_WAIT), ("text", text)]
+
+
+def _amp_status_approve(p):
+    """카드 없이(prompt_id 없이) 승인: 지금 화면 승인 카드의 Allow Once로 커서 이동 + enter. 카드가 없으면 None."""
+    if not p or p["kind"] != "approval":
+        return None
+    try:
+        return [s for _, v in answer_steps(p, option_index=p["approve_index"]) for s in v]
+    except ApiError:
+        return None
+
+
+def _amp_status_reject(p):
+    """카드 없이 거절: 승인·질문 카드가 보이면 esc(승인은 거절, 질문은 고르지 않고 닫기). 피드백 입력칸 등 카드가
+    없으면 None(그 칸의 esc는 입력 취소라 거절이 아니다)."""
+    return ["esc"] if p and p["kind"] in ("approval", "question") else None
+
+
 def _parse_codex_lines(lines, plan_reader=None):
     return _parse_codex_approval(lines) or _parse_codex_question(lines) or _parse_codex_plan(lines)
 
@@ -3842,6 +3983,164 @@ def cursor_preview(path, sid):
         _cursor_preview_cache.clear()
     _cursor_preview_cache[(path, sid)] = (key, pv)
     return pv
+
+
+# ---- Amp 대화 기록. 본문은 Amp 서버(ampcode.com)에만 있다(실측 0.0.1795233642). 로컬에는 스레드별 운영 로그
+# $XDG_CACHE_HOME/amp/logs/threads/<T-id>.log만 있고 amp가 세션 동안 쓰기로 열어 둔다(lsof로 스레드 ID).
+# 본문은 `amp threads export <T-id>`(JSON, 0.6초 안팎)로 읽는다. 실행 비용 때문에 대화 보기 요청 때만 부르고
+# 목록 미리보기에는 쓰지 않는다. 실행 파일은 허용 목록 이름(AGENT_BY_ID)을 find_executable로 찾고 인자는 검증한 id만.
+AMP_THREAD_RE = re.compile(r"^T-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+AMP_EXPORT_TIMEOUT = 8.0
+AMP_EXPORT_TTL = 5.0  # 같은 스레드 export를 다시 쓰는 시간(초)
+AMP_EXPORT_MAX = 16 * 1024 * 1024
+AMP_SUGGESTED_RE = re.compile(r"\s*<suggested-replies>.*?</suggested-replies>\s*", re.S)
+_amp_export_cache = {}  # (exe, id) → (시각, dict)
+_amp_export_lock = threading.Lock()
+
+
+def _lsof_amp(pid, runner):
+    exe = next((p for p in ("/usr/sbin/lsof", "/usr/bin/lsof") if os.path.exists(p)), None)
+    if not exe:
+        return None
+    try:
+        r = runner([exe, "-a", "-p", str(int(pid)), "-Fn"], capture_output=True, text=True,
+                   timeout=HC_TIMEOUT, shell=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    for ln in (r.stdout or "").splitlines():
+        if not ln.startswith("n"):
+            continue
+        path = ln[1:].replace("\\", "/")
+        name = path.rsplit("/", 1)[-1]
+        if not name.endswith(".log") or not path[:-len(name)].endswith("/amp/logs/threads/"):
+            continue
+        if AMP_THREAD_RE.match(name[:-4]):
+            return name[:-4]
+    return None
+
+
+def amp_executable(home):
+    return find_executable(AGENT_BY_ID["amp"][2], agent_search_dirs(home))
+
+
+def find_amp_transcript(info, home, runner=None):
+    """Amp 터미널 → (스레드 ID, amp 실행 파일 경로). 스레드는 amp가 열어 둔 운영 로그(lsof)로만 안다(로컬에 본문이 없어
+    폴더 최근 기록으로 찾을 수 없다). 실행 파일을 못 찾으면 경로 None(대화 보기 빈 목록)."""
+    info = info or {}
+    runner = runner or subprocess.run
+    if IS_WINDOWS:
+        return None, None  # lsof 없음(미확인: Windows의 Amp 로그 위치)
+    fg = info.get("foreground")
+    pids = [v for v in (info.get("pid"), fg.get("pid") if isinstance(fg, dict) else None)
+            if isinstance(v, int) and not isinstance(v, bool) and v > 0]
+    for pid in dict.fromkeys(pids):
+        tid = _lsof_amp(pid, runner)
+        if tid:
+            return tid, amp_executable(home)
+    return None, None
+
+
+def amp_thread_export(exe, thread_id, runner=None, clock=time.monotonic):
+    """`amp threads export <id>` → dict 또는 None. 같은 스레드는 AMP_EXPORT_TTL 동안 기억한 값."""
+    if not isinstance(thread_id, str) or not AMP_THREAD_RE.match(thread_id):
+        return None
+    if not isinstance(exe, str) or not is_abs_path(exe) or not os.path.isfile(exe):
+        return None
+    now = clock()
+    with _amp_export_lock:
+        hit = _amp_export_cache.get((exe, thread_id))
+        if hit and now - hit[0] < AMP_EXPORT_TTL:
+            return hit[1]
+    runner = runner or subprocess.run
+    try:
+        r = runner([exe, "threads", "export", thread_id], capture_output=True, text=True,
+                   timeout=AMP_EXPORT_TIMEOUT, shell=False, **subprocess_kwargs(text=True))
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    out = r.stdout if isinstance(r.stdout, str) else ""
+    if getattr(r, "returncode", 0) != 0 or not out or len(out) > AMP_EXPORT_MAX:
+        return None
+    try:
+        data = json.loads(out)
+    except ValueError:
+        return None
+    if not isinstance(data, dict) or data.get("id") != thread_id or not isinstance(data.get("messages"), list):
+        return None
+    with _amp_export_lock:
+        if len(_amp_export_cache) > 50:
+            _amp_export_cache.clear()
+        _amp_export_cache[(exe, thread_id)] = (now, data)
+    return data
+
+
+def _amp_tool_output(run):
+    res = run.get("result")
+    if isinstance(res, str):
+        return res
+    if isinstance(res, dict):
+        if isinstance(res.get("output"), str):
+            return res["output"]
+        if isinstance(res.get("summary"), str):
+            return res["summary"]
+    if res is None:
+        return None
+    return json.dumps(res, ensure_ascii=False)
+
+
+def _parse_amp_thread(data, limit):
+    """export JSON(실측): messages[] = {role: user|assistant, content: [text | thinking | tool_use{id,name,input} |
+    tool_result{toolUseID, run{status, result}}]}. tool_result는 user 메시지에 오지만 도구 줄에 붙인다."""
+    turns, tools = [], {}
+    for m in data.get("messages") or []:
+        if not isinstance(m, dict) or m.get("role") not in ("user", "assistant"):
+            continue
+        role = m["role"]
+        parts = []
+        for c in m.get("content") if isinstance(m.get("content"), list) else []:
+            if not isinstance(c, dict):
+                continue
+            t = c.get("type")
+            if t == "text" and isinstance(c.get("text"), str):
+                text = AMP_SUGGESTED_RE.sub("\n", c["text"]).strip() if role == "assistant" else c["text"]
+                if text.strip():
+                    parts.append({"kind": "text", "text": _cap(text)})
+            elif t == "thinking" and role == "assistant" and isinstance(c.get("thinking"), str) and c["thinking"].strip():
+                parts.append({"kind": "thinking", "text": _cap(c["thinking"])})
+            elif t == "tool_use" and role == "assistant":
+                name = c.get("name") if isinstance(c.get("name"), str) else "?"
+                inp = c.get("input") if isinstance(c.get("input"), dict) else {}
+                tool = {"kind": "tool", "name": name, "summary": _tool_summary(name, inp), "input": _cap_obj(inp),
+                        "output": None, "state": "pending"}
+                if isinstance(c.get("id"), str):
+                    tools[c["id"]] = tool
+                parts.append(tool)
+            elif t == "tool_result":
+                tool = tools.get(c.get("toolUseID"))
+                run = c.get("run") if isinstance(c.get("run"), dict) else {}
+                if tool is None or run.get("status") in (None, "in-progress", "queued", "blocked-on-user"):
+                    continue
+                v = _amp_tool_output(run)
+                tool["output"] = _cap(_strip_ansi(v)) if isinstance(v, str) else None
+                res = run.get("result")
+                code = res.get("exitCode") if isinstance(res, dict) else None
+                bad = run.get("status") != "done" \
+                    or (isinstance(code, int) and not isinstance(code, bool) and code != 0) \
+                    or (isinstance(res, str) and res.startswith("Tool rejected"))
+                tool["state"] = "error" if bad else "ok"
+        if role == "user":
+            if parts:
+                turns.append({"role": "user", "parts": parts})
+        else:
+            _codex_add(turns, "assistant", parts)
+    cut = len(turns) > limit
+    return turns[-limit:] if limit else turns, cut
+
+
+def read_amp_transcript(exe, thread_id, limit=50):
+    data = amp_thread_export(exe, thread_id)
+    if data is None:
+        return [], False
+    return _parse_amp_thread(data, limit)
 
 
 def find_agent_transcript(info, home, runner=None):
@@ -5629,6 +5928,8 @@ QWEN_PUSH_PROMPT_WAIT = 1.0
 #   reject_status_keys     (선택) 카드 없이 거절할 때 esc 대신 보낼 키. None이면 거절을 앱에서 직접(409 needs_manual).
 #                          함수면 approve_keys처럼 지금 화면 카드로 정한다
 #   read(path, sid, n)     (선택) 기록이 jsonl이 아닐 때 (turns, 잘렸는지). preview(path, sid)는 목록 미리보기
+#   card_status            (선택) hc가 막힘을 알지만 kind가 없을 때(Amp): 막힘 중 화면 카드가 읽히면 API 판정(effective_info)
+#                          의 status를 카드로 바꾼다. 알림 판정(refresh)은 hc status 그대로
 AGENTS = {
     "claude": {"match": is_claude, "parse": _parse_claude_lines, "free_text": _free_text_digit,
                "transcript": lambda info, home, runner=None: find_transcript(info, home, runner=runner),
@@ -5688,8 +5989,18 @@ AGENTS = {
                "dialog_re": CURSOR_DIALOG_RE, "pick": _pick_cursor, "reject_keys": _reject_keys_cursor,
                "approve_keys": _cursor_status_approve, "reject_status_keys": _cursor_status_reject,
                "done_settle": True, "idle_after_re": CURSOR_TRUST_MSG_RE, "send_guard": True},
+    # Amp은 OSC 7501로 막힘·작업 중·끝남을 보내지만 막힘에 kind가 없다(msg "Input needed", 실측 0.0.1795233642):
+    # hc status를 그대로 쓰고, 막힘일 때 화면 카드가 읽히면 API 판정용 status만 카드로 바꾼다(card_status. 알림 판정에는
+    # 안 써서 PC에서 피드백 입력칸을 열어도 새 알림이 안 간다). 메뉴는 번호 없이 커서 이동 + enter. 대화 기록은 서버에만
+    # 있어 대화 보기 때만 `amp threads export`를 부르고 목록 미리보기는 없다.
+    "amp": {"match": _named("amp"), "parse": _parse_amp_lines, "free_text": _free_text_amp,
+            "transcript": lambda info, home, runner=None: find_amp_transcript(info, home, runner=runner),
+            "read": lambda path, sid, n: read_amp_transcript(path, sid, n),
+            "preview": lambda path, sid: None,
+            "push_wait": lambda: PUSH_PROMPT_BUDGET, "retry": False, "screen": None, "card_status": True,
+            "approve_keys": _amp_status_approve, "reject_status_keys": _amp_status_reject, "send_guard": True},
 }
-AGENT_ORDER = ("claude", "codex", "gemini", "copilot", "qwen", "opencode", "grok", "cursor")
+AGENT_ORDER = ("claude", "codex", "gemini", "copilot", "qwen", "opencode", "grok", "cursor", "amp")
 SCREEN_POLL_INTERVAL = 3.0  # "full" 에이전트 화면 판정 주기(초). 제목 이벤트가 먼저 오면 그때 바로 본다
 SCREEN_SETTLE = 0.6  # 제목은 막힘인데 메뉴를 못 읽었을 때 다시 볼 때까지(초)
 PROMPT_STATUS_KINDS = {"approval": "permission", "confirm": "permission", "question": "question", "plan": "plan"}
@@ -5726,9 +6037,11 @@ class App:
         self.plan_reader = make_plan_reader(self.home)
         self.reminders = Reminders(reminder_intervals(cfg))
         self._later = lambda sec, fn: threading.Timer(sec, fn).start()  # 테스트가 바꾼다
+        self._sleep = time.sleep  # 테스트가 바꾼다
         self._agent_kinds = {}  # tid → agent_kind(마지막 hc get). 알림 카드를 어느 화면으로 읽을지 정한다
         self._screen_state = {}  # "full" 에이전트: tid → 마지막으로 판정한 status
         self._screen_turns = {}  # "full" 에이전트: tid → 끝남 횟수(Tracker의 turn 대신)
+        self._card_states = {}  # card_status 에이전트: tid → 이번 막힘에서 마지막으로 읽은 카드 status
         self.tracker = Tracker(self._notify, prompt_for=self._prompt_for_push, reminders=self.reminders)
         self.blocked_since = BlockedSince()
         self.branches = BranchCache()
@@ -5865,14 +6178,41 @@ class App:
             self._screen_state[tid] = st
         return st
 
+    def _card_state(self, tid, info, commit=False):
+        """card_status 에이전트(Amp): hc 막힘 중 화면 카드로 만든 status(kind·msg를 카드에서). 카드가 안 보이면(PC에서
+        피드백 입력칸을 열었다 등) 이 막힘에서 마지막으로 본 카드 status를 그대로 둬 새 알림이 안 가게 한다. 처음부터
+        카드가 없으면 None(hc status 그대로). commit이면 기억한다(refresh만)."""
+        if self.hooks.has(tid) or status_of(info).get("state") != "blocked":
+            if commit:
+                self._card_states.pop(tid, None)
+            return None
+        try:
+            text = (self.hc.read(tid, 0) or {}).get("text", "")
+        except HcError:
+            text = ""
+        p = self.parse_screen(text, agent_kind(info)) if text else None
+        if not p:
+            return self._card_states.get(tid)
+        st = dict(status_of(info), **_card_status(p))
+        if commit:
+            self._card_states[tid] = st
+        return st
+
     def effective_info(self, tid, info):
         """화면으로 판정한 막힘이 있으면 status를 바꾼 사본(카드·답·목록이 막힘으로 다룬다).
         "overlay"(Codex 계획 실행 메뉴, Copilot 폴더 신뢰·autopilot 권한)는 그 메뉴만, hc status가 없는 에이전트("full")는
         status 전체."""
-        if agent_spec(agent_kind(info))["screen"] == "full":
+        spec = agent_spec(agent_kind(info))
+        if spec["screen"] == "full":
             st = self._screen_status(tid, info)
             info = dict(info)
             info["status"] = st or self._screen_state.get(tid) or {"app": agent_kind(info), "state": "idle"}
+            return info
+        if spec.get("card_status"):
+            st = self._card_state(tid, info)
+            if st:
+                info = dict(info)
+                info["status"] = st
             return info
         plan_st, _ = self._overlay_status(tid, info)
         if plan_st:
@@ -5904,6 +6244,14 @@ class App:
                         return
                     turn = self._screen_turns.get(tid)
                     plan_st, plan_mode = None, False
+                elif agent_spec(self._agent_kinds[tid]).get("card_status"):
+                    plan_st, plan_mode = self._card_state(tid, info, commit=True), False
+                    if plan_st is None and st.get("state") == "blocked" and not settle:
+                        # hc는 막힘인데 상자가 아직 안 그려졌다(실측 Amp: blocked 직후 한 장면): 잠깐 뒤 한 번 더 본다.
+                        # 바로 알리면 "Input needed" 알림 뒤 카드 알림이 한 번 더 간다
+                        self._later(SCREEN_SETTLE, lambda: self.refresh(tid, name=name, settle=True))
+                        self._detected = None
+                        return
                 else:
                     plan_st, plan_mode = self._overlay_status(tid, info)
                 if plan_st:
@@ -5961,6 +6309,7 @@ class App:
             self._agent_kinds.pop(tid, None)
             self._screen_state.pop(tid, None)
             self._screen_turns.pop(tid, None)
+            self._card_states.pop(tid, None)
         for tid in self.tracker.known_claude() - live:
             self.exited(tid)
 
@@ -6486,6 +6835,8 @@ class App:
             if kind == "keys":
                 self._keys(tid, val)
                 sent += val
+            elif kind == "wait":
+                self._sleep(val)  # 키로 연 입력칸이 그려질 때까지(Amp 피드백 칸)
             else:
                 try:
                     self.hc.send(tid, val, force=True)

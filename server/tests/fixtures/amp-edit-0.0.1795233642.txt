@@ -1,0 +1,120 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ ┃ Run exactly this one shell command and nothing else: cp README.md copy.md
+
+ ✓ Ran 1 command ▸
+
+ BANANA
+
+ ┃ Create a new file hello.txt containing the single line: hi
+
+ ✓ Edited 1 file (+1) ▸
+
+ Created hello.txt with hi.
+
+ ┃ Change the line in hello.txt from hi to hello
+
+ ⢍ Read 1 file, editing 1 file (+1 -1) ▸
+╭─ Approval Required ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│                                                                                                                                                                                                      │
+│ Apply Patch:                                                                                                                                                                                       █ │
+│   Patchtext:                                                                                                                                                                                       █ │
+│     *** Begin Patch                                                                                                                                                                                █ │
+│     *** Update File: hello.txt                                                                                                                                                                     █ │
+│     @@                                                                                                                                                                                             █ │
+│     -hi                                                                                                                                                                                            █ │
+│     +hello                                                                                                                                                                                         ▅ │
+│     *** End Patch                                                                                                                                                                                  █ │
+│                                                                                                                                                                                                      │
+│ ‣ Allow Once                                                                                                                                                                                         │
+│   Reject with feedback                                                                                                                                                                               │
+│   Allow All for This Session                                                                                                                                                                         │
+│   Allow All for Every Session                                                                                                                                                                        │
+│                                                                                                                                                                                                      │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── ↑/↓/j/k move · Enter select · Ctrl+E/Ctrl+Y scroll · Esc cancel ─╯
+  Up next (1)
+  2. Approval Required  Apply Patch: Patchtext: Begin Patch Update File: hello.txt @@ -hi +hello End Patch Matches user permissions rule 0: ask applypatch
+╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── $0.10 ─ gpt-5.6 terra · low ─╮
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+╰ ≋ Running Tools ────────────────────────────────────────────────────────────────────────────────────────────────────────────────── permissions: on (deprecated) ─ ~/work/demo (main) ─╯

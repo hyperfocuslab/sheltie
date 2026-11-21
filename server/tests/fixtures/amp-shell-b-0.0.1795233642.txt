@@ -1,0 +1,120 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ ┃ Run exactly this one shell command and nothing else: cp README.md copy.md
+
+ ✓ Ran 1 command ▸
+
+ BANANA
+
+ ┃ Create a new file hello.txt containing the single line: hi
+
+ ✓ Edited 1 file (+1) ▸
+
+ Created hello.txt with hi.
+
+ ┃ Change the line in hello.txt from hi to hello
+
+ ✓ Read 2 files, edited 1 file (+1 -1) ▸
+
+ Updated hello.txt to hello and verified its contents.
+
+ ┃ Run this shell command: cp README.md copy.md
+
+ ⢋ Running 1 command ▸
+╭─ Approval Required ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│                                                                                                                                                                                                      │
+│ Bash:                                                                                                                                                                                                │
+│   cp README.md copy.md                                                                                                                                                                               │
+│   Working directory: /Users/me/work/demo                                                                                                            │
+│                                                                                                                                                                                                      │
+│ Matches built-in permissions rule 74: ask shell_command                                                                                                                                              │
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+│ ‣ Allow Once                                                                                                                                                                                         │
+│   Reject with feedback                                                                                                                                                                               │
+│   Allow All for This Session                                                                                                                                                                         │
+│   Allow All for Every Session                                                                                                                                                                        │
+│                                                                                                                                                                                                      │
+╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── ↑/↓/j/k move · Enter select · Esc cancel ─╯
+╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── $0.12 ─ gpt-5.6 terra · low ─╮
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+╰ ≈ Running Too  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────── permissions: on (deprecated) ─ ~/work/demo (main) ─╯

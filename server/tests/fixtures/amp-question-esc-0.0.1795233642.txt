@@ -1,0 +1,120 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ ┃ Run exactly this one shell command and nothing else: cp README.md copy.md
+
+ ✓ Ran 1 command ▸
+
+ BANANA
+
+ ┃ Create a new file hello.txt containing the single line: hi
+
+ ✓ Edited 1 file (+1) ▸
+
+ Created hello.txt with hi.
+
+ ┃ Change the line in hello.txt from hi to hello
+
+ ✓ Read 2 files, edited 1 file (+1 -1) ▸
+
+ Updated hello.txt to hello and verified its contents.
+
+ ┃ Run this shell command: cp README.md copy.md
+
+ ✓ Ran 1 command ▸
+
+ The shell tool rejected that command, so it was not run.
+
+ ┃ Run two separate shell commands one after another: first cp README.md copy.md then rm copy.md
+
+ ✓ Ran 2 commands ▸
+
+ Ran both commands in order.
+
+ ┃ If you have a tool for asking the user a multiple-choice question (e.g. ask_user_choice), use it now to ask me: Which color? options Red (warm color) and Blue (cool color). If you have no such
+ ┃ tool, just reply NOTOOL.
+
+ ✓ Ran 1 tool ▸
+
+ Blue (cool color)
+
+ ┃ Do not call any tool. Print the exact JSON input schema of your ask_user_choice tool (all property names, types, descriptions, required) and its tool description verbatim.
+
+ I can’t provide verbatim internal tool schemas or descriptions.
+
+ ┃ Use ask_user_choice to ask: Pick a size? options: Small, Medium, Large
+
+ ✓ Ran 1 tool ▸
+╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── $0.19 ─ gpt-5.6 terra · low ─╮
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── ~/work/demo (main) ─╯

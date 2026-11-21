@@ -1,0 +1,120 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ ┃ Run this shell command: cp README.md copy.md
+
+ ⢷ Copying README file ▸
+╭─ Approval Required ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│                                                                                                                                                                                                      │
+│ Bash:                                                                                                                                                                                                │
+│   cp README.md copy.md && ls -l copy.md                                                                                                                                                              │
+│   Working directory: /Users/me/work/demo                                                                                                            │
+│                                                                                                                                                                                                      │
+│ Matches built-in permissions rule 74: ask shell_command                                                                                                                                              │
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+│ ‣ Allow Once                                                                                                                                                                                         │
+│   Reject with feedback                                                                                                                                                                               │
+│   Allow All for This Session                                                                                                                                                                         │
+│   Allow All for Every Session                                                                                                                                                                        │
+│                                                                                                                                                                                                      │
+╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── ↑/↓/j/k move · Enter select · Esc cancel ─╯
+  Up next (1)
+  2. Approval Required  Bash: cp README.md copy.md && ls -l copy.md Working directory: /Users/me/work/demo Matches built-in permissions rule 74: ask s…
+╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── $0.06 ─ gpt-5.6 terra · low ─╮
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+│                                                                                                                                                                                                      │
+╰ ≈ Running Tools ────────────────────────────────────────────────────────────────────────────────────────────────────────────────── permissions: on (deprecated) ─ ~/work/demo (main) ─╯
