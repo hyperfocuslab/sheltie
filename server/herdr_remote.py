@@ -123,6 +123,8 @@ RELAY_OFF = "off"  # push_relay_url에 이 값을 넣으면 중계를 쓰지 않
 HC_TIMEOUT = 10
 HC_STYLED_WAIT = 0.4  # hc attach --observe 첫 그림을 받는 시간(초). 실측 hc 0.1.21: 붙고 6ms 안에 다 온다
 MAX_BODY = 64 * 1024
+# 이 프로세스가 뜬 시각(/api/health의 started). 설치기가 재설치 뒤 응답한 서버가 새 서버인지 대조한다.
+PROCESS_STARTED = time.time()
 POLL_INTERVAL = 15
 BIND_RETRY = 10
 EVENTS_MAX_BACKOFF = 30
@@ -8726,7 +8728,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 body = self._body() if method in ("POST", "DELETE") else {}
                 tid = urllib.parse.unquote(mt.group(1)) if mt.groups() else None
                 if name == "health":
-                    res = {"ok": True, "name": machine_name()}
+                    res = {"ok": True, "name": machine_name(), "started": round(PROCESS_STARTED, 3)}
                     if app.cfg.get("push_relay_url"):
                         res["push_relay_url"] = app.cfg["push_relay_url"]
                     if app.cfg.get("fcm_relay_url"):

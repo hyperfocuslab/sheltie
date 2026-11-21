@@ -3,7 +3,8 @@
 #   Env: HERDR_REMOTE_SRC (server file https URL or local path; default: server\ next to this file, else GitHub raw),
 #   HERDR_REMOTE_HC (hc.exe path), HERDR_REMOTE_PORT (default 8790), HERDR_REMOTE_PYTHON (python.exe path),
 #   HERDR_REMOTE_TAILSCALE (tailscale CLI path), HERDR_REMOTE_SKIP_TAILSCALE=1 (skip tailscale check/serve/pair; for tests),
-#   HERDR_REMOTE_HEALTH_TRIES (health check attempts, default 10)
+#   HERDR_REMOTE_HEALTH_TRIES (health check attempts, default 10), HERDR_REMOTE_STOP_WAIT (seconds to wait for the old
+#   server to free its port before killing it, default 15)
 # The server starts at logon via Task Scheduler ("Sheltie herdr-remote") in the desktop session, non-elevated.
 # This file must stay pure ASCII with no BOM: irm | iex chokes on a BOM, and PS 5.1 -File reads BOM-less files as cp949.
 # User-facing Korean text lives in $MSG below as Base64 of UTF-8 bytes.
@@ -89,6 +90,8 @@
     hk_off = 'KC1Ob0hvb2tzOiDtm4Ug65Ox66GdIOqxtOuEiOucgCk=' # hk_off
     hk_restart = 'Q2xhdWRlIENvZGXCt0NvZGV466W8IOyDiOuhnCDsi5zsnpHtlbTslbwg7ZuF7J20IOyggeyaqeuQnOuLpChDb2RleOuKlCAvaG9va3Mg7JeQ7IScIO2VnCDrsogg7Iug66Kw7ZW07JW8IO2VnOuLpCku' # hk_restart
     help5 = 'ICAtTm9Ib29rczogQ2xhdWRlIENvZGXCt0NvZGV4IO2bhSDrk7HroZ0o7ZW07KCcKeydhCDqsbTrhIjrnIAuIGhj6rCAIOyXhuyWtOuPhCDshKTsuZjripQg6rOE7IaN7ZWc64ukKOqzteyLnSDtm4XsnLzroZzrp4wg64+Z7J6RKS4=' # help5
+    port_busy = '7Y+s7Yq4IHswfeydhCjrpbwpIOuLpOuluCDtlITroZzqt7jrnqjsnbQg6rOE7IaNIOyTsOqzoCDsnojri6QuIOq3uCDtlITroZzqt7jrnqjsnYQg64GE6rOgIOuLpOyLnCDsi6TtlontlbTrnbwu' # port still in use
+    old_health = '7JibIOyEnOuyhOqwgCDslYTsp4Eg7J2R64u17ZWc64ukLiDsg4gg7ISc67KE66W8IOq4sOuLpOumrOuKlCDspJEuLi4=' # old server answered
     unexpected = '7JiI7IOB7ZWY7KeAIOuqu+2VnCDsmKTrpZg6IHswfQ==' # unexpected error
   }
   # messages end
@@ -384,6 +387,54 @@ except Exception:
     }
     return $false
   }
+  function Port-Open([int]$P) {
+    # Listening sockets from the TCP table (a connect test is fooled by a full backlog). Only loopback/any:
+    # tailscale serve listens on the same port number on the tailnet address.
+    if (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue) {
+      try {
+        $l = @(Get-NetTCPConnection -LocalPort $P -State Listen -ErrorAction SilentlyContinue |
+          Where-Object { @('127.0.0.1', '0.0.0.0', '::', '::1') -contains $_.LocalAddress })
+        return ($l.Count -gt 0)
+      } catch {}
+    }
+    $c = New-Object Net.Sockets.TcpClient
+    try {
+      $iar = $c.BeginConnect('127.0.0.1', $P, $null, $null)
+      if (-not $iar.AsyncWaitHandle.WaitOne(500)) { return $false }
+      $c.EndConnect($iar)
+      return $true
+    } catch { return $false } finally { $c.Close() }
+  }
+  # Stop the old server and wait until its port is free. schtasks /End returns before the process exits,
+  # so without this wait the old server still answers health (false success) and the new one cannot bind.
+  # If our server file still holds the port after the wait, kill that process (not hook calls).
+  function Stop-Old([int[]]$Ports, [switch]$NoDie) {
+    $rc = Run 'schtasks' @('/End', '/TN', $TASK) -Quiet
+    if ($DRY -or $Ports.Count -eq 0) { return }
+    $wait = 15
+    if ($env:HERDR_REMOTE_STOP_WAIT -match '^[0-9]+$') { $wait = [int]$env:HERDR_REMOTE_STOP_WAIT }
+    $deadline = (Get-Date).AddSeconds($wait)
+    $killed = $false
+    while ($true) {
+      $busy = @($Ports | Select-Object -Unique | Where-Object { Port-Open $_ })
+      if ($busy.Count -eq 0) { return }
+      if ((Get-Date) -ge $deadline) {
+        if ($killed) {
+          if ($NoDie) { return }
+          Die 9 (T 'port_busy' ($busy -join ', '))
+        }
+        foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name like 'python%'" -ErrorAction SilentlyContinue)) {
+          $cl = [string]$p.CommandLine
+          if ($cl.IndexOf($SERVER, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and -not ($cl -match '\shook(\s|$)')) {
+            Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+          }
+        }
+        $killed = $true
+        $deadline = (Get-Date).AddSeconds(5)
+      }
+      Start-Sleep -Milliseconds 200
+    }
+  }
   function Fill-Template([string]$Text, $Map) {
     foreach ($k in $Map.Keys) {
       $Text = $Text.Replace("@$k@", [Security.SecurityElement]::Escape([string]$Map[$k]))
@@ -413,7 +464,7 @@ except Exception:
 
     if ($MODE -eq 'uninstall') {
       if (-not $PORT) { $PORT = [string](Config-Port) }
-      $rc = Run 'schtasks' @('/End', '/TN', $TASK) -Quiet
+      Stop-Old @([int]$PORT) -NoDie
       $rc = Run 'schtasks' @('/Delete', '/TN', $TASK, '/F') -Quiet
       if ($rc -ne 0) { Say (T 'no_task') }
       if ($env:HERDR_REMOTE_SKIP_TAILSCALE -ne '1') {
@@ -434,6 +485,8 @@ except Exception:
     }
 
     # ---- 1. checks
+    # Health must come from a server started after this point (not the old one still exiting).
+    $T0 = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0
     if ([Environment]::OSVersion.Platform -ne 'Win32NT') { Die 1 (T 'win_only') }
 
     $PY = Find-Python
@@ -489,8 +542,12 @@ except Exception:
         if (-not (Test-Path -LiteralPath $tmp) -or (Get-Item -LiteralPath $tmp).Length -eq 0) { Die 1 (T 'src_empty' $SRC) }
         & $PY -c "import sys; compile(open(sys.argv[1], encoding='utf-8-sig').read(), sys.argv[1], 'exec')" $tmp 2>$null | Out-Null
         if ($LASTEXITCODE -ne 0) { Die 1 (T 'src_badpy' $SRC) }
-        # A running server may hold the file: stop it before replacing.
-        $rc = Run 'schtasks' @('/End', '/TN', $TASK) -Quiet
+        # A running server may hold the file and the port: stop it and wait for it to exit before replacing.
+        # Old port only if a config exists (fresh install: nothing of ours is running).
+        $ports = @()
+        if (Test-Path -LiteralPath $CONFIG) { $ports += Config-Port }
+        if ($PORT) { $ports += [int]$PORT }
+        Stop-Old $ports
         Move-Item -LiteralPath $tmp -Destination $SERVER -Force
       } finally {
         Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
@@ -569,10 +626,20 @@ except Exception:
       $tries = 10
       if ($env:HERDR_REMOTE_HEALTH_TRIES -match '^[0-9]+$') { $tries = [int]$env:HERDR_REMOTE_HEALTH_TRIES }
       $ok = $false
+      $warned = $false
       for ($i = 0; $i -lt $tries; $i++) {
         try {
           $r = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:$PORT/api/health" -Headers @{ Authorization = "Bearer $token" } -TimeoutSec 3
-          if ($r.StatusCode -eq 200) { $ok = $true; break }
+          if ($r.StatusCode -eq 200) {
+            $started = 0.0
+            try {
+              $body = $r.Content
+              if ($body -is [byte[]]) { $body = [Text.Encoding]::UTF8.GetString($body) }  # PS 5.1 without Content-Type
+              $started = [double](($body | ConvertFrom-Json).started)
+            } catch {}
+            if ($started -ge $T0) { $ok = $true; break }
+            if (-not $warned) { Say (T 'old_health'); $warned = $true }
+          }
         } catch {}
         Start-Sleep -Seconds 1
       }

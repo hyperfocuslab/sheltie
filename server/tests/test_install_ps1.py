@@ -15,7 +15,7 @@ TEMPLATE = os.path.join(ROOT, "deploy", "windows-task.xml.in")
 PS = shutil.which("powershell") or shutil.which("pwsh")
 
 # 서버 대역: init은 설정을 만들고, pair는 PAIR_FAIL이 있으면 실패하고, serve는 /api/health에 토큰 검사 후 200.
-STUB_SERVER = '''import json, os, sys
+STUB_SERVER = '''import json, os, sys, time
 cmd = sys.argv[1] if len(sys.argv) > 1 else "serve"
 p = os.path.expanduser("~/.config/herdr-remote/config.json")
 if cmd == "init":
@@ -29,24 +29,35 @@ elif cmd == "pair":
 elif cmd == "serve":
     from http.server import BaseHTTPRequestHandler, HTTPServer
     cfg = json.load(open(p))
+    STARTED = time.time()
     class H(BaseHTTPRequestHandler):
         def do_GET(self):
             ok = self.path == "/api/health" and self.headers.get("Authorization") == "Bearer " + cfg["token"]
             self.send_response(200 if ok else 401)
             self.end_headers()
-            self.wfile.write(b"ok")
+            started = 0 if os.environ.get("STUB_OLD_STARTED") else STARTED
+            self.wfile.write(json.dumps({"ok": True, "started": started}).encode())
         def log_message(self, *a):
             pass
     HTTPServer(("127.0.0.1", int(cfg["port"])), H).serve_forever()
 '''
 
-# 가짜 schtasks / tailscale: 호출을 FAKE_LOG에 남기고, schtasks /Create는 XML을 복사하고, /Run은 서버 대역을 띄운다.
+# 가짜 schtasks / tailscale: 호출을 FAKE_LOG에 남기고, /End는 띄운 서버를 1.5초 뒤 끝내고, schtasks /Create는 XML을 복사하고, /Run은 서버 대역을 띄운다.
 FAKE_HELPER = '''import os, shutil, subprocess, sys
 name = sys.argv[1]
 args = sys.argv[2:]
 with open(os.environ["FAKE_LOG"], "a", encoding="utf-8") as f:
     f.write(name + " " + " ".join(args) + "\\n")
 if name == "schtasks":
+    if args and args[0] == "/End":
+        # like real /End: return at once, the process exits a bit later (never with SCHTASKS_END_NOKILL)
+        if os.path.exists(os.environ["FAKE_PIDS"]) and not os.environ.get("SCHTASKS_END_NOKILL"):
+            pids = open(os.environ["FAKE_PIDS"]).read().split()
+            code = "import subprocess, time; time.sleep(%s)\\n" % os.environ.get("SCHTASKS_END_DELAY", "1.5")
+            code += "".join("subprocess.run(['taskkill', '/F', '/PID', '%s'], capture_output=True)\\n" % x for x in pids)
+            subprocess.Popen([sys.executable, "-c", code], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, close_fds=True, creationflags=0x00000008 | 0x00000200)
+        sys.exit(0)
     if args and args[0] == "/Create":
         shutil.copy(args[args.index("/XML") + 1], os.environ["FAKE_XML"])
         sys.exit(int(os.environ.get("SCHTASKS_CREATE_RC", "0")))
@@ -399,6 +410,47 @@ class InstallPs1Test(unittest.TestCase):
         self.assertEqual(read_json(self.cfg_path())["token"], tok)
         self.assertEqual(self.task_xml()[1], first)
         self.assertFalse(any(x.startswith("tailscale serve --bg") for x in self.calls()))
+
+    def pid_alive(self, pid):
+        out = subprocess.run(["tasklist", "/FI", "PID eq %s" % pid, "/NH"], capture_output=True, text=True).stdout
+        return (" %s " % pid) in out
+
+    def test_reinstall_waits_for_old_server(self):
+        # 옛 서버가 /End 뒤 1.5초 더 살아 있어도, 설치기는 그 서버의 health를 성공으로 치지 않고 새 서버를 띄운다.
+        self.assertEqual(self.run_install().returncode, 0)
+        old = read(self.pids).split()
+        open(self.log, "w").close()
+        r = self.run_install()
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        new = [x for x in read(self.pids).split() if x not in old]
+        self.assertEqual(len(new), 1, read(self.pids))
+        self.assertFalse(any(self.pid_alive(x) for x in old), old)
+        self.assertTrue(self.pid_alive(new[0]))
+        self.assertLess(self.idx("schtasks /End"), self.idx("schtasks /Run"))
+
+    def test_reinstall_kills_old_server_that_ignores_end(self):
+        self.assertEqual(self.run_install().returncode, 0)
+        old = read(self.pids).split()
+        r = self.run_install(SCHTASKS_END_NOKILL="1", HERDR_REMOTE_STOP_WAIT="1")
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertFalse(any(self.pid_alive(x) for x in old), old)
+
+    def test_old_server_health_is_not_success(self):
+        # started가 설치 시작보다 이른 서버(옛 서버)만 답하면 실패로 본다.
+        r = self.run_install(STUB_OLD_STARTED="1")
+        self.assertEqual(r.returncode, 7, r.stderr + r.stdout)
+
+    def test_port_held_by_other_program(self):
+        s = socket.socket()
+        s.bind(("127.0.0.1", int(self.port)))
+        s.listen(50)
+        try:
+            r = self.run_install(HERDR_REMOTE_STOP_WAIT="1")
+        finally:
+            s.close()
+        self.assertEqual(r.returncode, 9, r.stderr + r.stdout)
+        self.assertIn(self.port, r.stderr)
+        self.assertFalse(any(x.startswith("schtasks /Run") for x in self.calls()))
 
     def test_http_source_rejected(self):
         r = self.run_install(HERDR_REMOTE_SRC="http://example.invalid/herdr_remote.py")
