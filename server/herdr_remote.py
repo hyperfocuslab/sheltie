@@ -1218,6 +1218,187 @@ def _parse_gemini_lines(lines, plan_reader=None):
     return _parse_gemini_approval(inner) or _parse_gemini_question(inner) or _parse_gemini_plan(inner)
 
 
+# ---- GitHub Copilot CLI 대화 상자. 실측: copilot 1.0.114, 200열(tests/fixtures/copilot-*-1.0.114.txt).
+# 승인·폴더 신뢰·계획·autopilot 권한은 화면 맨 끝 ╭…╰ 상자(제목, 가로줄, 본문, 번호 메뉴, 힌트)다. 숫자 키가 그 항목을
+# 바로 고르고 제출한다. "No, and tell Copilot…"·"Suggest changes"는 입력 항목이라 숫자는 커서만 옮기고 글자를 치면
+# 라벨이 입력값으로 바뀐다(빈 enter는 무시): 숫자 → 붙여넣기+enter. esc는 거절과 함께 턴 전체를 멈춘다.
+# ask_user 질문은 가로줄 두 개 사이 대화 상자이고 번호가 없다(숫자 키 무시): ↑/↓ + enter. "Other"로 커서를 옮기면
+# 상자 아래 입력 칸이 열린다. 여러 칸 폼(탭)·복수 선택은 카드 없음.
+COPILOT_HINT_RE = re.compile(r"^↑/↓ to navigate · enter to select(?: · ctrl\+e to show full plan)? · esc to cancel$")
+COPILOT_APPROVAL_Q_RE = re.compile(r"^Do you (?:want to .+|trust the files in this folder)\?$")
+COPILOT_ESC_SUFFIX_RE = re.compile(r"\s*\(Esc(?: to stop)?\)$")
+COPILOT_REJECT_FREE = "No, and tell Copilot what to do differently"
+COPILOT_TRUST_TITLE = "Confirm folder trust"
+COPILOT_PLAN_TITLE = "Plan Ready for Review"
+COPILOT_PLAN_FREE = "Suggest changes"
+COPILOT_AUTOPILOT_TITLE = "Enable autopilot mode"
+COPILOT_Q_HEAD = "Copilot needs information."
+COPILOT_Q_HINT_RE = re.compile(r"^(?:↑/↓ select · )?enter accept · ctrl\+d decline · esc cancel$")
+COPILOT_OTHER = "Other (type your answer)"
+COPILOT_OTHER_RE = re.compile(r"^Other \(type your answer(?: below)?\)$")
+COPILOT_OTHER_INPUT = "┃ Type your answer..."
+COPILOT_CHOICE_RE = re.compile(r"^(\s*)(❯| ) (\S.*)$")
+
+
+def _copilot_box(lines):
+    """화면 맨 끝 메뉴 상자 → (제목, 안쪽 줄, 메뉴 줄, 라벨) 또는 None."""
+    inner = _last_box(lines)
+    if not inner or len(inner) < 4 or not inner[0].strip() or not SOLID_RULE_RE.match(inner[1].strip()):
+        return None
+    idx = [i for i, ln in enumerate(inner) if ln.strip()]
+    if not COPILOT_HINT_RE.match(inner[idx[-1]].strip()):
+        return None
+    rows = _menu_rows(inner, 2, idx[-1])
+    if len(rows) < 2 or sum(1 for r in rows if r["selected"]) != 1:
+        return None
+    labels = [COPILOT_ESC_SUFFIX_RE.sub("", _norm(" ".join([r["label"]] + r["extra"]))) for r in rows]
+    return inner[0].strip(), inner, rows, labels
+
+
+def _parse_copilot_box(lines):
+    box = _copilot_box(lines)
+    if box is None:
+        return None
+    title, inner, rows, labels = box
+    sel = next(k for k, r in enumerate(rows) if r["selected"])
+    opts = [(lb, None, r["num"]) for lb, r in zip(labels, rows)]
+    first = rows[0]["line"]
+    if title == COPILOT_PLAN_TITLE:
+        if len(rows) != 4 or labels[-1] != COPILOT_PLAN_FREE \
+                or not all(lb.startswith(("Accept plan", "Exit")) for lb in labels[:3]):
+            return None  # 4번에 PC에서 글자를 치는 중이면 라벨이 입력값으로 바뀐다
+        p = _finish("plan", None, COPILOT_PLAN_TITLE, _dedent_block(inner[2:first]), opts, selected=sel,
+                    free_text_index=3)
+    elif title == COPILOT_AUTOPILOT_TITLE:
+        if len(rows) != 4 or labels[-1] != "Cancel" or not all(lb.startswith("Use ") for lb in labels[:3]):
+            return None
+        p = _finish("question", None, COPILOT_AUTOPILOT_TITLE, _dedent_block(inner[2:first]), opts, selected=sel)
+    else:
+        # 질문 줄: 메뉴 바로 위 빈 줄 사이 덩어리(긴 경로는 접힐 수 있다)
+        q_end = first - 1
+        while q_end > 1 and not inner[q_end].strip():
+            q_end -= 1
+        q_start = q_end
+        while q_start > 2 and inner[q_start - 1].strip() and q_end - q_start < 4:
+            q_start -= 1
+        question = _norm(" ".join(ln.strip() for ln in inner[q_start:q_end + 1]))
+        if not COPILOT_APPROVAL_Q_RE.match(question) or labels[0] != "Yes":
+            return None
+        body = _gemini_body(inner[2:q_start])
+        if title == COPILOT_TRUST_TITLE:
+            if labels[-1] != "No" or len(rows) != 3:
+                return None
+            free, reject = None, len(rows) - 1
+        elif labels[-1] == COPILOT_REJECT_FREE:
+            # 거절 항목은 입력 항목이라 숫자만으로는 제출되지 않는다: 거절 버튼은 esc(라벨의 "Esc to stop"),
+            # 이 줄을 고르면 직접 입력으로 지시와 함께 거절
+            free, reject = len(rows) - 1, None
+        else:
+            return None  # 3번에 PC에서 글자를 치는 중(라벨이 입력값으로 바뀐다) 등
+        _, persist = allow_more_indices(labels)  # "Yes, and don't ask again …"은 permissions-config.json에 영구 저장
+        p = _finish("approval", title, question, body, opts, selected=sel, free_text_index=free,
+                    reject_index=reject, persist_index=persist)
+    p["agent"] = "copilot"
+    return p
+
+
+def _copilot_question_dialog(lines):
+    """화면 맨 끝 가로줄 두 개 사이 질문 상자의 안쪽 줄과 "Other" 입력 칸이 열려 있는지. 아니면 None."""
+    nz = [i for i, ln in enumerate(lines) if ln.strip()]
+    if not nz:
+        return None
+    k = len(nz) - 1
+    other_open = False
+    if lines[nz[k]].strip().startswith("╹"):
+        # "Other" 입력 칸(╻▄▄ / ┃ Type your answer... / ╹▀▀). 이미 글자를 쳤으면 카드 없음
+        if k < 3 or lines[nz[k - 1]].strip() != COPILOT_OTHER_INPUT or not lines[nz[k - 2]].strip().startswith("╻"):
+            return None
+        k -= 3
+        other_open = True
+    if k < 1 or not SOLID_RULE_RE.match(lines[nz[k]].strip()):
+        return None
+    bottom = nz[k]
+    top = next((i for i in range(bottom - 1, max(-1, bottom - 120), -1) if SOLID_RULE_RE.match(lines[i].strip())), -1)
+    if top < 0:
+        return None
+    return lines[top + 1:bottom], other_open
+
+
+def _parse_copilot_question(lines):
+    got = _copilot_question_dialog(lines)
+    if got is None:
+        return None
+    inner, other_open = got
+    idx = [i for i, ln in enumerate(inner) if ln.strip()]
+    if len(idx) < 4 or inner[idx[0]].strip() != COPILOT_Q_HEAD or not COPILOT_Q_HINT_RE.match(inner[idx[-1]].strip()):
+        return None
+    msg = []
+    j = idx[0] + 1
+    while j < len(inner) and inner[j].strip():
+        msg.append(inner[j].strip())
+        j += 1
+    field = [ln for ln in inner[j:idx[-1]]]
+    ms = [COPILOT_CHOICE_RE.match(ln) for ln in field]
+    cur = [k for k, m in enumerate(ms) if m and m.group(2) == "❯"]
+    text_in = [k for k, ln in enumerate(field) if ln.strip() == "❯"]
+    if len(cur) == 1 and not text_in:
+        col = len(ms[cur[0]].group(1))
+        a = b = cur[0]
+        while a > 0 and ms[a - 1] and len(ms[a - 1].group(1)) == col:
+            a -= 1
+        while b + 1 < len(field) and ms[b + 1] and len(ms[b + 1].group(1)) == col:
+            b += 1
+        labels = [m.group(3).strip() for m in ms[a:b + 1]]
+        if len(labels) < 2 or any(lb.startswith(("•", "✓")) for lb in labels):
+            return None  # 복수 선택
+        labels = [COPILOT_OTHER if COPILOT_OTHER_RE.match(lb) else lb for lb in labels]
+        free = labels.index(COPILOT_OTHER) if COPILOT_OTHER in labels else None
+        if other_open != (free is not None and cur[0] - a == free):
+            return None  # 입력 칸은 커서가 "Other"에 있을 때만 열린다
+        head = [ln.strip() for ln in field[:a] if ln.strip()]
+        t = next((k for k in range(len(head) - 1, -1, -1) if head[k].endswith(":")), None)
+        if t is None:
+            return None
+        msg += head[:t]
+        title, desc = head[t][:-1].strip(), _norm(" ".join(head[t + 1:])) or None
+        opts = [(lb, None, None) for lb in labels]
+        sel = cur[0] - a
+    elif len(text_in) == 1 and not cur and not other_open:
+        k = text_in[0]
+        if k < 1 or not field[k - 1].strip().startswith("▄") or k + 1 >= len(field) \
+                or not field[k + 1].strip().startswith("▀"):
+            return None
+        head = [ln.strip() for ln in field[:k - 1]]
+        while head and not head[-1]:
+            head.pop()
+        para = []
+        while head and head[-1]:
+            para.insert(0, head.pop())
+        msg += [h for h in head if h]
+        if not para:
+            return None
+        title, desc = para[0], _norm(" ".join(para[1:])) or None
+        opts, free, sel = [(title, None, None)], 0, None
+    else:
+        return None
+    question = _norm(" ".join(msg))
+    if not question:
+        return None
+    p = _finish("question", title or None, question, desc, opts, selected=sel, free_text_index=free)
+    p["agent"] = "copilot"
+    return p
+
+
+def _parse_copilot_lines(lines, plan_reader=None):
+    return _parse_copilot_box(lines) or _parse_copilot_question(lines)
+
+
+def _copilot_overlay_card(p):
+    """hc가 막힘으로 보지 않는 Copilot 상자(폴더 신뢰: idle, autopilot 권한: working). 실측 1.0.114."""
+    return (p["kind"], p["title"] or p["question"]) in (("approval", COPILOT_TRUST_TITLE),
+                                                        ("question", COPILOT_AUTOPILOT_TITLE))
+
+
 def _parse_codex_lines(lines, plan_reader=None):
     return _parse_codex_approval(lines) or _parse_codex_question(lines) or _parse_codex_plan(lines)
 
@@ -1329,6 +1510,18 @@ def _free_text_gemini(p, num, text):
     return _free_text_digit(p, num, text)
 
 
+def _free_text_copilot(p, num, text):
+    """Copilot: 승인 3·계획 4(번호 있는 입력 항목)는 숫자 → 붙여넣기+enter. 질문(번호 없음)은 커서를 "Other"로 옮겨
+    입력 칸을 연 뒤 붙여넣기+enter, 입력만 받는 질문은 바로 붙여넣기+enter(실측 1.0.114)."""
+    fi = p["free_text_index"]
+    if p["options"][fi].get("number") is not None:
+        return _free_text_digit(p, num, text)
+    if p.get("selected") is None:
+        return [("text", text)]
+    keys = nav_keys(num(p["selected"]), num(fi))
+    return ([("keys", keys)] if keys else []) + [("text", text)]
+
+
 def answer_steps(p, option_index=None, option_indices=None, text=None):
     """카드에 대한 답 → [("keys",[...]) | ("text", s)].
     실측(2.1.329): 숫자 키는 승인·계획·단일 선택·리뷰에서 바로 고른다. 자유 입력 줄은 숫자로 커서만 옮기고,
@@ -1366,7 +1559,8 @@ def answer_steps(p, option_index=None, option_indices=None, text=None):
         raise ApiError(400, "use_option_indices")
     if option_index == p.get("free_text_index"):
         raise ApiError(400, "needs_text")
-    if kind == "confirm" or num(option_index) > 9:
+    # 화면에 번호가 없는 메뉴(Claude confirm, Copilot 질문: 숫자 키를 무시한다)는 커서 이동 + enter
+    if kind == "confirm" or num(option_index) > 9 or p["options"][option_index].get("number") is None:
         cur = p.get("selected")
         keys = nav_keys(None if cur is None else num(cur), num(option_index))
         if keys is None:
@@ -1598,8 +1792,58 @@ def _is_gemini_record(rec):
     return rec.get("type") == "gemini" or "$set" in rec or "$patch" in rec or "projectHash" in rec
 
 
+def _is_copilot_record(rec):
+    """Copilot 이벤트 줄: type이 "user.message"처럼 점으로 나뉘고 data가 있다(Claude·Codex·Gemini 줄 type에는 점이 없다)."""
+    typ = rec.get("type")
+    return isinstance(typ, str) and "." in typ and isinstance(rec.get("data"), dict)
+
+
+def _parse_copilot_transcript(recs, limit):
+    """Copilot events.jsonl(실측 1.0.114): user.message(content, 빈 것은 Copilot이 넣은 재촉이라 숨김),
+    assistant.message(reasoningText·content·toolRequests), tool.execution_complete(success, result.content·error.message)."""
+    turns, tools = [], {}
+    for rec in recs:
+        typ, d = rec.get("type"), rec.get("data")
+        if not isinstance(d, dict):
+            continue
+        if typ == "user.message":
+            c = d.get("content")
+            if isinstance(c, str) and c.strip():
+                turns.append({"role": "user", "parts": [{"kind": "text", "text": _cap(c)}]})
+        elif typ == "assistant.message":
+            parts = []
+            r = d.get("reasoningText")
+            if isinstance(r, str) and r.strip():
+                parts.append({"kind": "thinking", "text": _cap(r)})
+            c = d.get("content")
+            if isinstance(c, str) and c.strip():
+                parts.append({"kind": "text", "text": _cap(c)})
+            for tr in d.get("toolRequests") if isinstance(d.get("toolRequests"), list) else []:
+                if not isinstance(tr, dict):
+                    continue
+                name = tr.get("name") if isinstance(tr.get("name"), str) else "?"
+                inp = tr.get("arguments") if isinstance(tr.get("arguments"), dict) else {}
+                t = {"kind": "tool", "name": name, "summary": _tool_summary(name, inp), "input": _cap_obj(inp),
+                     "output": None, "state": "pending"}
+                if isinstance(tr.get("toolCallId"), str):
+                    tools[tr["toolCallId"]] = t
+                parts.append(t)
+            _codex_add(turns, "assistant", parts)
+        elif typ == "tool.execution_complete":
+            t = tools.get(d.get("toolCallId"))
+            if t is None:
+                continue
+            ok = d.get("success") is True
+            src = d.get("result") if ok else d.get("error")
+            out = src.get("content" if ok else "message") if isinstance(src, dict) else None
+            t["output"] = _cap(_strip_ansi(out)) if isinstance(out, str) else None
+            t["state"] = "ok" if ok else "error"
+    cut = len(turns) > limit
+    return turns[-limit:] if limit else turns, cut
+
+
 def parse_transcript(lines, limit=50):
-    """Claude Code 세션 jsonl(또는 Codex rollout jsonl, Gemini chats jsonl) 줄들 → (turns, 잘렸는지)."""
+    """Claude Code 세션 jsonl(또는 Codex rollout jsonl, Gemini chats jsonl, Copilot events.jsonl) 줄들 → (turns, 잘렸는지)."""
     recs = []
     for line in lines:
         line = line.strip()
@@ -1613,6 +1857,8 @@ def parse_transcript(lines, limit=50):
             recs.append(rec)
     if any(_is_gemini_record(r) for r in recs[:50]):
         return _parse_gemini_transcript(recs, limit)
+    if any(_is_copilot_record(r) for r in recs[:50]):
+        return _parse_copilot_transcript(recs, limit)
     turns = []
     tools = {}
     for rec in recs:
@@ -1925,6 +2171,93 @@ def find_gemini_transcript(info, home, runner=None):
         return None, None
     sid = _jsonl_first(best[1]).get("sessionId")
     return (sid if isinstance(sid, str) and SESSION_ID_RE.match(sid) else None), best[1]
+
+
+COPILOT_SCAN_SESSIONS = 50  # 잠금 파일로 못 찾았을 때 폴더를 비교해 볼 최근 세션 수
+COPILOT_CWD_RE = re.compile(r"^cwd:\s*(.+?)\s*$", re.M)
+COPILOT_LOCK_RE = re.compile(r"^inuse\.(\d{1,10})\.lock$")
+
+
+def _child_pids(pid, runner):
+    """바로 아래 자식 pid들(맥·리눅스 pgrep). 못 구하면 []."""
+    exe = next((p for p in ("/usr/bin/pgrep", "/bin/pgrep") if os.path.exists(p)), None)
+    if IS_WINDOWS or not exe:
+        return []
+    try:
+        r = runner([exe, "-P", str(int(pid))], capture_output=True, text=True, timeout=HC_TIMEOUT, shell=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    return [int(x) for x in (r.stdout or "").split() if x.isdigit()]
+
+
+def copilot_dir(home):
+    env = os.environ.get("COPILOT_HOME")
+    return os.path.expanduser(env) if env else os.path.join(home, ".copilot")
+
+
+def _copilot_workspace_cwd(sdir):
+    try:
+        m = COPILOT_CWD_RE.search(read_regular_file(os.path.join(sdir, "workspace.yaml"), 64 * 1024)
+                                  .decode("utf-8", "replace"))
+    except OSError:
+        return None
+    if not m:
+        return None
+    v = m.group(1)
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
+        v = v[1:-1]
+    return v
+
+
+def find_copilot_transcript(info, home, runner=None):
+    """Copilot 터미널 → (session_id, events.jsonl). 실측 1.0.114: ~/.copilot/session-state/<id>/events.jsonl.
+    쓰는 동안 파일을 열어 두지 않는다. 살아 있는 세션 폴더에는 inuse.<pid>.lock이 있어 그 pid(또는 그 자식)의 세션을
+    먼저 찾고, 없으면 workspace.yaml의 cwd가 같은 가장 최근 세션."""
+    info = info or {}
+    base = os.path.join(copilot_dir(home), "session-state")
+    try:
+        names = os.listdir(base)
+    except OSError:
+        return None, None
+    entries = []
+    for name in names:
+        if not SESSION_ID_RE.match(name):
+            continue
+        try:
+            st_ = os.stat(os.path.join(base, name, "events.jsonl"), follow_symlinks=False)
+        except OSError:
+            continue
+        if stat.S_ISREG(st_.st_mode):
+            entries.append((st_.st_mtime, name))
+    entries.sort(reverse=True)
+    locks = {}  # 잠금 pid → 세션
+    for _, name in entries:
+        try:
+            for f in os.listdir(os.path.join(base, name)):
+                m = COPILOT_LOCK_RE.match(f)
+                if m:
+                    locks.setdefault(int(m.group(1)), name)
+        except OSError:
+            continue
+    if locks:
+        fg = info.get("foreground")
+        pids = {v for v in (info.get("pid"), fg.get("pid") if isinstance(fg, dict) else None)
+                if isinstance(v, int) and not isinstance(v, bool) and v > 0}
+        hit = next((locks[p] for p in pids if p in locks), None)
+        if hit is None:
+            # npm으로 깐 copilot은 node 런처가 플랫폼 바이너리를 자식으로 띄우고, 잠금은 자식 pid다(실측 1.0.114)
+            kids = [c for p in pids for c in _child_pids(p, runner or subprocess.run)]
+            hit = next((locks[c] for c in kids if c in locks), None)
+        if hit is not None:
+            return hit, os.path.join(base, hit, "events.jsonl")
+    cwd = live_cwd(info)
+    if not cwd:
+        return None, None
+    want = {cwd, os.path.realpath(cwd)}
+    for _, name in entries[:COPILOT_SCAN_SESSIONS]:
+        if _copilot_workspace_cwd(os.path.join(base, name)) in want:
+            return name, os.path.join(base, name, "events.jsonl")
+    return None, None
 
 
 def find_agent_transcript(info, home, runner=None):
@@ -3672,6 +4005,8 @@ PUSH_PROMPT_BUDGET = 0.3   # 푸시용 카드 읽기 상한(초). 넘으면 prom
 # 그래서 Codex만 메뉴가 보일 때까지 이 시간 안에서 다시 읽는다. 끝내 없으면 prompt_id 없이 보낸다.
 CODEX_PUSH_PROMPT_WAIT = 2.0
 CODEX_PUSH_PROMPT_RETRY = 0.15
+# Copilot ask_user 질문 상자는 blocked 이벤트 직후 수십 ms 늦게 그려질 때가 있다(맥북 실측 1.0.114, 4번 중 2번 카드 없이 감).
+COPILOT_PUSH_PROMPT_WAIT = 1.0
 
 
 # ---------------------------------------------------------------- 에이전트 표
@@ -3683,8 +4018,12 @@ CODEX_PUSH_PROMPT_RETRY = 0.15
 #                          끼우므로 호출 때 이름으로 찾는다
 #   push_wait()            blocked 알림 카드를 읽을 시간(초). 메뉴가 늦게 그려지는 에이전트는 그 안에서 다시 읽는다
 #   screen                 hc가 막힘으로 안 보는 화면을 서버가 화면으로 판정하는 방식:
-#                          None, "codex_plan"(hc status + 계획 메뉴만 덧씌움),
+#                          None, "overlay"(hc status를 쓰고, hc가 막힘으로 안 보는 메뉴만 화면으로 덧씌움: 아래 overlay),
 #                          "full"(OSC 7501 상태를 안 보내 hc status가 없다: 화면 메뉴·터미널 제목으로 전부 판정)
+#   overlay                "overlay"일 때 {states: 화면을 볼 hc state들, card(p): 덧씌울 카드인가,
+#                          plan_mode_re: 메뉴는 없고 이 줄이 화면 끝이면 끝남을 잠깐 미룸(없으면 None),
+#                          poll: 상태 이벤트 없이 뜨는 상자라 3초 화면 판정(screen_poll)에 넣는다}
+#   send_guard             화면으로 판정한 막힘이면 메시지 보내기를 409로 막는다(hc는 그 상자를 몰라 글자가 들어간다)
 #   title_blocked/title_working  "full"에서 터미널 제목으로 막힘·작업 중을 아는 정규식(없으면 None)
 #   busy_re                "full"에서 제목이 없을 때 화면 끝 줄로 작업 중을 아는 정규식(없으면 None)
 AGENTS = {
@@ -3695,16 +4034,34 @@ AGENTS = {
     "codex": {"match": is_codex, "parse": _parse_codex_lines, "free_text": _free_text_codex,
               "transcript": lambda info, home, runner=None: find_codex_transcript(info, home, runner=runner),
               "push_wait": lambda: CODEX_PUSH_PROMPT_WAIT, "retry": True,
-              "screen": "codex_plan"},
+              "screen": "overlay",
+              "overlay": {"states": ("done", "idle"), "card": lambda p: p["kind"] == "plan",
+                          "plan_mode_re": CODEX_PLAN_MODE_RE, "poll": False}},
     "gemini": {"match": _named("gemini"), "parse": _parse_gemini_lines, "free_text": _free_text_gemini,
                "transcript": lambda info, home, runner=None: find_gemini_transcript(info, home, runner=runner),
                "push_wait": lambda: PUSH_PROMPT_BUDGET, "retry": False, "screen": "full",
-               "title_blocked": GEMINI_TITLE_BLOCKED_RE, "title_working": GEMINI_TITLE_WORKING_RE, "busy_re": None},
+               "title_blocked": GEMINI_TITLE_BLOCKED_RE, "title_working": GEMINI_TITLE_WORKING_RE, "busy_re": None,
+               "send_guard": True},
+    # Copilot은 OSC 7501로 승인(permission)·질문·계획(question) 막힘을 보낸다. 폴더 신뢰(idle)·autopilot 권한(working)
+    # 상자만 hc가 모른다(실측 1.0.114). 질문 상자는 blocked 직후 조금 늦게 그려질 때가 있어 다시 읽는다.
+    "copilot": {"match": _named("copilot"), "parse": _parse_copilot_lines, "free_text": _free_text_copilot,
+                "transcript": lambda info, home, runner=None: find_copilot_transcript(info, home, runner=runner),
+                "push_wait": lambda: COPILOT_PUSH_PROMPT_WAIT, "retry": True, "screen": "overlay",
+                "overlay": {"states": ("idle", "working", "done"), "card": _copilot_overlay_card,
+                            "plan_mode_re": None, "poll": True},
+                "send_guard": True},
 }
-AGENT_ORDER = ("claude", "codex", "gemini")
+AGENT_ORDER = ("claude", "codex", "gemini", "copilot")
 SCREEN_POLL_INTERVAL = 3.0  # "full" 에이전트 화면 판정 주기(초). 제목 이벤트가 먼저 오면 그때 바로 본다
 SCREEN_SETTLE = 0.6  # 제목은 막힘인데 메뉴를 못 읽었을 때 다시 볼 때까지(초)
 PROMPT_STATUS_KINDS = {"approval": "permission", "confirm": "permission", "question": "question", "plan": "plan"}
+
+
+def _card_status(p):
+    """화면에서 읽은 카드로 만든 막힘 status(app 제외). 승인은 msg "approve <제목>", 질문은 질문 글."""
+    msg = ("approve " + (p["title"] or "")).strip() if p["kind"] in ("approval", "confirm") \
+        else (p["question"] or None if p["kind"] == "question" else None)
+    return {"state": "blocked", "kind": PROMPT_STATUS_KINDS.get(p["kind"], "question"), "msg": msg[:200] if msg else None}
 
 
 class App:
@@ -3793,23 +4150,31 @@ class App:
             return None
         return box.get("p")
 
-    def _codex_plan_status(self, tid, info):
-        """hc가 blocked로 보지 않는 Codex "Implement this plan?" 메뉴가 화면 끝에 살아 있으면
-        (막힘 status, True). 메뉴는 없고 플랜 모드면 (None, True). 그 밖에는 (None, False)."""
-        if self.hooks.has(tid) or agent_spec(agent_kind(info))["screen"] != "codex_plan":
+    def _overlay_status(self, tid, info):
+        """hc가 막힘으로 보지 않는 메뉴(Codex "Implement this plan?", Copilot 폴더 신뢰·autopilot 권한)가 화면 끝에
+        살아 있으면 (막힘 status, True). 메뉴는 없고 플랜 모드면 (None, True). 그 밖에는 (None, False).
+        훅 세션은 화면이 없어 보지 않는다."""
+        if self.hooks.has(tid):
+            return None, False
+        kind = agent_kind(info)
+        over = agent_spec(kind).get("overlay") if agent_spec(kind)["screen"] == "overlay" else None
+        if not over:
             return None, False
         st = status_of(info)
-        if st.get("state") not in ("done", "idle"):
+        if st.get("state") not in over["states"]:
             return None, False
         try:
             text = (self.hc.read(tid, 0) or {}).get("text", "")
         except HcError:
             return None, False
-        p = parse_prompt(text, agent="codex")
-        if p and p["kind"] == "plan":
-            return dict(st, state="blocked", kind="plan", msg=None), True
+        p = parse_prompt(text, agent=kind)
+        if p and over["card"](p):
+            return dict(st, **_card_status(p)), True
+        mode_re = over.get("plan_mode_re")
+        if not mode_re:
+            return None, False
         tail = [ln for ln in screen_lines(text) if ln.strip()][-1:]
-        return None, bool(tail and CODEX_PLAN_MODE_RE.search(tail[0]))
+        return None, bool(tail and mode_re.search(tail[0]))
 
     def _screen_status(self, tid, info, commit=False, settle=False):
         """hc status가 없는 에이전트("full")의 status를 화면·제목으로 만든다.
@@ -3827,10 +4192,7 @@ class App:
         prev_st = self._screen_state.get(tid) or {}
         prev = prev_st.get("state")
         if p:
-            msg = ("approve " + (p["title"] or "")).strip() if p["kind"] in ("approval", "confirm") \
-                else (p["question"] or None if p["kind"] == "question" else None)
-            st = {"app": kind, "state": "blocked", "kind": PROMPT_STATUS_KINDS.get(p["kind"], "question"),
-                  "msg": msg[:200] if msg else None}
+            st = dict({"app": kind}, **_card_status(p))
         elif spec.get("title_blocked") and spec["title_blocked"].search(title):
             if prev == "blocked":
                 st = prev_st  # 같은 상자에서 PC나 앱이 고르는 중(직접 입력 칸 등): 새 막힘이 아니다
@@ -3857,13 +4219,14 @@ class App:
 
     def effective_info(self, tid, info):
         """화면으로 판정한 막힘이 있으면 status를 바꾼 사본(카드·답·목록이 막힘으로 다룬다).
-        Codex는 계획 실행 메뉴만, hc status가 없는 에이전트("full")는 status 전체."""
+        "overlay"(Codex 계획 실행 메뉴, Copilot 폴더 신뢰·autopilot 권한)는 그 메뉴만, hc status가 없는 에이전트("full")는
+        status 전체."""
         if agent_spec(agent_kind(info))["screen"] == "full":
             st = self._screen_status(tid, info)
             info = dict(info)
             info["status"] = st or self._screen_state.get(tid) or {"app": agent_kind(info), "state": "idle"}
             return info
-        plan_st, _ = self._codex_plan_status(tid, info)
+        plan_st, _ = self._overlay_status(tid, info)
         if plan_st:
             info = dict(info)
             info["status"] = plan_st
@@ -3894,7 +4257,7 @@ class App:
                     turn = self._screen_turns.get(tid)
                     plan_st, plan_mode = None, False
                 else:
-                    plan_st, plan_mode = self._codex_plan_status(tid, info)
+                    plan_st, plan_mode = self._overlay_status(tid, info)
                 if plan_st:
                     st = plan_st  # 계획 실행 메뉴: 끝남 대신 막힘으로(끝남 알림을 따로 보내지 않는다)
                 elif plan_mode and st.get("state") == "done" and not settle:
@@ -4042,9 +4405,11 @@ class App:
             backoff = min(backoff * 2, EVENTS_MAX_BACKOFF)
 
     def screen_poll(self):
-        """hc status가 없는 에이전트("full") 터미널만 화면으로 다시 판정한다(제목 이벤트를 놓쳐도 잡히게)."""
+        """hc status가 없는 에이전트("full")와 상태 이벤트 없이 상자가 뜨는 에이전트(overlay poll) 터미널만
+        화면으로 다시 판정한다(제목 이벤트를 놓치거나 working 중에 상자가 떠도 잡히게)."""
         for tid, kind in list(self._agent_kinds.items()):
-            if kind and agent_spec(kind)["screen"] == "full":
+            spec = agent_spec(kind) if kind else None
+            if spec and (spec["screen"] == "full" or (spec.get("overlay") or {}).get("poll")):
                 self.refresh(tid)
 
     def screen_poll_loop(self):
@@ -4601,7 +4966,7 @@ class App:
         text = validate_text(body.get("text"))
         with self.term_lock(tid):
             info = self.require_claude(tid)
-            if agent_spec(agent_kind(info))["screen"] == "full" \
+            if agent_spec(agent_kind(info)).get("send_guard") \
                     and status_of(self.effective_info(tid, info)).get("state") == "blocked":
                 # hc는 이 에이전트의 대화 상자를 모른다: 그대로 보내면 메뉴에 글자가 들어간다
                 raise ApiError(409, "hc_refused", detail="blocked")
