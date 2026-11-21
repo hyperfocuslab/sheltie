@@ -2815,6 +2815,10 @@ class BranchCache:
 # ---------------------------------------------------------------- 앱
 
 PUSH_PROMPT_BUDGET = 0.3   # 푸시용 카드 읽기 상한(초). 넘으면 prompt_id 없이 보낸다(알림 속도 우선).
+# Codex는 hc가 blocked로 알린 뒤 0.9초쯤 지나서야 승인 메뉴가 화면에 그려진다(맥미니 실측, 0.171.0).
+# 그래서 Codex만 메뉴가 보일 때까지 이 시간 안에서 다시 읽는다. 끝내 없으면 prompt_id 없이 보낸다.
+CODEX_PUSH_PROMPT_WAIT = 2.0
+CODEX_PUSH_PROMPT_RETRY = 0.15
 
 
 class App:
@@ -2870,16 +2874,27 @@ class App:
         box = {}
         agent = self._agent_kinds.get(tid)
 
+        budget = CODEX_PUSH_PROMPT_WAIT if agent == "codex" else PUSH_PROMPT_BUDGET
+        end = time.monotonic() + budget
+        stop = threading.Event()
+
         def work():
             try:
-                box["p"] = self.parse_screen((self.hc.read(tid, 0) or {}).get("text", ""), agent)
+                while True:
+                    box["p"] = self.parse_screen((self.hc.read(tid, 0) or {}).get("text", ""), agent)
+                    if box["p"] or agent != "codex" or stop.is_set() \
+                            or time.monotonic() + CODEX_PUSH_PROMPT_RETRY >= end:
+                        return
+                    time.sleep(CODEX_PUSH_PROMPT_RETRY)
             except Exception:  # noqa: BLE001 - 카드 실패가 알림을 막지 않게
                 box["p"] = None
         th = threading.Thread(target=work, name="push-prompt", daemon=True)
         th.start()
-        th.join(PUSH_PROMPT_BUDGET)
+        th.join(budget)
+        stop.set()
         if th.is_alive():
-            log.info("카드 읽기 %dms 초과 %s, prompt_id 없이 보낸다", int(PUSH_PROMPT_BUDGET * 1000), tid)
+            log.info("카드 읽기 %dms 초과 %s, prompt_id 없이 보낸다", int(budget * 1000), tid)
+            return None
         return box.get("p")
 
     def refresh(self, tid, event_state=None, initial=False, name=None, detected=None):

@@ -174,6 +174,39 @@ class CodexApiTests(unittest.TestCase):
         self.assertEqual((p["category"], p["kind"], p["prompt_id"]),
                          ("HR_PERMISSION_ALWAYS", "approval", card("patch")["id"]))
 
+    def test_push_waits_for_menu_drawn_after_blocked(self):
+        # 맥미니 실측: hc가 blocked를 알린 뒤 0.9초쯤 지나야 승인 메뉴가 그려진다
+        self.hc.set_status("c1", {"app": "codex", "state": "working"})
+        self.app.poll(initial=True)
+        screens = [cx("idle"), cx("idle"), cx("idle")]
+        real_read = self.hc.read
+
+        def read(tid, lines=0):
+            if screens:
+                self.hc.read_calls += 1
+                return {"text": screens.pop(0)}
+            return real_read(tid, lines)
+        self.hc.read = read
+        self.hc.screens["c1"] = cx("exec")
+        self.hc.set_status("c1", BLOCKED_PERM)
+        self.app.handle_event_line(status_ev("c1", BLOCKED_PERM))
+        p = self.pusher.payloads[-1]
+        self.assertEqual((p["category"], p["prompt_id"]), ("HR_PERMISSION", card("exec")["id"]))
+        self.assertEqual(self.hc.read_calls, 4)
+
+    def test_push_without_menu_gives_up_within_wait(self):
+        import time
+        self.hc.set_status("c1", {"app": "codex", "state": "working"})
+        self.app.poll(initial=True)
+        self.hc.screens["c1"] = cx("idle")
+        self.hc.set_status("c1", BLOCKED_PERM)
+        t0 = time.monotonic()
+        with mock.patch.object(hr, "CODEX_PUSH_PROMPT_WAIT", 0.5):
+            self.app.handle_event_line(status_ev("c1", BLOCKED_PERM))
+        self.assertLess(time.monotonic() - t0, 1.0)
+        p = self.pusher.payloads[-1]
+        self.assertEqual((p["category"], p["prompt_id"]), ("HR_BLOCKED", None))  # 카드 없으면 버튼 없는 알림
+
     def test_claude_terminal_still_uses_claude_parser(self):
         self.hc.add("t1", st("blocked", "approve Bash: mkdir sub", "permission"))
         self.hc.screens["t1"] = fixture("claude-bash-2.1.329.txt")
