@@ -143,7 +143,9 @@ LIVE_ACTIVITY_MIN_GAP = 5.0  # 같은 기기 Live Activity 푸시 최소 간격(
 LIVE_ACTIVITY_START_WAIT = 60.0  # start를 보낸 뒤 앱이 Activity 토큰을 올릴 때까지 다시 start하지 않는 시간(초)
 LIVE_ACTIVITY_ATTRIBUTES_TYPE = "SheltieActivityAttributes"  # 앱 확장의 ActivityAttributes 타입 이름
 LIVE_ACTIVITY_TTL = 3600  # 갱신 푸시 유효기간(초)
-LIVE_ACTIVITY_END_LINGER = 5  # 끝(end) 뒤 잠금화면에 남기는 시간(초)
+LIVE_ACTIVITY_END_LINGER = 0  # 끝(end) 뒤 잠금화면에 남기는 시간(초). 0이면 바로 내린다
+LIVE_ACTIVITY_STALE = 900  # start·update에 넣는 stale-date(초 뒤). end를 못 보내도 낡은 것으로 표시된다
+LIVE_ACTIVITY_REFRESH = 600  # 막힘이 그대로여도 이만큼 지나면 update로 stale-date를 늦춘다(초)
 
 ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 DEVICE_TOKEN_RE = re.compile(r"^[0-9a-fA-F]{32,200}$")
@@ -7282,14 +7284,16 @@ def live_activity_signature(state):
 
 
 def live_activity_action(entry, state, last_sig, last_at, now, min_gap=LIVE_ACTIVITY_MIN_GAP,
-                         start_wait=LIVE_ACTIVITY_START_WAIT):
+                         start_wait=LIVE_ACTIVITY_START_WAIT, refresh=LIVE_ACTIVITY_REFRESH):
     """이 기기에 지금 무엇을 보낼지. "start" | "update" | "end" | "wait"(최소 간격 때문에 미룸) | None(할 일 없음).
-    now·last_at·entry["started_at"]은 같은 시계(초)."""
+    now·last_at·entry["started_at"]은 같은 시계(초). 상태가 그대로여도 refresh초가 지나면 update(stale-date 연장)."""
     n = state["blockedCount"]
     if entry.get("activity_token"):
         if n == 0:
             action = "end"
         elif live_activity_signature(state) != last_sig:
+            action = "update"
+        elif last_at is not None and now - last_at >= refresh:
             action = "update"
         else:
             return None
@@ -7304,6 +7308,9 @@ def live_activity_action(entry, state, last_sig, last_at, now, min_gap=LIVE_ACTI
 
 def live_activity_payload(action, state, now_s, pc_name=None, server=None):
     aps = {"timestamp": int(now_s), "event": action, "content-state": state}
+    if action in ("start", "update"):
+        # 서버가 end를 못 보내는 경우(앱이 Activity 토큰을 못 올림, 서버 꺼짐)에도 오래된 막힘이 새것처럼 남지 않게.
+        aps["stale-date"] = int(now_s) + LIVE_ACTIVITY_STALE
     if action == "start":
         aps["attributes-type"] = LIVE_ACTIVITY_ATTRIBUTES_TYPE
         aps["attributes"] = {"pcName": pc_name or "", "serverTag": server or ""}

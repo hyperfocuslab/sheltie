@@ -85,14 +85,26 @@ class DecisionTests(unittest.TestCase):
         self.assertEqual(hr.live_activity_action({"activity_token": ACT}, s, None, 97.0, 100.0), "wait")
         self.assertEqual(hr.live_activity_action({"activity_token": ACT}, s, None, 94.0, 100.0), "update")
 
+    def test_refresh_before_stale(self):
+        # 같은 상태여도 오래되면 stale-date를 늦추려고 다시 update한다
+        s = self.state(1)
+        sig = hr.live_activity_signature(s)
+        self.assertIsNone(hr.live_activity_action({"activity_token": ACT}, s, sig, 100.0, 100.0 + hr.LIVE_ACTIVITY_REFRESH - 1))
+        self.assertEqual(hr.live_activity_action({"activity_token": ACT}, s, sig, 100.0, 100.0 + hr.LIVE_ACTIVITY_REFRESH),
+                         "update")
+        self.assertLess(hr.LIVE_ACTIVITY_REFRESH, hr.LIVE_ACTIVITY_STALE)
+
     def test_payloads(self):
         s = self.state(2)
         up = hr.live_activity_payload("update", s, 123.9)
-        self.assertEqual(up, {"aps": {"timestamp": 123, "event": "update", "content-state": s}})
+        self.assertEqual(up, {"aps": {"timestamp": 123, "event": "update", "content-state": s,
+                                      "stale-date": 123 + hr.LIVE_ACTIVITY_STALE}})
         end = hr.live_activity_payload("end", self.state(0), 123)
         self.assertEqual(end["aps"]["event"], "end")
-        self.assertEqual(end["aps"]["dismissal-date"], 123 + hr.LIVE_ACTIVITY_END_LINGER)
+        self.assertEqual(end["aps"]["dismissal-date"], 123)  # 바로 내린다
+        self.assertNotIn("stale-date", end["aps"])
         st = hr.live_activity_payload("start", s, 123, pc_name="Mac", server="abc")
+        self.assertEqual(st["aps"]["stale-date"], 123 + hr.LIVE_ACTIVITY_STALE)
         self.assertEqual(st["aps"]["attributes-type"], "SheltieActivityAttributes")
         self.assertEqual(st["aps"]["attributes"], {"pcName": "Mac", "serverTag": "abc"})
         self.assertIn("alert", st["aps"])
@@ -148,6 +160,40 @@ class FlowTests(unittest.TestCase):
         self.assertEqual([x["payload"]["aps"]["event"] for x in self.pusher.la], ["start", "update"])
         self.assertEqual(self.pusher.la[1]["token"], ACT)
         self.assertEqual(self.pusher.la[1]["payload"]["aps"]["content-state"]["blockedCount"], 2)
+
+    def test_start_without_activity_token_goes_stale(self):
+        """2026-11-21 실기기: push-to-start 뒤 앱이 Activity 토큰을 안 올려 end를 못 보냈고 Dynamic Island에 남았다.
+        서버가 end를 못 보내도 start에 넣은 stale-date가 지나면 Activity가 낡은 것으로 표시된다."""
+        self.app.live_activity.set(DEV, start_token=START)
+        self.block("t1")
+        aps = self.pusher.la[0]["payload"]["aps"]
+        self.assertEqual(aps["event"], "start")
+        self.assertEqual(aps["stale-date"], int(self.wall.t) + hr.LIVE_ACTIVITY_STALE)
+        # 토큰이 안 왔으면 막힘이 풀려도 보낼 곳이 없다(end 대상 없음)
+        self.wall.t += 30
+        self.block("t1", base.st("working"))
+        self.assertEqual(len(self.pusher.la), 1)
+        self.assertEqual(self.app.live_activity.get(DEV), {"start_token": START, "started_at": self.wall.t - 30})
+
+    def test_start_then_token_then_end(self):
+        """start 뒤 앱이 Activity 토큰을 올리면 update가 그 토큰으로 가고, 막힘이 풀리면 end(즉시 내림)가 간다."""
+        self.app.live_activity.set(DEV, start_token=START)
+        self.block("t1")
+        self.wall.t += 2
+        self.app.api_live_activity({"device": DEV, "activity_token": ACT})  # 새 토큰은 최소 간격과 상관없이 바로
+        self.assertEqual([x["payload"]["aps"]["event"] for x in self.pusher.la], ["start", "update"])
+        self.assertEqual(self.pusher.la[1]["token"], ACT)
+        self.assertEqual(self.pusher.la[1]["payload"]["aps"]["stale-date"], int(self.wall.t) + hr.LIVE_ACTIVITY_STALE)
+        # 오래 막혀 있으면 stale-date를 늦추는 update
+        self.wall.t += hr.LIVE_ACTIVITY_REFRESH
+        self.app.poll()
+        self.assertEqual([x["payload"]["aps"]["event"] for x in self.pusher.la], ["start", "update", "update"])
+        self.wall.t += 10
+        self.block("t1", base.st("working"))
+        end = self.pusher.la[-1]
+        self.assertEqual((end["token"], end["payload"]["aps"]["event"]), (ACT, "end"))
+        self.assertEqual(end["payload"]["aps"]["dismissal-date"], int(self.wall.t))
+        self.assertEqual(self.app.live_activity.get(DEV), {"start_token": START})
 
     def test_no_start_when_nothing_blocked_or_no_tokens(self):
         self.app.live_activity.set(DEV, start_token=START)
