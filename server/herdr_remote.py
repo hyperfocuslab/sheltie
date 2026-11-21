@@ -1741,6 +1741,8 @@ def push_category(state, status, prompt=None):
     return "HR_BLOCKED"
 
 
+TIME_SENSITIVE_CATEGORIES = {"HR_PERMISSION", "HR_PERMISSION_ALWAYS", "HR_BLOCKED"}
+
 # 알림 문구는 앱의 String Catalog 키(loc-key)로 보내 기기 언어로 보이게 한다.
 # 평문 subtitle/body(영어)는 키를 모르는 구버전 앱과 로그용이다.
 SUBTITLES = {"HR_PERMISSION": "Needs permission", "HR_PERMISSION_ALWAYS": "Needs permission",
@@ -1804,13 +1806,12 @@ def build_payload(tid, name, state, status, prompt=None, exit_code=None):
         alert["loc-key"] = loc_key
         if loc_args:
             alert["loc-args"] = loc_args
+    aps = {"alert": alert, "sound": "default", "category": cat, "thread-id": tid}
+    if cat in TIME_SENSITIVE_CATEGORIES:
+        # 에이전트가 답을 기다리는 알림: 집중 모드에서도 배너·소리가 나게(앱에 Time Sensitive 엔타이틀먼트).
+        aps["interruption-level"] = "time-sensitive"
     payload = {
-        "aps": {
-            "alert": alert,
-            "sound": "default",
-            "category": cat,
-            "thread-id": tid,
-        },
+        "aps": aps,
         "terminal": tid,
         "name": name,
         "state": state,

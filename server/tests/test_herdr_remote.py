@@ -392,6 +392,16 @@ class ApnsTests(unittest.TestCase):
         self.assertEqual((a["loc-key"], a["loc-args"], a["body"]),
                          ("push.body.exited.code", ["2"], "Terminal exited (exit 2)"))
 
+    def test_interruption_level(self):
+        def level(*a, **k):
+            return hr.build_payload("t1", "n", *a, **k)["aps"].get("interruption-level")
+        self.assertEqual(level("blocked", PERM), "time-sensitive")
+        self.assertEqual(level("blocked", {"kind": "question"}), "time-sensitive")
+        self.assertEqual(level("blocked", {}, prompt={"id": "p", "kind": "approval", "body": "x", "always_index": 1}),
+                         "time-sensitive")
+        self.assertIsNone(level("done", {}))
+        self.assertIsNone(level("exited", None, exit_code=1))
+
     def test_plain_fallback_has_no_hangul(self):
         import re
         for args, kw in [(("done", {}), {}), (("blocked", PERM), {}), (("blocked", {}), {}),
