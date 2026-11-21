@@ -108,6 +108,9 @@ class DecisionTests(unittest.TestCase):
         self.assertEqual(st["aps"]["attributes-type"], "SheltieActivityAttributes")
         self.assertEqual(st["aps"]["attributes"], {"pcName": "Mac", "serverTag": "abc"})
         self.assertIn("alert", st["aps"])
+        # push로 시작된 Activity가 갱신·종료용 push token을 받으려면 필요하다(iOS 18). 없으면 서버가 end를 못 보낸다.
+        self.assertEqual(st["aps"]["input-push-token"], 1)
+        self.assertNotIn("input-push-token", up["aps"])
         # content-state 키는 앱 확장의 ContentState와 같다
         self.assertEqual(set(s), {"blockedCount", "oldestTerminal", "oldestName", "oldestSummary", "oldestSinceMs", "updatedAt"})
         json.dumps(st)

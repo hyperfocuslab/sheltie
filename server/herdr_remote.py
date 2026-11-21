@@ -7314,6 +7314,8 @@ def live_activity_payload(action, state, now_s, pc_name=None, server=None):
     if action == "start":
         aps["attributes-type"] = LIVE_ACTIVITY_ATTRIBUTES_TYPE
         aps["attributes"] = {"pcName": pc_name or "", "serverTag": server or ""}
+        # 이게 없으면 push로 시작된 Activity에 갱신·종료용 push token이 안 나와 서버가 end를 못 보낸다(실기기 확인).
+        aps["input-push-token"] = 1
         aps["alert"] = {"title": pc_name or "Sheltie", "body": state["oldestName"] or "Input needed"}
     elif action == "end":
         aps["dismissal-date"] = int(now_s) + LIVE_ACTIVITY_END_LINGER
