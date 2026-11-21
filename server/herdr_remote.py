@@ -380,6 +380,38 @@ def is_claude(info):
     return False
 
 
+def _binary_base(arg0):
+    if IS_WINDOWS:
+        base = ntpath.basename(arg0).lower()
+        for ext in (".exe", ".cmd"):
+            if base.endswith(ext):
+                return base[:-len(ext)]
+        return base
+    return os.path.basename(arg0)
+
+
+def is_codex(info):
+    """OpenAI Codex CLI 터미널. hc가 agent·status.app을 codex로 알려 주거나 앞 프로그램이 codex다."""
+    info = info or {}
+    if info.get("agent") == "codex" or status_of(info).get("app") == "codex":
+        return True
+    fg = info.get("foreground")
+    if isinstance(fg, dict):
+        argv = fg.get("argv")
+        if isinstance(argv, list) and argv and isinstance(argv[0], str) and _binary_base(argv[0]) == "codex":
+            return True
+    return False
+
+
+def agent_kind(info):
+    """잠금화면 답·대화 보기·메시지 보내기를 지원하는 에이전트 종류: "claude", "codex", 아니면 None."""
+    if is_claude(info):
+        return "claude"
+    if is_codex(info):
+        return "codex"
+    return None
+
+
 def is_permission(status):
     msg = status.get("msg") or ""
     if msg == TRUST_MSG:
@@ -876,8 +908,98 @@ def _parse_confirm(lines):
                    reject_index=reject_index(labels))
 
 
-def parse_prompt(screen_text, plan_reader=None):
-    """화면 글자 → 활성 메뉴 카드(dict) 또는 None. plan_reader(path)는 계획 파일 본문을 준다."""
+# ---- Codex CLI 메뉴. 실측: codex-cli 0.171.0, 200열(tests/fixtures/codex-*-0.171.0.txt).
+# 커서는 `›`, 숫자 키가 그 항목을 바로 고르고 제출한다(승인·질문 모두). 모르는 화면은 None(카드·버튼 없음).
+CODEX_APPROVAL_HINT_RE = re.compile(r"^Press enter to confirm or esc to cancel$")
+CODEX_APPROVAL_Q_RE = re.compile(r"^Would you like to (.+)\?$")
+CODEX_QUESTION_HINT_RE = re.compile(r"^tab to add notes \| enter to submit (?:answer|all)\b")
+CODEX_QUESTION_HEAD_RE = re.compile(r"^Question (\d+)/(\d+)\b")
+CODEX_SHORTCUT_RE = re.compile(r"\s+\(([a-z]|esc)\)$")
+CODEX_FREE_TEXT = "None of the above"
+CODEX_APPROVAL_TITLES = {"run the following command": "Run command", "make the following edits": "Edit files"}
+
+
+def _codex_hint(lines, rx):
+    tail = _meaningful_tail(lines, 1)
+    if not tail or not rx.match(lines[tail[0]].strip()):
+        return -1
+    return tail[0]
+
+
+def _find_above(lines, h, rx, span=40):
+    for i in range(h - 1, max(-1, h - span), -1):
+        if rx.match(lines[i].strip()):
+            return i
+    return -1
+
+
+def _parse_codex_approval(lines):
+    h = _codex_hint(lines, CODEX_APPROVAL_HINT_RE)
+    if h < 0:
+        return None
+    q = _find_above(lines, h, CODEX_APPROVAL_Q_RE)
+    if q < 0:
+        return None
+    rows = _menu_rows(lines, q + 1, h)
+    if len(rows) < 2 or sum(1 for r in rows if r["selected"]) != 1:
+        return None
+    labels, shortcuts = [], []
+    for r in rows:
+        lb = _norm(" ".join([r["label"]] + r["extra"]))
+        m = CODEX_SHORTCUT_RE.search(lb)
+        labels.append(lb[:m.start()] if m else lb)
+        shortcuts.append(m.group(1) if m else None)
+    body = _dedent_block(lines[q + 1:rows[0]["line"]])
+    question = lines[q].strip()
+    title = CODEX_APPROVAL_TITLES.get(CODEX_APPROVAL_Q_RE.match(question).group(1).lower(), question)
+
+    def yes_with(key):  # (a)=이 세션 동안 허용, (p)=규칙 파일(~/.codex/rules)에 영구 허용. 실측 0.171.0
+        return next((k for k, (lb, s) in enumerate(zip(labels, shortcuts))
+                     if s == key and re.match(r"^yes\b", lb.lower())), None)
+    p = _finish("approval", title, question, body, [(lb, None, r["num"]) for lb, r in zip(labels, rows)],
+                selected=next(k for k, r in enumerate(rows) if r["selected"]),
+                always_index=yes_with("a"), reject_index=reject_index(labels), persist_index=yes_with("p"))
+    p["agent"] = "codex"
+    return p
+
+
+def _parse_codex_question(lines):
+    h = _codex_hint(lines, CODEX_QUESTION_HINT_RE)
+    if h < 0:
+        return None
+    head = _find_above(lines, h, CODEX_QUESTION_HEAD_RE, span=64)
+    if head < 0:
+        return None
+    rows = _menu_rows(lines, head + 1, h)
+    if len(rows) < 2 or sum(1 for r in rows if r["selected"]) != 1:
+        return None
+    question = _norm(" ".join(ln.strip() for ln in lines[head + 1:rows[0]["line"]] if ln.strip()))
+    if not question:
+        return None
+    opts = []
+    for r in rows:
+        parts = re.split(r"\s{2,}", r["label"], maxsplit=1)
+        desc = _norm(" ".join(parts[1:] + r["extra"])) or None
+        opts.append((parts[0].strip(), desc, r["num"]))
+    m = CODEX_QUESTION_HEAD_RE.match(lines[head].strip())
+    title = "Question %s/%s" % (m.group(1), m.group(2)) if m.group(2) != "1" else None
+    free = next((k for k, o in enumerate(opts) if o[0] == CODEX_FREE_TEXT), None)
+    p = _finish("question", title, question, None, opts,
+                selected=next(k for k, r in enumerate(rows) if r["selected"]), free_text_index=free)
+    p["agent"] = "codex"
+    return p
+
+
+def parse_codex_prompt(screen_text):
+    lines = screen_lines(screen_text)
+    return _parse_codex_approval(lines) or _parse_codex_question(lines)
+
+
+def parse_prompt(screen_text, plan_reader=None, agent=None):
+    """화면 글자 → 활성 메뉴 카드(dict) 또는 None. plan_reader(path)는 계획 파일 본문을 준다.
+    agent가 "codex"면 Codex 화면으로 읽는다(그 밖에는 Claude Code 화면)."""
+    if agent == "codex":
+        return parse_codex_prompt(screen_text)
     lines = screen_lines(screen_text)
     for fn in (_parse_question, _parse_submit, _parse_approval, _parse_confirm):
         p = fn(lines)
@@ -966,6 +1088,14 @@ def answer_steps(p, option_index=None, option_indices=None, text=None):
             raise ApiError(400, "no_free_text")
         if "\n" in text or "\t" in text:
             raise ApiError(400, "bad_text")
+        if p.get("agent") == "codex":
+            # Codex: 숫자는 그 항목으로 바로 제출한다. 커서를 "None of the above"로 옮기고 tab으로 메모 칸을 연 뒤
+            # 붙여넣기+enter(실측 0.171.0: 답 "None of the above" + 메모가 간다).
+            cur = p.get("selected")
+            keys = nav_keys(None if cur is None else num(cur), num(fi))
+            if keys is None:
+                raise ApiError(409, "no_cursor")
+            return [("keys", keys + ["tab"]), ("text", text)]
         if num(fi) > 9:
             raise ApiError(400, "bad_option")
         return [("keys", [str(num(fi))]), ("text", text)]
@@ -1074,8 +1204,71 @@ def _hidden(text):
     return text.lstrip().startswith(HIDDEN_USER_PREFIXES)
 
 
+CODEX_HIDDEN_USER_PREFIXES = ("<", "# AGENTS.md instructions")
+
+
+def _codex_add(turns, role, parts):
+    if not parts:
+        return
+    if role == "assistant" and turns and turns[-1]["role"] == "assistant":
+        turns[-1]["parts"].extend(parts)
+    else:
+        turns.append({"role": role, "parts": parts})
+
+
+def _codex_record(p, turns, tools):
+    """Codex rollout의 response_item 하나를 Claude 대화와 같은 turns 모양으로 더한다.
+    message(user/assistant, developer는 숨김), reasoning 요약, function_call·custom_tool_call과 그 output."""
+    if not isinstance(p, dict):
+        return
+    pt = p.get("type")
+    if pt == "message":
+        role = p.get("role")
+        if role not in ("user", "assistant"):
+            return
+        parts = []
+        for c in p.get("content") if isinstance(p.get("content"), list) else []:
+            t = c.get("text") if isinstance(c, dict) else None
+            if not isinstance(t, str) or not t.strip():
+                continue
+            if role == "user" and t.lstrip().startswith(CODEX_HIDDEN_USER_PREFIXES):
+                continue  # 환경·지침 주입(<environment_context>, AGENTS.md 등)
+            parts.append({"kind": "text", "text": _cap(t)})
+        _codex_add(turns, role, parts)
+    elif pt == "reasoning":
+        summ = p.get("summary") if isinstance(p.get("summary"), list) else []
+        text = "\n\n".join(s["text"] for s in summ if isinstance(s, dict) and isinstance(s.get("text"), str)).strip()
+        if text:
+            _codex_add(turns, "assistant", [{"kind": "thinking", "text": _cap(text)}])
+    elif pt in ("function_call", "custom_tool_call"):
+        name = p.get("name") if isinstance(p.get("name"), str) else "?"
+        if pt == "function_call":
+            try:
+                inp = json.loads(p.get("arguments") or "{}")
+            except (TypeError, ValueError):
+                inp = {"arguments": p.get("arguments")}
+            if not isinstance(inp, dict):
+                inp = {"arguments": inp}
+        else:
+            inp = {"input": p.get("input") if isinstance(p.get("input"), str) else ""}
+        summary = _tool_summary(name, {"command": inp["cmd"]} if isinstance(inp.get("cmd"), str) else inp)
+        t = {"kind": "tool", "name": name, "summary": summary, "input": _cap_obj(inp), "output": None,
+             "state": "pending"}
+        if isinstance(p.get("call_id"), str):
+            tools[p["call_id"]] = t
+        _codex_add(turns, "assistant", [t])
+    elif pt in ("function_call_output", "custom_tool_call_output"):
+        t = tools.get(p.get("call_id"))
+        if t is not None:
+            out = p.get("output")
+            if isinstance(out, dict):
+                out = out.get("content")
+            t["output"] = _cap(_strip_ansi(_result_text(out)))
+            t["state"] = "ok"
+
+
 def parse_transcript(lines, limit=50):
-    """Claude Code 세션 jsonl 줄들 → (turns, 잘렸는지)."""
+    """Claude Code 세션 jsonl(또는 Codex rollout jsonl) 줄들 → (turns, 잘렸는지)."""
     turns = []
     tools = {}
     for line in lines:
@@ -1089,6 +1282,9 @@ def parse_transcript(lines, limit=50):
         if not isinstance(rec, dict) or rec.get("isMeta") or rec.get("isSidechain"):
             continue
         typ = rec.get("type")
+        if typ == "response_item":  # Codex rollout 줄
+            _codex_record(rec.get("payload"), turns, tools)
+            continue
         if typ not in ("user", "assistant"):
             continue
         msg = rec.get("message")
@@ -1227,6 +1423,106 @@ def find_transcript(info, home, runner=None, filetime=None):
     return sid, None
 
 
+CODEX_ROLLOUT_RE = re.compile(r"^rollout-[0-9T:-]+-([0-9a-fA-F-]{8,64})\.jsonl$")
+CODEX_SCAN_DAYS = 3
+
+
+def codex_sessions_dir(home):
+    env = os.environ.get("CODEX_HOME")
+    return os.path.join(os.path.expanduser(env) if env else os.path.join(home, ".codex"), "sessions")
+
+
+def _codex_rollout(path, base):
+    """base(sessions) 아래 일반 파일인 rollout-*.jsonl이면 (session_id, path)."""
+    m = CODEX_ROLLOUT_RE.match(os.path.basename(path))
+    if not m:
+        return None
+    real = os.path.realpath(path)
+    root = os.path.realpath(base)
+    if not real.startswith(root + os.sep) or os.path.islink(path) or not os.path.isfile(path):
+        return None
+    return m.group(1), path
+
+
+def _lsof_rollouts(pid, base, runner):
+    """그 프로세스가 열어 둔 rollout 파일(맥·리눅스). Codex는 세션 동안 rollout을 열어 둔다(실측 0.171.0)."""
+    exe = next((p for p in ("/usr/sbin/lsof", "/usr/bin/lsof") if os.path.exists(p)), None)
+    if not exe:
+        return None
+    try:
+        r = runner([exe, "-a", "-p", str(int(pid)), "-Fn"], capture_output=True, text=True,
+                   timeout=HC_TIMEOUT, shell=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    for ln in (r.stdout or "").splitlines():
+        if ln.startswith("n"):
+            hit = _codex_rollout(ln[1:], base)
+            if hit:
+                return hit
+    return None
+
+
+def _rollout_cwd(path):
+    try:
+        data = read_regular_file(path, 512 * 1024)
+    except OSError:
+        return None
+    first = data.split(b"\n", 1)[0]
+    try:
+        rec = json.loads(first.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    p = rec.get("payload") if isinstance(rec, dict) and rec.get("type") == "session_meta" else None
+    return p.get("cwd") if isinstance(p, dict) and isinstance(p.get("cwd"), str) else None
+
+
+def _latest_rollout_in(cwd, base):
+    """열린 파일을 못 볼 때(Windows 등): 최근 며칠 rollout 중 같은 폴더에서 시작한 가장 최근 수정 파일."""
+    if not isinstance(cwd, str):
+        return None
+    want = os.path.normcase(os.path.realpath(cwd))
+    cands = []
+    try:
+        for y in sorted(os.listdir(base), reverse=True)[:2]:
+            for mo in sorted(os.listdir(os.path.join(base, y)), reverse=True)[:2]:
+                for d in sorted(os.listdir(os.path.join(base, y, mo)), reverse=True)[:CODEX_SCAN_DAYS]:
+                    folder = os.path.join(base, y, mo, d)
+                    for name in os.listdir(folder):
+                        hit = _codex_rollout(os.path.join(folder, name), base)
+                        if hit:
+                            cands.append((os.stat(hit[1]).st_mtime, hit))
+    except OSError:
+        pass
+    for _, hit in sorted(cands, reverse=True)[:30]:
+        c = _rollout_cwd(hit[1])
+        if c and os.path.normcase(os.path.realpath(c)) == want:
+            return hit
+    return None
+
+
+def find_codex_transcript(info, home, runner=None):
+    """Codex 터미널 → (session_id, rollout 경로) 또는 (None, None)."""
+    info = info or {}
+    runner = runner or subprocess.run
+    base = codex_sessions_dir(home)
+    pid = info.get("pid")
+    if not isinstance(pid, int):
+        fg = info.get("foreground")
+        pid = fg.get("pid") if isinstance(fg, dict) else None
+    hit = None
+    if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 and not IS_WINDOWS:
+        hit = _lsof_rollouts(pid, base, runner)
+    if hit is None:
+        hit = _latest_rollout_in(live_cwd(info), base)
+    return hit if hit else (None, None)
+
+
+def find_agent_transcript(info, home, runner=None):
+    if agent_kind(info) == "codex":
+        return find_codex_transcript(info, home, runner=runner)
+    return find_transcript(info, home, runner=runner)
+
+
 def read_transcript(path, limit=50):
     data = read_regular_file(path, TRANSCRIPT_TAIL, tail=True)
     try:
@@ -1304,7 +1600,7 @@ def terminal_preview(info, home, runner=None, now=None):
         if hit and hit[0] > now:
             sid, path = hit[1]
         else:
-            sid, path = find_transcript(info, home, runner=runner)
+            sid, path = find_agent_transcript(info, home, runner=runner)
             if isinstance(pid, int):
                 if len(_preview_by_pid) > 200:
                     _preview_by_pid.clear()
@@ -2539,6 +2835,7 @@ class App:
         self.home = os.path.realpath(os.path.expanduser(cfg.get("home") or "~"))
         self.plan_reader = make_plan_reader(self.home)
         self.reminders = Reminders(reminder_intervals(cfg))
+        self._agent_kinds = {}  # tid → agent_kind(마지막 hc get). 알림 카드를 어느 화면으로 읽을지 정한다
         self.tracker = Tracker(self._notify, prompt_for=self._prompt_for_push, reminders=self.reminders)
         self.blocked_since = BlockedSince()
         self.branches = BranchCache()
@@ -2565,16 +2862,17 @@ class App:
             log.info("알림 %s %s %s 감지→발송 %dms", p["terminal"], p["state"], p["aps"]["category"],
                      int((self.clock() - t0) * 1000))
 
-    def parse_screen(self, text):
-        return parse_prompt(text, plan_reader=self.plan_reader)
+    def parse_screen(self, text, agent=None):
+        return parse_prompt(text, plan_reader=self.plan_reader, agent=agent)
 
     def _prompt_for_push(self, tid):
         """blocked 알림용 카드: hc read 한 번 + 파싱, PUSH_PROMPT_BUDGET 안에 못 끝나면 None."""
         box = {}
+        agent = self._agent_kinds.get(tid)
 
         def work():
             try:
-                box["p"] = self.parse_screen((self.hc.read(tid, 0) or {}).get("text", ""))
+                box["p"] = self.parse_screen((self.hc.read(tid, 0) or {}).get("text", ""), agent)
             except Exception:  # noqa: BLE001 - 카드 실패가 알림을 막지 않게
                 box["p"] = None
         th = threading.Thread(target=work, name="push-prompt", daemon=True)
@@ -2597,6 +2895,7 @@ class App:
                 name = info.get("name") or name
                 if is_claude(info) and info.get("state") in (None, "live"):
                     self.tracker.mark_claude(tid, name)
+                self._agent_kinds[tid] = agent_kind(info)
                 turn = info.get("turn")
                 st = status_of(info)
                 if event_state == "done" and st.get("state") != "done":
@@ -2659,6 +2958,7 @@ class App:
                 st = status_of(info)
                 if (st.get("state"), st.get("msg")) != key:
                     continue  # 그 사이 풀렸거나 바뀌었다: 다음 폴링이 판정한다
+                self._agent_kinds[tid] = agent_kind(info)
                 payload = build_payload(tid, info.get("name") or name, "blocked", st,
                                         prompt=self._prompt_for_push(tid))
                 payload["reminder"] = n
@@ -2760,9 +3060,10 @@ class App:
             raise ApiError(502, "hc_failed")
 
     def require_claude(self, tid):
+        """답·카드·대화 보기·키·메시지를 지원하는 에이전트(Claude Code, Codex)만. 오류 이름은 옛 앱 호환으로 not_claude."""
         self.require_terminal(tid)
         info = self.get_info(tid)
-        if not is_claude(info):
+        if agent_kind(info) is None:
             raise ApiError(403, "not_claude")
         return info
 
@@ -2778,7 +3079,8 @@ class App:
                 continue
             item = {"id": tid, "name": t.get("name"), "cwd": live_cwd(t), "agent": t.get("agent"),
                     "state": t.get("state"), "status": None, "status_ms": None, "title": None,
-                    "claude": is_claude(t), "preview": None, "blocked_since": None}
+                    "claude": agent_kind(t) is not None, "agent_kind": agent_kind(t), "preview": None,
+                    "blocked_since": None}
             try:
                 info = self.hc.get(tid)
             except HcError:
@@ -2791,7 +3093,9 @@ class App:
                 item["status"] = info.get("status") if isinstance(info.get("status"), dict) else None
                 item["status_ms"] = info.get("status_ms")
                 item["title"] = info.get("title")
-                item["claude"] = is_claude(info)
+                # "claude"는 앱이 대화 보기·막힘 구역을 켜는 기준이라 Codex도 true(옛 앱이 그대로 Codex를 지원한다).
+                item["agent_kind"] = agent_kind(info)
+                item["claude"] = item["agent_kind"] is not None
                 if item["claude"]:
                     item["preview"] = terminal_preview(info, self.home, self.runner)
             out.append(item)
@@ -2870,7 +3174,7 @@ class App:
             r = self.hc.read(tid, 0)
         except HcError:
             raise ApiError(502, "hc_failed")
-        return self.parse_screen((r or {}).get("text", ""))
+        return self.parse_screen((r or {}).get("text", ""), agent_kind(info))
 
     def _same_prompt(self, tid, info, pid):
         """키를 보내기 직전에 화면을 다시 읽어 같은 카드인지(힌트가 화면 끝에 살아 있는지) 확인."""
@@ -2941,7 +3245,7 @@ class App:
         if not 1 <= n <= 200:
             raise ApiError(400, "bad_limit")
         info = self.require_claude(tid)
-        sid, path = find_transcript(info, self.home, runner=self.runner)
+        sid, path = find_agent_transcript(info, self.home, runner=self.runner)
         if not path:
             return {"session_id": sid, "turns": [], "truncated": False}
         try:

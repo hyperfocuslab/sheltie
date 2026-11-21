@@ -1,0 +1,119 @@
+
+  >_ OpenAI Codex (v0.171.0)
+     ~/work/demo
+
+
+› hi
+
+
+• Hello from mock.
+
+  Worked for 1s • 2:54 PM
+
+
+› make b.txt
+
+
+✔ You approved codex to run touch b.txt this time
+
+• Ran touch b.txt
+  └ (no output)
+
+• Created b.txt.
+
+  Worked for 11s • 2:54 PM
+
+
+› go
+
+
+✗ You canceled the request to run rm -f b.txt
+
+• Exited (status 1) rm -f b.txt
+  └ (no output)
+
+■ Conversation interrupted - use /feedback if something went wrong
+
+
+› ask me
+
+
+• OK.
+
+  Worked for <1s • 2:55 PM
+
+
+› ask me
+
+
+• Questions 1/1 answered
+  • Which database should we use?
+    answer: Postgres
+
+• OK.
+
+  Worked for 4s • 2:55 PM
+
+
+› ask two
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  Question 2/2 (1 unanswered)
+  Which language?
+
+  › 1. Python             Fast to write.
+    2. Go                 Single binary.
+    3. None of the above  Optionally, add details in notes (tab)
+
+  tab to add notes | enter to submit all | ←/→ to navigate questions | esc to interrupt

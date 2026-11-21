@@ -1,0 +1,120 @@
+
+  >_ OpenAI Codex (v0.171.0)
+     ~/work/demo
+
+
+› hi
+
+
+• Hello from mock.
+
+  Worked for 1s • 2:59 PM
+
+
+› edit files
+
+
+• Edited 2 files (+2 -1)
+  └ a.txt (+1 -1)
+    1 -hello
+    1 +hello world
+
+  └ c.txt (+1 -0)
+    1 +new file
+    + Show details
+
+• Patched.
+
+  Worked for 9s • 3:00 PM
+
+
+› x
+
+
+✔ You approved codex to always run commands that start with touch d.txt
+
+• Ran touch d.txt
+  └ (no output)
+
+• Ran touch d.txt
+  └ (no output)
+
+• ok
+  └ Tip: Visit the Codex community forum.
+
+  Worked for 2s • 3:00 PM
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+› Ask Codex to do anything
+
+  mock-model medium · ~/work/demo · hi
+  ← for agents · ? for shortcuts                                                                                                                                              ⚠ 3 warnings · f2 to view

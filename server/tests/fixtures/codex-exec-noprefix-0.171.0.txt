@@ -1,0 +1,120 @@
+
+  >_ OpenAI Codex (v0.171.0)
+     ~/work/demo
+
+
+› hi
+
+
+• Hello from mock.
+
+  Worked for 1s • 2:54 PM
+
+
+› make b.txt
+
+
+✔ You approved codex to run touch b.txt this time
+
+• Ran touch b.txt
+  └ (no output)
+
+• Created b.txt.
+
+  Worked for 11s • 2:54 PM
+
+
+› go
+
+
+• Running rm -f b.txt
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  Would you like to run the following command?
+
+  Environment: local
+
+  Reason: Remove b.txt?
+
+  $ rm -f b.txt
+
+
+› 1. Yes, proceed (y)
+  2. Yes, and don't ask again for commands that start with `rm -f b.txt` (p)
+  3. No, and tell Codex what to do differently (esc)
+
+  Press enter to confirm or esc to cancel

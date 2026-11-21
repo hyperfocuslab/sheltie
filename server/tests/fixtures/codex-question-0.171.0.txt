@@ -1,0 +1,119 @@
+
+  >_ OpenAI Codex (v0.171.0)
+     ~/work/demo
+
+
+› hi
+
+
+• Hello from mock.
+
+  Worked for 1s • 2:54 PM
+
+
+› make b.txt
+
+
+✔ You approved codex to run touch b.txt this time
+
+• Ran touch b.txt
+  └ (no output)
+
+• Created b.txt.
+
+  Worked for 11s • 2:54 PM
+
+
+› go
+
+
+✗ You canceled the request to run rm -f b.txt
+
+• Exited (status 1) rm -f b.txt
+  └ (no output)
+
+■ Conversation interrupted - use /feedback if something went wrong
+
+
+› ask me
+
+
+• OK.
+
+  Worked for <1s • 2:55 PM
+
+
+› ask me
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  Question 1/1 (1 unanswered)
+  Which database should we use?
+
+  › 1. SQLite (Recommended)  Single file, no server.
+    2. Postgres              Needs a running server.
+    3. None of the above     Optionally, add details in notes (tab)
+
+  tab to add notes | enter to submit answer | esc to interrupt

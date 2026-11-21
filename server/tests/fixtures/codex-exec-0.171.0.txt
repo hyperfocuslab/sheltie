@@ -1,0 +1,120 @@
+
+  >_ OpenAI Codex (v0.171.0)
+     ~/work/demo
+
+
+› hi
+
+
+• Hello from mock.
+
+  Worked for 1s • 2:54 PM
+
+
+› make b.txt
+
+
+• Running touch b.txt
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  Would you like to run the following command?
+
+  Environment: local
+
+  Reason: Do you want to allow creating b.txt in this folder?
+
+  $ touch b.txt
+
+
+› 1. Yes, proceed (y)
+  2. Yes, and don't ask again for commands that start with `touch` (p)
+  3. No, and tell Codex what to do differently (esc)
+
+  Press enter to confirm or esc to cancel
