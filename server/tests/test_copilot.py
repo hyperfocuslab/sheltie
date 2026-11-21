@@ -235,6 +235,14 @@ class CopilotMultiTests(unittest.TestCase):
         for bad in ({"text": "x"}, {"option_index": 0}, {"option_indices": [3]}):
             with self.assertRaises(hr.ApiError):
                 hr.answer_steps(p, **bad)
+        # 항목 12개(번호 없음, 화살표로 답한다): 10번째 넘는 항목도 고른다
+        m = card("question-multi-12")
+        self.assertEqual((m["multi_select"], labels(m), m["checked"], m["selected"]),
+                         (True, ["opt%02d" % i for i in range(1, 13)], [], 0))
+        self.assertEqual(hr.answer_steps(m, option_indices=[1, 11]),
+                         [("keys", ["down", "space"] + ["down"] * 10 + ["space", "enter"])])
+        with self.assertRaises(hr.ApiError):
+            hr.answer_steps(m, option_indices=[12])
         # 글 칸: 붙여넣기+enter
         self.assertEqual(hr.answer_steps(card("question-multi-tab3"), text="demo-x"), [("text", "demo-x")])
         with self.assertRaises(hr.ApiError):

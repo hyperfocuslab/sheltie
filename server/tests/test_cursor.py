@@ -224,6 +224,17 @@ class CursorScreenStatusTests(unittest.TestCase):
         self.settle()
         self.assertEqual([x["state"] for x in self.pusher.payloads], ["blocked", "done"])
 
+    def test_short_task_sent_from_app_gets_done(self):
+        # 3초 화면 판정 사이에 끝난 작업: 앱에서 보낸 순간을 작업 중으로 둬 다음 판정에서 끝남 알림(OpenCode와 같다)
+        now = [50.0]
+        self.app.clock = lambda: now[0]
+        self.assertEqual(self.app.api_send("c1", {"text": "hi"}), {"ok": True})
+        self.screen("idle")
+        self.assertEqual(self.pusher.payloads, [])
+        now[0] += hr.SEND_SETTLE
+        self.screen("idle")
+        self.assertEqual([x["state"] for x in self.pusher.payloads], ["done"])
+
     def test_transient_frame_after_answer_is_not_done(self):
         self.screen("exec")
         self.screen("exec-skip-reply")  # 답 직후 한 장면

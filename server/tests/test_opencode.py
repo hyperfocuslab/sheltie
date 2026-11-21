@@ -4,6 +4,7 @@ OpenCode는 OSC 7501을 안 보내고 제목도 "OC | <세션 제목>"으로 고
 대화 기록은 SQLite(opencode.db)다."""
 import json
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -135,6 +136,14 @@ class OpencodeParseTests(unittest.TestCase):
 
 
 class OpencodeMultiQuestionTests(unittest.TestCase):
+    def test_answered_single_tab_label_has_no_check_mark(self):
+        # 이미 답한 단일 선택 탭에 다시 오면 고른 항목이 `MIT ✓`로 그려진다(실측): 라벨에서 떼고 답했다는 것만 남긴다
+        screen = oc("question-multi-tab2").replace("1. MIT", "1. MIT ✓", 1)
+        p = hr.parse_prompt(screen, agent="opencode")
+        self.assertEqual([o["label"] for o in p["options"]], ["MIT", "GPL", "Type your own answer"])
+        self.assertTrue(p.get("answered_here"))
+        self.assertEqual(p["id"], hr.parse_prompt(oc("question-multi-tab2"), agent="opencode")["id"])
+
     """여러 질문(탭)·복수 선택·Review(Confirm) 탭. 실측 1.19.6: 복수 선택은 숫자 키 = 토글, tab = 다음 탭.
     단일 선택 탭은 숫자 = 고르고 다음 탭. Review는 enter = 제출, esc = dismiss. 지금 탭은 화면 글자로 안 보인다."""
 
@@ -263,6 +272,32 @@ class OpencodeScreenStatusTests(unittest.TestCase):
         self.screen("hello2")
         self.screen("hello2")
         self.assertEqual([x["state"] for x in self.pusher.payloads], ["done"])
+
+    def test_short_task_sent_from_app_gets_done(self):
+        # 3초 화면 판정 사이에 끝나는 작업(실측: 가짜 모델 답 117ms)은 작업 중 화면을 못 본다.
+        # 앱에서 보낸 순간을 작업 중으로 두면 다음 판정에서 끝남 알림이 간다. 보내자마자 본 화면(아직 시작 전)은 잠깐 기다린다
+        now = [100.0]
+        self.app.clock = lambda: now[0]
+        self.screen("hello2")
+        self.assertEqual(self.pusher.payloads, [])  # 작업을 못 봤다(시작 화면 → 끝난 화면): 알림 없음
+        self.assertEqual(self.app.api_send("o1", {"text": "short task"}), {"ok": True})
+        by = {t["id"]: t for t in self.app.api_terminals()["terminals"]}
+        self.assertEqual(by["o1"]["status"]["state"], "working")
+        now[0] += 0.5
+        self.screen("hello2")  # 보낸 직후: 아직 그려지기 전일 수 있다
+        self.assertEqual(self.pusher.payloads, [])
+        now[0] += hr.SEND_SETTLE
+        self.screen("hello2")
+        self.assertEqual([x["state"] for x in self.pusher.payloads], ["done"])
+        # 끝남 뒤 다시 짧은 작업: 두 번째 끝남도 간다
+        self.app.api_send("o1", {"text": "again"})
+        now[0] += hr.SEND_SETTLE + 1
+        self.screen("hello2")
+        self.assertEqual([x["state"] for x in self.pusher.payloads], ["done", "done"])
+        # 보내기가 거절되면(대화 상자) 작업 중으로 두지 않는다
+        self.screen("question")
+        self.err(self.app.api_send, "o1", {"text": "x"})
+        self.assertEqual(self.app.api_terminals()["terminals"][0]["status"]["state"], "blocked")
 
     def test_approval_push_card_and_answer(self):
         self.screen("working")
@@ -437,6 +472,90 @@ def build_db(path, jsonl_files):
     con.commit()
     con.close()
     return sids
+
+
+class OpencodeStyledTabsTests(unittest.TestCase):
+    """여러 질문 탭 막대의 지금 탭·답한 탭은 색으로만 보인다(실측 1.19.6). 앱 카드(/prompt)만 hc attach --observe 첫 그림
+    (색 포함)을 한 번 읽어 tabs·title을 채운다. 지금 탭 = 배경이 다른 탭, 답 안 한 탭 = Confirm 탭과 같은 흐린 글자색."""
+
+    @staticmethod
+    def raw(name):
+        with open(os.path.join(FIX, "opencode-question-multi-styled-%s-%s.ansi" % (name, V)), encoding="utf-8",
+                  newline="") as f:
+            return f.read()
+
+    def styled(self, name):
+        text = oc("question-multi-styled-" + name)
+        p = hr.parse_prompt(text, agent="opencode")
+        pid = p["id"]
+        hr._opencode_style_tabs(p, text, self.raw(name))
+        self.assertEqual(p["id"], pid)  # 색으로 채운 탭은 id에 안 넣는다(재확인·알림 카드와 같은 id)
+        return p
+
+    def test_first_tab_current(self):
+        p = self.styled("t1")
+        self.assertEqual((p["title"], p["question"], p["multi_select"]), ("Features", "Which features do you want?", True))
+        self.assertEqual(p["tabs"], [{"label": "Features", "answered": False}, {"label": "License", "answered": False}])
+
+    def test_second_tab_current_first_answered(self):
+        p = self.styled("t2")
+        self.assertEqual((p["title"], p["question"], p["multi_select"]), ("License", "Which license?", False))
+        self.assertEqual(p["tabs"], [{"label": "Features", "answered": True}, {"label": "License", "answered": False}])
+
+    def test_unreadable_colors_leave_tabs_empty(self):
+        text = oc("question-multi-styled-t1")
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", self.raw("t1"))
+        swapped = self.raw("t2")  # 다른 화면의 그림: 탭 라벨은 같지만 지금 탭이 다르다 → 그래도 색대로(같은 상자)
+        for raw in ("", plain, "garbage\r\n"):
+            p = hr.parse_prompt(text, agent="opencode")
+            hr._opencode_style_tabs(p, text, raw)
+            self.assertEqual((p["tabs"], p["title"]), (None, None), repr(raw[:40]))
+        p = hr.parse_prompt(text, agent="opencode")
+        hr._opencode_style_tabs(p, text, swapped.replace("48;2;157;124;216", "48;2;20;20;20"))  # 지금 탭이 안 보임
+        self.assertEqual(p["tabs"], None)
+        # 한 탭만 있는 상자·Review 카드는 이미 tabs가 있어 건드리지 않는다
+        one = card("question-multi-one")
+        hr._opencode_style_tabs(one, oc("question-multi-one"), self.raw("t1"))
+        self.assertEqual(one["tabs"], [{"label": "Langs", "answered": False}])
+
+    def test_hc_read_styled_cuts_stream_after_paint(self):
+        seen = []
+
+        def runner(argv, **kw):
+            seen.append((argv, kw.get("timeout"), kw.get("stdin")))
+            raise hr.subprocess.TimeoutExpired(argv, kw["timeout"], output="\x1b[0m그림".encode("utf-8"))
+        hc = hr.Hc("/bin/hc", runner=runner)
+        self.assertEqual(hc.read_styled("t3"), "\x1b[0m그림")
+        self.assertEqual(seen, [(["/bin/hc", "attach", "--observe", "t3"], hr.HC_STYLED_WAIT, hr.subprocess.DEVNULL)])
+
+        def empty(argv, **kw):
+            return hr.subprocess.CompletedProcess(argv, 1, b"", b"no such terminal")
+        with self.assertRaises(hr.HcError):
+            hr.Hc("/bin/hc", runner=empty).read_styled("t3")
+
+    def test_api_prompt_reads_colors_once(self):
+        app, hc, _ = make_app()
+        info = hc.add("o1", None, agent="opencode", name="oc", turn=0)
+        info["title"] = "OC | x"
+        hc.screens["o1"] = oc("idle-start")
+        app.poll(initial=True)
+        hc.screens["o1"] = oc("question-multi-styled-t2")
+        app.screen_poll()
+        calls = []
+        hc.read_styled = lambda tid: calls.append(tid) or self.raw("t2")
+        p = app.api_prompt("o1")["prompt"]
+        self.assertEqual((p["title"], p["tabs"][0]["answered"]), ("License", True))
+        self.assertEqual(calls, ["o1"])
+        # 답 직전 재확인은 색을 안 읽고도 같은 id
+        self.assertEqual(app.api_prompt_answer("o1", {"prompt_id": p["id"], "option_index": 1})["ok"], True)
+        self.assertEqual(calls, ["o1"])
+        self.assertEqual(hc.keys_calls, [("o1", ["2"])])
+
+        def broken(tid):
+            raise hr.HcError("attach failed")
+        hc.read_styled = broken  # 색을 못 읽으면 탭 없이 카드는 그대로
+        q = app.api_prompt("o1")["prompt"]
+        self.assertEqual((q["id"], q["tabs"], q["title"]), (p["id"], None, None))
 
 
 class OpencodeTranscriptTests(unittest.TestCase):

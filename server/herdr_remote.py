@@ -121,6 +121,7 @@ DEFAULT_RELAY_URL = "https://sheltie-push-relay.cpubench.workers.dev"
 RELAY_OFF = "off"  # push_relay_url에 이 값을 넣으면 중계를 쓰지 않는다
 
 HC_TIMEOUT = 10
+HC_STYLED_WAIT = 0.4  # hc attach --observe 첫 그림을 받는 시간(초). 실측 hc 0.1.21: 붙고 6ms 안에 다 온다
 MAX_BODY = 64 * 1024
 POLL_INTERVAL = 15
 BIND_RETRY = 10
@@ -318,6 +319,21 @@ class Hc:
         if lines:
             args += ["--lines", str(int(lines))]
         return self._json(args)
+
+    def read_styled(self, tid):
+        """색(SGR)이 남은 지금 화면: `hc attach --observe`의 첫 그림(실측 hc 0.1.21: 붙자마자 화면 전체를 줄마다
+        \\r\\n으로 다시 그린다). 보기만 하고 입력·크기 변경은 안 한다. 그 뒤 흐름은 HC_STYLED_WAIT에서 끊는다."""
+        argv = [self.path, "attach", "--observe", tid]
+        try:
+            out = self.runner(argv, stdin=subprocess.DEVNULL, capture_output=True, timeout=HC_STYLED_WAIT,
+                              shell=False, **subprocess_kwargs()).stdout
+        except subprocess.TimeoutExpired as e:
+            out = e.stdout if e.stdout is not None else e.output  # 그림을 받은 뒤 끊었다(정상)
+        except OSError as e:
+            raise HcError("hc not runnable: %s" % e)
+        if not out:
+            raise HcError("hc attach: no paint")
+        return out.decode("utf-8", "replace") if isinstance(out, bytes) else out
 
     def keys(self, tid, keys):
         self._run(["keys", tid] + list(keys))
@@ -1329,7 +1345,7 @@ def _parse_gemini_ask(inner, idx, qs):
     items = [lb for lb, _ in src] + ([GEMINI_ALL] if multi and n > 1 else []) + [other]
     total = len(items) + (1 if multi else 0)
     if total > 9:
-        return None  # 두 자리 번호는 숫자 키가 1초 기다린다
+        return None  # 두 자리 번호는 숫자 키가 1초 기다린다. ask_user가 options를 4개로 막아(0.70.0 검증) 실제로는 최대 7
     if (GEMINI_MULTI_NOTE in [b.strip() for b in rest]) != multi or (rest and rest[0].strip() == GEMINI_MULTI_NOTE) != multi:
         return None
     cursor, checked, seen, prev_row = [], [], 0, False
@@ -1958,6 +1974,8 @@ def _multi_qwen(p, num, want):
     """복수 선택: 숫자 키는 커서만 옮기고 space가 토글, enter가 확정(실측 0.28.3). 하나도 안 고르면 enter가 무시된다."""
     if not want:
         raise ApiError(400, "bad_option")
+    if any(num(i) > 9 for i in want.symmetric_difference(set(p["checked"]))):  # 누를 숫자 키는 한 자리만
+        raise ApiError(400, "bad_option")
     keys = []
     for i in sorted(want.symmetric_difference(set(p["checked"]))):
         keys += [str(num(i)), "space"]
@@ -2175,6 +2193,9 @@ def _parse_opencode_question(inner):
             return None
         question = question[:-len(OPENCODE_MULTI_SUFFIX)].strip()
     labels = [_norm(r["label"]) for r in rows]
+    # 이미 답한 단일 선택 탭에 다시 오면 고른 항목이 `MIT ✓`로 그려진다: 라벨에서 떼고 답했다는 것만 남긴다
+    answered_here = not multi and any(lb.endswith(" ✓") for lb in labels)
+    labels = [lb[:-2] if not multi and lb.endswith(" ✓") else lb for lb in labels]
     free = None
     if labels[-1] == OPENCODE_FREE:
         if rows[-1]["extra"] or rows[-1]["checked"]:
@@ -2193,8 +2214,11 @@ def _parse_opencode_question(inner):
         if labels != ["Yes", "No"]:
             return None
         return _finish("plan", None, question, None, opts, reject_index=1)
-    return _finish("question", title, question, None, opts, multi=multi,
-                   checked=[j for j, k in enumerate(keep) if rows[k]["checked"]], free_text_index=free, tabs=tabs)
+    p = _finish("question", title, question, None, opts, multi=multi,
+                checked=[j for j, k in enumerate(keep) if rows[k]["checked"]], free_text_index=free, tabs=tabs)
+    if answered_here:
+        p["answered_here"] = True  # prompt_id에는 안 들어간다
+    return p
 
 
 def _parse_opencode_lines(lines, plan_reader=None):
@@ -2217,6 +2241,94 @@ def _opencode_dialog_group(text):
     return tuple(tabs) if tabs else None
 
 
+SGR_SEQ_RE = re.compile(r"\x1b\[([0-9;:]*)m|\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])")
+
+
+def _sgr_cells(line):
+    """색 그림 한 줄 → (글자들, 글자마다 (글자색, 배경색, 반전)). SGR 말고 다른 제어열은 버린다."""
+    fg = bg = None
+    rev = False
+    chars, styles = [], []
+    pos = 0
+    for m in list(SGR_SEQ_RE.finditer(line)) + [None]:
+        end = m.start() if m else len(line)
+        for ch in line[pos:end]:
+            if ch >= " ":
+                chars.append(ch)
+                styles.append((fg, bg, rev))
+        if m is None:
+            break
+        pos = m.end()
+        if m.group(1) is None:
+            continue
+        ps = [int(x) if x.isdigit() else 0 for x in re.split(r"[;:]", m.group(1))]
+        k = 0
+        while k < len(ps):
+            v = ps[k]
+            if v in (38, 48) and k + 1 < len(ps):
+                n = 3 if ps[k + 1] == 2 else 1
+                col = tuple(ps[k + 2:k + 2 + n])
+                if v == 38:
+                    fg = col
+                else:
+                    bg = col
+                k += 2 + n
+                continue
+            if v == 0:
+                fg = bg = None
+                rev = False
+            elif v == 7:
+                rev = True
+            elif v == 27:
+                rev = False
+            elif v == 39:
+                fg = None
+            elif v == 49:
+                bg = None
+            elif 30 <= v <= 37 or 90 <= v <= 97:
+                fg = (v,)
+            elif 40 <= v <= 47 or 100 <= v <= 107:
+                bg = (v,)
+            k += 1
+    return "".join(chars), styles
+
+
+def _opencode_style_tabs(p, text, read):
+    """여러 질문 탭 막대의 지금 탭·답한 탭은 색으로만 보인다(실측 1.19.6, 기본 테마): 지금 탭은 배경이 강조색,
+    답한 탭은 글자색이 밝고 답 안 한 탭은 Confirm 탭과 같은 흐린 글자색. read()가 준 색 그림(hc attach)으로 카드의
+    tabs·title을 채운다. id는 그대로(글자 화면으로 만든 재확인·알림 카드와 같아야 한다). 못 읽으면 그대로 둔다."""
+    if not p or p["kind"] != "question" or p.get("tabs") is not None:
+        return p
+    labels = _opencode_dialog_group(text)
+    if not labels or len(labels) < 2:
+        return p
+    raw = read() if callable(read) else read
+    names = list(labels) + [OPENCODE_CONFIRM_TAB]
+    bar = re.compile(r"(?:^|\s)" + r"\s{2,}".join("(%s)" % re.escape(x) for x in names) + r"(?=\s|$)")
+    for line in (raw or "").split("\n"):
+        plain, styles = _sgr_cells(line.rstrip("\r"))
+        m = bar.search(plain)
+        if not m:
+            continue
+        st = [styles[m.start(k + 1)] for k in range(len(names))]
+        if any(x[2] for x in st):
+            return p  # 반전으로 그린 테마: 모르는 모양
+        bgs = [x[1] for x in st]
+        cur = [k for k in range(len(st)) if bgs.count(bgs[k]) == 1]
+        if len(cur) != 1 or cur[0] == len(labels) or st[-1][0] is None:
+            return p
+        muted = st[-1][0]
+        c = cur[0]
+        if p["multi_select"]:
+            now = bool(p["checked"])
+        else:
+            now = bool(p.get("answered_here"))  # 답한 단일 선택 탭에 다시 오면 `MIT ✓`(파서가 라벨에서 뗀다)
+        p["tabs"] = [{"label": lb, "answered": now if k == c else st[k][0] != muted} for k, lb in enumerate(labels)]
+        p["title"] = labels[c]
+        return p
+    return p
+
+
 def _pick_opencode(p, option_index):
     """승인·2차 확인 버튼(번호 없음, 커서가 돌아 화면으로 위치를 모른다): 뜰 때 자리(첫 버튼) 기준 키.
     Review 탭은 enter(제출)·esc(dismiss). 질문은 숫자 키."""
@@ -2227,6 +2339,8 @@ def _pick_opencode(p, option_index):
 
 def _multi_opencode(p, num, want):
     """복수 선택: 숫자 키 = 토글(커서와 상관없이), tab = 다음 탭(실측 1.19.6). 안 골라도 tab으로 넘어간다."""
+    if any(num(i) > 9 for i in want.symmetric_difference(set(p["checked"]))):  # 누를 숫자 키는 한 자리만
+        raise ApiError(400, "bad_option")
     return [("keys", [str(num(i)) for i in sorted(want.symmetric_difference(set(p["checked"])))] + ["tab"])]
 
 
@@ -2525,6 +2639,8 @@ def _pick_grok(p, option_index):
 def _multi_grok(p, num, want):
     """복수 선택: 숫자 키 = 토글. 고른 게 있으면 enter(다음 질문, 마지막이면 제출), 없으면 →(다음 질문).
     마지막 질문에서 빈 답은 enter가 커서 줄을 골라 제출해 버린다(실측 1.0.77): 400."""
+    if any(num(i) > 9 for i in want.symmetric_difference(set(p["checked"]))):  # 누를 숫자 키는 한 자리만
+        raise ApiError(400, "bad_option")
     keys = [str(num(i)) for i in sorted(want.symmetric_difference(set(p["checked"])))]
     if want:
         return [("keys", keys + ["enter"])]
@@ -3198,11 +3314,11 @@ def answer_steps(p, option_index=None, option_indices=None, text=None):
             raise ApiError(400, "bad_option")
         if p.get("free_text_index") in want:
             raise ApiError(400, "no_free_text")
+        multi = agent_spec(p.get("agent")).get("multi")  # 에이전트만의 토글·확정 키(Qwen: 숫자+space, enter)
+        if multi:  # 숫자 키 상한(9)은 숫자로 답하는 에이전트 함수가 정한다(Copilot·Cursor는 화살표라 상한 없음)
+            return multi(p, num, want)
         if any(num(i) > 9 for i in want):
             raise ApiError(400, "bad_option")
-        multi = agent_spec(p.get("agent")).get("multi")  # 에이전트만의 토글·확정 키(Qwen: 숫자+space, enter)
-        if multi:
-            return multi(p, num, want)
         toggle = sorted(want.symmetric_difference(set(p["checked"])) - {p.get("free_text_index")})
         return [("keys", [str(num(i)) for i in toggle] + ["right"])]
     if option_index is None:
@@ -6551,6 +6667,11 @@ class MultiBackend:
             raise ApiError(409, "unsupported")
         return self._hc().read(tid, lines)
 
+    def read_styled(self, tid):
+        if self.hooks.has(tid):
+            raise ApiError(409, "unsupported")
+        return self._hc().read_styled(tid)
+
     def keys(self, tid, keys):
         if self.hooks.has(tid):
             raise ApiError(409, "unsupported")
@@ -6611,6 +6732,8 @@ QWEN_PUSH_PROMPT_WAIT = 1.0
 #   dialog_group(text)     (선택) 여러 질문 상자의 묶음 키(탭 라벨 등, 아니면 None). 막힘 중 같은 묶음의
 #                          다른 탭 카드로 바뀌면 새 막힘이 아니다(알림 한 번, Claude·Qwen의 hc status와 같다).
 #                          hc status 에이전트(Grok: msg가 지금 질문 문장)도 같은 상자면 처음 msg로 둔다
+#   style_tabs(p, text, read)  (선택) 지금 탭·답한 탭이 색으로만 보이는 여러 질문 상자(OpenCode): 앱 카드(/prompt)만
+#                          read()(hc attach 색 그림)로 tabs·title을 채운다. id는 그대로
 #   pick(p, i)             (선택) 그 항목을 고르는 키 단계. None을 주면 숫자·커서 이동 기본 방식
 #   multi(p, num, want)    (선택) 복수 선택 답(want: 고를 index 집합) → 키 단계. 없으면 숫자 토글 + right(Claude)
 #   reject_keys(p)         (선택) reject_index가 없는 카드의 거절 키(기본 esc)
@@ -6665,6 +6788,7 @@ AGENTS = {
                  "push_wait": lambda: PUSH_PROMPT_BUDGET, "retry": False, "screen": "full",
                  "title_blocked": None, "title_working": None, "busy_re": OPENCODE_BUSY_RE,
                  "dialog_re": OPENCODE_DIALOG_RE, "dialog_group": _opencode_dialog_group,
+                 "style_tabs": _opencode_style_tabs,
                  "pick": _pick_opencode, "multi": _multi_opencode,
                  "reject_keys": _reject_keys_opencode,
                  "approve_keys": ["enter"],
@@ -6703,6 +6827,10 @@ AGENTS = {
 }
 AGENT_ORDER = ("claude", "codex", "gemini", "copilot", "qwen", "opencode", "grok", "cursor", "amp")
 SCREEN_POLL_INTERVAL = 3.0  # "full" 에이전트 화면 판정 주기(초). 제목 이벤트가 먼저 오면 그때 바로 본다
+# 제목으로 작업 중을 모르는 "full" 에이전트(OpenCode·Cursor)는 앱에서 보낸 순간을 작업 중으로 둔다(판정 주기보다 짧은
+# 작업도 끝남 알림이 가게. hc events에는 화면 출력 이벤트가 없다, 실측 hc 0.1.21). 보낸 뒤 이 시간(초) 안에 본 화면은
+# 아직 작업 표시가 그려지기 전일 수 있어 끝남으로 보지 않는다
+SEND_SETTLE = 1.5
 SCREEN_SETTLE = 0.6  # 제목은 막힘인데 메뉴를 못 읽었을 때 다시 볼 때까지(초)
 PROMPT_STATUS_KINDS = {"approval": "permission", "confirm": "permission", "question": "question", "plan": "plan"}
 
@@ -6743,6 +6871,7 @@ class App:
         self._screen_state = {}  # "full" 에이전트: tid → 마지막으로 판정한 status
         self._screen_group = {}  # "full" 에이전트: tid → 막힘 중인 여러 질문 상자의 묶음 키(dialog_group)
         self._status_group = {}  # hc status 에이전트: tid → (묶음 키, 그 상자의 첫 msg)(dialog_group)
+        self._screen_sent = {}  # 제목 규칙 없는 "full" 에이전트: tid → 앱에서 메시지를 보낸 시각(SEND_SETTLE)
         self._screen_turns = {}  # "full" 에이전트: tid → 끝남 횟수(Tracker의 turn 대신)
         self._card_states = {}  # card_status 에이전트: tid → 이번 막힘에서 마지막으로 읽은 카드 status
         self.tracker = Tracker(self._notify, prompt_for=self._prompt_for_push, reminders=self.reminders)
@@ -6886,8 +7015,11 @@ class App:
             if not busy and spec.get("busy_re") and text:
                 tail = [ln for ln in screen_lines(text) if ln.strip()][-8:]
                 busy = any(spec["busy_re"].search(ln) for ln in tail)
+            sent = self._screen_sent.get(tid)
             if busy:
                 st = {"app": kind, "state": "working"}
+            elif prev == "working" and sent is not None and self.clock() - sent < SEND_SETTLE:
+                st = prev_st  # 앱에서 막 보냈다: 작업 표시가 아직 안 그려졌을 수 있다
             elif prev == "blocked" and spec.get("idle_after_re") \
                     and spec["idle_after_re"].search(prev_st.get("msg") or ""):
                 st = {"app": kind, "state": "idle"}  # 시작 화면(폴더 신뢰)에 답한 뒤: 끝난 작업이 없다
@@ -7562,7 +7694,8 @@ class App:
         return {"ok": True, "keys": keys}
 
     # --- 메뉴 카드
-    def current_prompt(self, tid, info):
+    def current_prompt(self, tid, info, styled=False):
+        """styled: 앱에 보낼 카드(/prompt)면 색으로만 보이는 탭 상태를 hc attach 색 그림으로 채운다(style_tabs)."""
         info = self.effective_info(tid, info)
         if status_of(info).get("state") != "blocked":
             return None
@@ -7570,7 +7703,19 @@ class App:
             r = self.hc.read(tid, 0)
         except HcError:
             raise ApiError(502, "hc_failed")
-        return self.parse_screen((r or {}).get("text", ""), agent_kind(info), tid=tid, info=info)
+        text = (r or {}).get("text", "")
+        kind = agent_kind(info)
+        p = self.parse_screen(text, kind, tid=tid, info=info)
+        style = agent_spec(kind).get("style_tabs") if styled and p else None
+        if style:
+            def read():
+                try:
+                    return self.hc.read_styled(tid)
+                except (HcError, AttributeError) as e:
+                    log.info("색 화면 못 읽음 %s: %s", tid, e)
+                    return ""
+            style(p, text, read)
+        return p
 
     def _same_prompt(self, tid, info, pid):
         """키를 보내기 직전에 화면을 다시 읽어 같은 카드인지(힌트가 화면 끝에 살아 있는지) 확인."""
@@ -7605,7 +7750,7 @@ class App:
         if self.hooks.has(tid):
             return {"prompt": self.hooks.current_prompt(tid)}
         info = self.require_claude(tid)
-        return {"prompt": self.current_prompt(tid, info)}
+        return {"prompt": self.current_prompt(tid, info, styled=True)}
 
     def api_prompt_answer(self, tid, body):
         pid = body.get("prompt_id")
@@ -7750,8 +7895,22 @@ class App:
                 self.hc.send(tid, text)
             except HcError as e:
                 raise ApiError(409, "hc_refused", detail=str(e)[:200])
+        spec = agent_spec(agent_kind(info))
+        if spec["screen"] == "full" and not spec.get("title_working"):
+            self._mark_sent_working(tid, info)
         log.info("send %s (%d자)", tid, len(text))
         return {"ok": True}
+
+    def _mark_sent_working(self, tid, info):
+        """제목으로 작업 중을 모르는 "full" 에이전트: 보낸 순간을 작업 중으로 판정해 둔다. 3초 판정 사이에 끝난 작업도
+        다음 판정이 작업 중 → 끝남으로 보고 알린다(SEND_SETTLE)."""
+        st = {"app": agent_kind(info), "state": "working"}
+        with self._refresh_lock:
+            self._screen_state[tid] = st
+            self._screen_group.pop(tid, None)
+            self._screen_sent[tid] = self.clock()
+            self.tracker.observe(tid, st, turn=self._screen_turns.get(tid), name=info.get("name"))
+        self._flush()
 
     def _keys(self, tid, keys):
         try:
