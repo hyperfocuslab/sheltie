@@ -141,9 +141,9 @@ class GrokParseTests(unittest.TestCase):
         self.assertEqual(hr.push_category("blocked", PERM_PLAN, p), "HR_BLOCKED")
 
     def test_unknown_screens_have_no_card(self):
-        # Esc로 포커스를 스크롤백으로 옮긴 승인(숫자 키 무시), 패턴 편집 중, z 입력 칸을 연 질문, 여러 질문·복수 선택,
+        # Esc로 포커스를 스크롤백으로 옮긴 승인(숫자 키 무시), 패턴 편집 중, z 입력 칸을 연 질문,
         # 계획 검토 중 입력창 포커스(s), 평소·작업 중·끝난 화면, 거절 뒤, 질문 거절 뒤
-        for name in ("exec-after-esc", "exec-editpattern", "question-custom-z", "question-multi", "question-multi-q2",
+        for name in ("exec-after-esc", "exec-editpattern", "question-custom-z",
                      "plan-s", "idle", "hello", "done", "working", "exec-feedback", "question-ctrlc",
                      "plan-approved", "plan-quit"):
             self.assertIsNone(card(name), name)
@@ -188,6 +188,87 @@ class GrokParseTests(unittest.TestCase):
         # 폴더 신뢰: y/n 글자 키
         self.assertEqual(hr.answer_steps(card("trust"), option_index=0), [("keys", ["y"])])
         self.assertEqual(hr.answer_steps(card("trust"), option_index=1), [("keys", ["n"])])
+
+
+QUESTION_LICENSE = {"app": APP, "state": "blocked", "kind": "question", "msg": "Which license?"}
+QUESTION_COLOR = {"app": APP, "state": "blocked", "kind": "question", "msg": "Which color?"}
+
+
+class GrokMultiQuestionTests(unittest.TestCase):
+    """여러 질문(`[1/2] … ←/→ question`)·복수 선택(`1 [x] Tests`). 카드는 지금 질문 하나(제목 "k/N"), 실측 1.0.77."""
+
+    def test_multi_select_tab(self):
+        p = card("question-multi")
+        self.assertEqual((p["kind"], p["title"], p["question"]), ("question", "1/2", "Which features to include?"))
+        self.assertEqual(labels(p), ["Tests", "CI", "Docs"])  # 직접 입력(z) 줄은 체크박스라 뺀다(Claude와 같다)
+        self.assertEqual([o["description"] for o in p["options"]], ["Add unit tests", "GitHub Actions", "README section"])
+        self.assertEqual([o["number"] for o in p["options"]], [1, 2, 3])
+        self.assertEqual((p["multi_select"], p["checked"], p["free_text_index"], p["tabs"], p["last_tab"]),
+                         (True, [], None, None, False))
+        c = card("question-multi-checked")  # 1·3 체크: 힌트가 Enter:next, Esc:unselect로 바뀐다
+        self.assertEqual((c["title"], c["checked"], c["multi_select"]), ("1/2", [0, 2], True))
+        self.assertEqual(c["id"], p["id"])
+
+    def test_single_tabs(self):
+        p = card("question-multi-q2")  # 마지막 질문(단일 선택): 숫자 = 고르고 전체 제출
+        self.assertEqual((p["title"], p["question"], p["multi_select"], p["last_tab"]),
+                         ("2/2", "Which license?", False, True))
+        self.assertEqual(labels(p), ["MIT", "Apache-2.0", "Type your answer here"])
+        self.assertEqual([o["description"] for o in p["options"]], ["Permissive", "Patent grant", None])
+        self.assertEqual((p["free_text_index"], p["selected"]), (2, None))
+        p1 = card("question-tabs-single")  # 첫 질문(단일 선택, Enter:select): 숫자 = 고르고 다음 질문
+        self.assertEqual((p1["title"], p1["question"], labels(p1), p1["free_text_index"], p1["last_tab"]),
+                         ("1/2", "Which color?", ["Red", "Blue", "Type your answer here"], 2, False))
+
+    def test_multi_select_last_and_single_question(self):
+        p = card("question-tabs-multi-last")
+        self.assertEqual((p["title"], p["multi_select"], p["checked"], p["last_tab"], p["free_text_index"]),
+                         ("2/2", True, [], True, None))
+        self.assertEqual(card("question-tabs-multi-last-checked")["checked"], [0, 1])
+        one = card("question-multi-one")  # 질문 하나·복수 선택: 탭 표시 없음
+        self.assertEqual((one["title"], one["question"], labels(one), one["multi_select"], one["last_tab"]),
+                         (None, "Which features to include?", ["Tests", "CI", "Docs"], True, True))
+        self.assertEqual(card("question-multi-one-checked")["checked"], [0])
+
+    def test_answer_steps(self):
+        # 복수 선택: 숫자 키 = 토글. 고른 게 있으면 enter = 다음 질문(마지막이면 제출), 없으면 → = 다음 질문(실측)
+        m, mc = card("question-multi"), card("question-multi-checked")
+        self.assertEqual(hr.answer_steps(m, option_indices=[2, 0]), [("keys", ["1", "3", "enter"])])
+        self.assertEqual(hr.answer_steps(m, option_indices=[]), [("keys", ["right"])])
+        self.assertEqual(hr.answer_steps(mc, option_indices=[1]), [("keys", ["1", "2", "3", "enter"])])
+        self.assertEqual(hr.answer_steps(mc, option_indices=[]), [("keys", ["1", "3", "right"])])
+        last, lc, one = card("question-tabs-multi-last"), card("question-tabs-multi-last-checked"), card("question-multi-one")
+        self.assertEqual(hr.answer_steps(last, option_indices=[0, 1]), [("keys", ["1", "2", "enter"])])
+        self.assertEqual(hr.answer_steps(lc, option_indices=[0]), [("keys", ["2", "enter"])])
+        self.assertEqual(hr.answer_steps(one, option_indices=[2]), [("keys", ["3", "enter"])])
+        for c in (last, one):
+            with self.assertRaises(hr.ApiError) as cm:
+                hr.answer_steps(c, option_indices=[])  # 아무것도 안 고르고 enter면 커서 줄이 골라져 제출된다(실측)
+            self.assertEqual(cm.exception.body["error"], "bad_option")
+        for c in (m, one):
+            with self.assertRaises(hr.ApiError) as cm:
+                hr.answer_steps(c, text="Lint")
+            self.assertEqual(cm.exception.body["error"], "no_free_text")
+            with self.assertRaises(hr.ApiError):
+                hr.answer_steps(c, option_index=0)
+        # 단일 선택 탭: 숫자 = 고르고 다음(마지막이면 제출), 직접 입력은 z → 붙여넣기+enter(실측: 다음 질문으로)
+        self.assertEqual(hr.answer_steps(card("question-tabs-single"), option_index=1), [("keys", ["2"])])
+        self.assertEqual(hr.answer_steps(card("question-tabs-single"), text="Green"), [("keys", ["z"]), ("text", "Green")])
+        self.assertEqual(hr.answer_steps(card("question-multi-q2"), option_index=1), [("keys", ["2"])])
+
+    def test_dialog_group(self):
+        g = hr._grok_dialog_group
+        self.assertEqual(g(gk("question-multi")), g(gk("question-multi-q2")))
+        self.assertIsNotNone(g(gk("question-multi")))
+        self.assertEqual(g(gk("question-tabs-single")), g(gk("question-tabs-multi-last-checked")))
+        for name in ("question", "question-multi-one", "question-text", "exec", "plan", "done"):
+            self.assertIsNone(g(gk(name)), name)
+
+    def test_parsers_do_not_cross(self):
+        for name in ("question-multi", "question-multi-checked", "question-tabs-single", "question-tabs-multi-last",
+                     "question-multi-one"):
+            for agent in (None, "codex", "gemini", "copilot", "qwen", "opencode"):
+                self.assertIsNone(hr.parse_prompt(gk(name), agent=agent), (name, agent))
 
 
 class GrokApiTests(unittest.TestCase):
@@ -279,10 +360,47 @@ class GrokApiTests(unittest.TestCase):
         self.assertIsNone(self.app.api_prompt("g1")["prompt"])
         self.assertEqual(self.err(self.app.api_prompt_answer, "g1", {"prompt_id": p["id"], "option_index": 0}),
                          (409, "prompt_changed"))
-        self.set(QUESTION_MULTI, gk("question-multi"))  # 여러 질문·복수 선택: 막힘이지만 카드 없음
-        self.assertIsNone(self.app.api_prompt("g1")["prompt"])
+        self.set(QUESTION_MULTI, gk("question-multi"))  # 다른 질문 상자(여러 질문·복수 선택): 새 막힘, 카드 있음
         self.assertEqual((self.pusher.payloads[-1]["category"], self.pusher.payloads[-1].get("prompt_id")),
-                         ("HR_BLOCKED", None))
+                         ("HR_BLOCKED", card("question-multi")["id"]))
+
+    def test_multi_question_one_push_and_answers(self):
+        # hc msg는 지금 질문 문장이라 탭을 넘기면 바뀐다(실측): 같은 상자면 새 막힘이 아니다(알림 한 번)
+        self.set(QUESTION_MULTI, gk("question-multi"))
+        p = self.app.api_prompt("g1")["prompt"]
+        self.assertEqual([(x["category"], x["kind"], x["prompt_id"]) for x in self.pusher.payloads],
+                         [("HR_BLOCKED", "question", p["id"])])
+        self.assertEqual((p["multi_select"], p["title"]), (True, "1/2"))
+        self.app.api_prompt_answer("g1", {"prompt_id": p["id"], "option_indices": [0, 2]})
+        self.assertEqual(self.hc.keys_calls, [("g1", ["1", "3", "enter"])])
+        self.set(QUESTION_LICENSE, gk("question-multi-q2"))
+        self.assertEqual(len(self.pusher.payloads), 1)
+        self.assertEqual(self.err(self.app.api_prompt_answer, "g1", {"prompt_id": p["id"], "option_indices": [1]}),
+                         (409, "prompt_changed"))
+        p2 = self.app.api_prompt("g1")["prompt"]
+        self.assertEqual((p2["title"], p2["question"]), ("2/2", "Which license?"))
+        self.app.api_prompt_answer("g1", {"prompt_id": p2["id"], "option_index": 1})
+        self.assertEqual(self.hc.keys_calls[-1], ("g1", ["2"]))
+        self.set(QUESTION_MULTI, gk("question-multi"))  # PC에서 ←로 돌아갔다: 같은 상자
+        self.assertEqual(len(self.pusher.payloads), 1)
+        self.set(WORKING, gk("working"))
+        self.set(DONE, gk("done"), turn=2)
+        self.set(QUESTION_COLOR, gk("question-tabs-single"))  # 다음 턴의 새 질문 상자: 다시 알린다
+        self.assertEqual([x["state"] for x in self.pusher.payloads], ["blocked", "done", "blocked"])
+        self.assertEqual(self.pusher.payloads[-1]["prompt_id"], card("question-tabs-single")["id"])
+        self.set(QUESTION_MULTI, gk("question-tabs-multi-last"))
+        self.assertEqual(len(self.pusher.payloads), 3)
+        p3 = self.app.api_prompt("g1")["prompt"]
+        self.assertEqual(self.err(self.app.api_prompt_answer, "g1", {"prompt_id": p3["id"], "option_indices": []}),
+                         (400, "bad_option"))
+        self.app.api_prompt_answer("g1", {"prompt_id": p3["id"], "option_indices": [1]})
+        self.assertEqual(self.hc.keys_calls[-1], ("g1", ["2", "enter"]))
+
+    def test_single_multi_select_question_is_its_own_dialog(self):
+        # 질문 하나(탭 없음)는 묶음이 아니다: msg가 바뀌면 새 막힘(기존과 같다)
+        self.set(QUESTION_MULTI, gk("question-multi-one"))
+        self.set(QUESTION, gk("question"))
+        self.assertEqual([x["kind"] for x in self.pusher.payloads], ["question", "question"])
 
     def test_text_only_question(self):
         self.set(QUESTION_TEXT, gk("question-text"))

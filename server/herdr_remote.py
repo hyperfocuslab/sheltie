@@ -1920,7 +1920,13 @@ def _reject_keys_opencode(p):
 # `Tab/Space:permission`으로 바뀌고 숫자 키를 무시한다: 카드 없음). always-approve 모드 항목은 $GROK_HOME/config.toml에
 # 전역 영구 저장, "Always allow:"·"Never allow:"는 그 폴더 권한 파일에 영구 저장, "allow all edits during this session"만
 # 세션 한정(파일 변화 없음). 계획 검토는 숫자 메뉴 없이 a 승인 / s 수정 요청(입력창으로) / q 계획 포기.
-# 폴더 신뢰는 화면 가운데 y/n 글자 키. 여러 질문·복수 선택은 카드 없음.
+# 폴더 신뢰는 화면 가운데 y/n 글자 키.
+# 여러 질문은 메뉴 아래 `[1/2] ↑/↓ navigate · ←/→ question · y copy  Enter:…`(질문 이름 탭 막대 없음): 카드는 지금 질문
+# 하나(제목 "k/N"). 복수 선택은 `1 [x] Tests`(질문 하나여도). 키(실측 1.0.77): 단일 선택 질문은 숫자 = 고르고 다음 질문
+# (마지막이면 전체 제출), 직접 입력은 z → 붙여넣기+enter. 복수 선택은 숫자 = 토글(커서와 상관없이), 고른 게 있으면
+# enter = 다음 질문(마지막이면 제출, 힌트 Enter:next/submit · Esc:unselect), 하나도 없으면 enter가 커서 줄을 골라 버려
+# → = 다음 질문(안 답한 질문은 모델에 안 간다), 마지막 질문이면 카드에서 빈 답 불가. 복수 선택의 z 줄은 카드에서 뺀다.
+# hc msg는 지금 질문 문장이라 질문을 넘기면 바뀐다: dialog_group으로 같은 상자면 알림 한 번.
 GROK_GUTTER = "┃"
 GROK_ROW_RE = re.compile(r"^([1-9z]) (\([○●]\)|\[[ xX✓]\]) ?(.*)$")
 GROK_APPROVAL_HINT_RE = re.compile(r"^1/(\d+):select │ .*│ Esc:scrollback$")
@@ -1934,8 +1940,8 @@ GROK_REJECT = "No, reject"
 GROK_REJECT_SUFFIX = " (type to add feedback)"
 GROK_RULE_PREFIXES = ("Always allow: ", "Never allow: ")
 GROK_EDIT_LABELS = (GROK_ALWAYS_APPROVE, GROK_SESSION_EDITS, "Yes", GROK_REJECT)
-GROK_Q_HINT = "Tab:next answer │ Esc:scrollback │ Shift+x:dismiss"
-GROK_Q_NAV_RE = re.compile(r"^↑/↓ navigate · y copy Enter:(submit|edit)$")
+GROK_Q_HINT_RE = re.compile(r"^Tab:next answer │ Esc:(scrollback|unselect) │ Shift\+x:dismiss$")
+GROK_Q_NAV_RE = re.compile(r"^(?:\[(\d+)/(\d+)\] )?↑/↓ navigate · (←/→ question · )?y copy Enter:(submit|edit|select|next)$")
 GROK_FREE = "Type your answer here"
 GROK_PLAN_HINT = "c:comment │ y:copy plan │ a:approve │ q:quit plan │ v:select │ Tab:prompt"
 GROK_PLAN_MENU = "a approve | s request changes | c comment | y copy plan | q quit plan"
@@ -2049,22 +2055,47 @@ def _parse_grok_approval(hint, inner, lines, top):
     return p
 
 
-def _parse_grok_question(hint, inner):
-    if hint != GROK_Q_HINT:
-        return None
+def _grok_q_nav(inner):
+    """질문 메뉴 아래 안내 줄 → (match, 그 줄 index) 또는 None. 여러 질문이면 `[k/N] … ←/→ question` 둘 다 있어야 한다."""
     nz = [k for k, s in enumerate(inner) if s.strip()]
     nav = GROK_Q_NAV_RE.match(_norm(inner[nz[-1]])) if nz else None
-    if not nav:
-        return None  # 여러 질문은 `[1/2] … ←/→ question`, 직접 입력 중에는 힌트가 다르다
+    if not nav or (nav.group(1) is None) != (nav.group(3) is None):
+        return None
+    if nav.group(1) is not None and not 1 <= int(nav.group(1)) <= int(nav.group(2)):
+        return None
+    return nav, nz
+
+
+def _parse_grok_question(hint, inner):
+    hm = GROK_Q_HINT_RE.match(hint)
+    nv = _grok_q_nav(inner) if hm else None
+    if not nv:
+        return None  # 직접 입력 중에는 힌트가 다르다
+    nav, nz = nv
     rows = _grok_rows(inner, nz[-1])
-    if not rows or any(r["mark"] not in ("(○)", "(●)") for r in rows):
-        return None  # 복수 선택([ ])
+    if not rows:
+        return None
+    multi = rows[0]["mark"].startswith("[")
+    if any(r["mark"].startswith("[") != multi for r in rows):
+        return None
     keys = [r["key"] for r in rows]
     if keys[-1] != "z" or keys[:-1] != [str(k) for k in range(1, len(rows))] or rows[-1]["text"] != GROK_FREE \
             or any(inner[k].strip() for k in range(rows[-1]["line"] + 1, nz[-1])):
         return None  # z 줄에 입력 칸이 열린 상태(`z (●) ❯`) 등
-    if (nav.group(1) == "edit") != (len(rows) == 1):
-        return None  # 옵션 없는 질문만 Enter:edit(커서가 이미 z 줄)
+    checked = [k for k, r in enumerate(rows[:-1]) if multi and r["mark"] != "[ ]"]
+    tab, ntab, enter = nav.group(1), nav.group(2), nav.group(4)
+    last = tab is None or tab == ntab
+    if multi:
+        if rows[-1]["mark"] != "[ ]" or len(rows) < 2:
+            return None  # PC에서 z 줄을 체크했다(모르는 상태)
+        # 실측: 체크가 있으면 Esc:unselect, 마지막이 아니면 체크 여부에 따라 Enter:next / Enter:select
+        if (hm.group(1) == "unselect") != bool(checked) \
+                or enter != ("submit" if last else ("next" if checked else "select")):
+            return None
+    elif hm.group(1) != "scrollback" or enter != ("select" if not last else ("edit" if len(rows) == 1 else "submit")):
+        return None  # 옵션 없는 질문만 Enter:edit(커서가 이미 z 줄). 탭 중간의 옵션 없는 질문·답한 탭으로 돌아온 화면은 안 봄
+    if tab is not None and len(rows) == 1:
+        return None
     q = [inner[k].strip() for k in nz if k < rows[0]["line"]]
     if not q:
         return None
@@ -2072,9 +2103,24 @@ def _parse_grok_question(hint, inner):
     for r in rows[:-1]:
         parts = re.split(r"\s{2,}", r["text"].strip(), maxsplit=1)
         opts.append((parts[0], parts[1] if len(parts) > 1 else None, int(r["key"])))
-    opts.append((GROK_FREE, None, None))
+    free = None
+    if not multi:
+        opts.append((GROK_FREE, None, None))
+        free = len(opts) - 1
     sel = next((k for k, r in enumerate(rows) if r["mark"] == "(●)"), None)
-    return _finish("question", None, _norm(" ".join(q)), None, opts, selected=sel, free_text_index=len(opts) - 1)
+    p = _finish("question", None if tab is None else "%s/%s" % (tab, ntab), _norm(" ".join(q)), None, opts,
+                selected=sel, multi=multi, checked=checked, free_text_index=free)
+    p["last_tab"] = last  # 복수 선택 답의 확정 키(마지막 질문이면 enter가 제출)
+    return p
+
+
+def _grok_dialog_group(text):
+    """여러 질문 상자(`[k/N] … ←/→ question`)면 묶음 키, 아니면 None. 질문 문장(hc msg)이 탭마다 바뀌어도 같은 상자다."""
+    g = _grok_gutter(screen_lines(text))
+    nv = _grok_q_nav(g[1]) if g else None
+    if not nv or nv[0].group(1) is None:
+        return None
+    return ("grok-questions", int(nv[0].group(2)))
 
 
 def _parse_grok_plan(lines):
@@ -2153,6 +2199,17 @@ def _pick_grok(p, option_index):
         return None
     k = GROK_LETTER_KEYS.get((p["kind"], o["label"]))
     return [("keys", [k])] if k else None
+
+
+def _multi_grok(p, num, want):
+    """복수 선택: 숫자 키 = 토글. 고른 게 있으면 enter(다음 질문, 마지막이면 제출), 없으면 →(다음 질문).
+    마지막 질문에서 빈 답은 enter가 커서 줄을 골라 제출해 버린다(실측 1.0.77): 400."""
+    keys = [str(num(i)) for i in sorted(want.symmetric_difference(set(p["checked"])))]
+    if want:
+        return [("keys", keys + ["enter"])]
+    if p.get("last_tab", True):
+        raise ApiError(400, "bad_option")
+    return [("keys", keys + ["right"])]
 
 
 def _reject_keys_grok(p):
@@ -6130,8 +6187,9 @@ QWEN_PUSH_PROMPT_WAIT = 1.0
 #   done_settle            (선택) "full"에서 막힘 뒤 바로 끝남으로 보일 때 SCREEN_SETTLE 뒤 한 번 더 본다(답 직후 작업 표시 전 장면)
 #   idle_after_re          (선택) "full"에서 이 msg의 막힘(시작 화면) 뒤에는 끝남이 아니라 idle
 #   dialog_re              "full"에서 카드를 못 읽어도 화면 끝 줄이 이 힌트면 막힘(제목으로 막힘을 모르는 에이전트, 없으면 None)
-#   dialog_group(text)     (선택) "full"에서 여러 질문 상자의 묶음 키(탭 라벨 등, 아니면 None). 막힘 중 같은 묶음의
-#                          다른 탭 카드로 바뀌면 새 막힘이 아니다(알림 한 번, Claude·Qwen의 hc status와 같다)
+#   dialog_group(text)     (선택) 여러 질문 상자의 묶음 키(탭 라벨 등, 아니면 None). 막힘 중 같은 묶음의
+#                          다른 탭 카드로 바뀌면 새 막힘이 아니다(알림 한 번, Claude·Qwen의 hc status와 같다).
+#                          hc status 에이전트(Grok: msg가 지금 질문 문장)도 같은 상자면 처음 msg로 둔다
 #   pick(p, i)             (선택) 그 항목을 고르는 키 단계. None을 주면 숫자·커서 이동 기본 방식
 #   multi(p, num, want)    (선택) 복수 선택 답(want: 고를 index 집합) → 키 단계. 없으면 숫자 토글 + right(Claude)
 #   reject_keys(p)         (선택) reject_index가 없는 카드의 거절 키(기본 esc)
@@ -6192,7 +6250,8 @@ AGENTS = {
     "grok": {"match": _named("grok"), "parse": _parse_grok_lines, "free_text": _free_text_grok,
              "transcript": lambda info, home, runner=None: find_grok_transcript(info, home, runner=runner),
              "push_wait": lambda: PUSH_PROMPT_BUDGET, "retry": False, "screen": None,
-             "pick": _pick_grok, "reject_keys": _reject_keys_grok, "reject_status_keys": None, "send_guard": True},
+             "pick": _pick_grok, "multi": _multi_grok, "dialog_group": _grok_dialog_group,
+             "reject_keys": _reject_keys_grok, "reject_status_keys": None, "send_guard": True},
     # Cursor Agent는 OSC 7501을 안 보내고 제목도 AI가 붙인 대화 제목으로 고정이다(실측 2026.11.19): 막힘은 화면 메뉴,
     # 작업 중은 입력줄 "ctrl+c to stop"·"Working" 줄로만 안다. 승인 메뉴는 글자 키라 카드 없는 답도 지금 화면 카드의
     # 키로 보낸다(esc는 거절이 아니라 "대신 할 말" 입력칸을 연다). 기록은 SQLite(store.db).
@@ -6257,6 +6316,7 @@ class App:
         self._agent_kinds = {}  # tid → agent_kind(마지막 hc get). 알림 카드를 어느 화면으로 읽을지 정한다
         self._screen_state = {}  # "full" 에이전트: tid → 마지막으로 판정한 status
         self._screen_group = {}  # "full" 에이전트: tid → 막힘 중인 여러 질문 상자의 묶음 키(dialog_group)
+        self._status_group = {}  # hc status 에이전트: tid → (묶음 키, 그 상자의 첫 msg)(dialog_group)
         self._screen_turns = {}  # "full" 에이전트: tid → 끝남 횟수(Tracker의 turn 대신)
         self._card_states = {}  # card_status 에이전트: tid → 이번 막힘에서 마지막으로 읽은 카드 status
         self.tracker = Tracker(self._notify, prompt_for=self._prompt_for_push, reminders=self.reminders)
@@ -6422,6 +6482,29 @@ class App:
             self._card_states[tid] = st
         return st
 
+    def _group_status(self, tid, st):
+        """hc status 에이전트(dialog_group, Grok): 여러 질문 상자에서 질문을 넘기면 hc msg가 다음 질문 문장으로 바뀐다.
+        같은 상자 안이면 그 상자의 첫 msg로 둬 Tracker가 새 막힘으로 보지 않게 한다(알림·재알림 한 번)."""
+        spec = agent_spec(self._agent_kinds.get(tid))
+        if spec["screen"] == "full" or not spec.get("dialog_group"):
+            return st
+        if st.get("state") != "blocked":
+            self._status_group.pop(tid, None)
+            return st
+        try:
+            text = (self.hc.read(tid, 0) or {}).get("text", "")
+        except HcError:
+            text = ""
+        group = spec["dialog_group"](text) if text else None
+        prev = self._status_group.get(tid)
+        if group is None:
+            self._status_group.pop(tid, None)
+            return st
+        if prev and prev[0] == group:
+            return dict(st, msg=prev[1])
+        self._status_group[tid] = (group, st.get("msg"))
+        return st
+
     def effective_info(self, tid, info):
         """화면으로 판정한 막힘이 있으면 status를 바꾼 사본(카드·답·목록이 막힘으로 다룬다).
         "overlay"(Codex 계획 실행 메뉴, Copilot 폴더 신뢰·autopilot 권한)는 그 메뉴만, hc status가 없는 에이전트("full")는
@@ -6485,6 +6568,7 @@ class App:
                     self._later(CODEX_PLAN_SETTLE, lambda: self.refresh(tid, name=name, settle=True))
                     self._detected = None
                     return
+                st = self._group_status(tid, st)
                 if event_state == "done" and st.get("state") not in ("done", "blocked"):
                     self.tracker.observe(tid, {"state": "done"}, turn=turn, name=name)
                 self.tracker.observe(tid, st, turn=turn, name=name, initial=initial)
@@ -6533,6 +6617,7 @@ class App:
             self._agent_kinds.pop(tid, None)
             self._screen_state.pop(tid, None)
             self._screen_group.pop(tid, None)
+            self._status_group.pop(tid, None)
             self._screen_turns.pop(tid, None)
             self._card_states.pop(tid, None)
         for tid in self.tracker.known_claude() - live:
