@@ -1,0 +1,119 @@
+
+  ┃                                                                                                                                                             New session - 2026-11-21T10:15:17.
+  ┃  ask many                                                                                                                                                   757Z
+  ┃
+                                                                                                                                                                Context
+     → Asked 2 questions                                                                                                                                        15 tokens
+                                                                                                                                                                0% used
+  ┃                                                                                                                                                             $0.00 spent
+  ┃  ask many again
+  ┃                                                                                                                                                             LSP
+                                                                                                                                                                LSPs are disabled
+  ┃
+  ┃  # Questions
+  ┃
+  ┃  Which features do you want?
+  ┃  Logging, CI
+  ┃
+  ┃  Which license?
+  ┃  Apache 2
+  ┃
+
+     Noted.
+
+     ▣  Build · Mock Model · 12.6s
+
+  ┃
+  ┃  ask many 3
+  ┃
+
+  ┃
+  ┃  # Questions
+  ┃
+  ┃  Which features do you want?
+  ┃  (no answer)
+  ┃
+  ┃  Which license?
+  ┃  GPL
+  ┃
+
+     Noted.
+
+     ▣  Build · Mock Model · 13.2s
+
+  ┃
+  ┃  ask one multi
+  ┃
+
+  ┃
+  ┃  # Questions
+  ┃
+  ┃  Which languages?
+  ┃  Go, Rust
+  ┃
+
+     Noted.
+
+     ▣  Build · Mock Model · 11.1s
+
+  ┃
+  ┃  ask three
+  ┃
+
+     → Asked 3 questions
+
+     ▣  Build · Mock Model
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  ┃
+  ┃   Size   Extras   Drink   Confirm
+  ┃
+  ┃  Review
+  ┃
+  ┃  Size: Large
+  ┃
+  ┃  Extras: Cheese, Bacon
+  ┃
+  ┃  Drink: Tea                                                                                                                                                 ~/work/demo:main
+  ┃                                                                                                                                                                                          
+  ┃  ⇆ tab  enter submit  esc dismiss
+  ┃                                                                                                                                                             • OpenCode 1.19.6

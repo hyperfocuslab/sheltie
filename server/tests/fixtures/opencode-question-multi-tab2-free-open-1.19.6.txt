@@ -1,0 +1,119 @@
+
+  ┃                                                                                                                                                             New session - 2026-11-21T10:15:17.
+  ┃  ask many                                                                                                                                                   757Z
+  ┃
+                                                                                                                                                                Context
+     → Asked 2 questions                                                                                                                                        15 tokens
+                                                                                                                                                                0% used
+  ┃                                                                                                                                                             $0.00 spent
+  ┃  ask many again
+  ┃                                                                                                                                                             LSP
+                                                                                                                                                                LSPs are disabled
+     → Asked 2 questions
+
+     ▣  Build · Mock Model
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  ┃
+  ┃   Features   License   Confirm
+  ┃
+  ┃  Which license?
+  ┃
+  ┃  1. MIT
+  ┃     Permissive
+  ┃  2. GPL
+  ┃     Copyleft
+  ┃  3. Type your own answer
+  ┃     Type your own answer                                                                                                                                    ~/work/demo:main
+  ┃                                                                                                                                                                                          
+  ┃  ⇆ tab  ↑↓ select  enter confirm  esc dismiss
+  ┃                                                                                                                                                             • OpenCode 1.19.6

@@ -1,0 +1,119 @@
+
+  ┃                                                                                                                                                             New session - 2026-11-21T10:15:17.
+  ┃  ask many                                                                                                                                                   757Z
+  ┃
+                                                                                                                                                                Context
+     → Asked 2 questions                                                                                                                                        0 tokens
+                                                                                                                                                                0% used
+     ▣  Build · Mock Model                                                                                                                                      $0.00 spent
+
+                                                                                                                                                                LSP
+                                                                                                                                                                LSPs are disabled
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  ┃
+  ┃   Features   License   Confirm
+  ┃
+  ┃  Which features do you want? (select all that apply)
+  ┃
+  ┃  1. [✓] Logging
+  ┃     Structured logs
+  ┃  2. [ ] Tests
+  ┃     Unit tests
+  ┃  3. [✓] CI
+  ┃     GitHub Actions
+  ┃  4. [ ] Type your own answer
+  ┃     Type your own answer                                                                                                                                    ~/work/demo:main
+  ┃                                                                                                                                                                                          
+  ┃  ⇆ tab  ↑↓ select  enter toggle  esc dismiss
+  ┃                                                                                                                                                             • OpenCode 1.19.6

@@ -99,19 +99,21 @@ class OpencodeParseTests(unittest.TestCase):
         self.assertEqual(hr.push_category("blocked", {}, p), "HR_BLOCKED")
 
     def test_unknown_screens_have_no_card(self):
-        # 평소 화면, 작업 중, 여러 질문·복수 선택·리뷰 탭, PC에서 직접 입력 칸을 연 질문, 답한 뒤
-        for name in ("idle-start", "hello2", "idle-plan", "working", "question-multi", "question-multi-tab2",
-                     "question-multi-confirm", "question-custom-typing", "question-dismissed", "write-reject",
+        # 평소 화면, 작업 중, PC에서 직접 입력 칸을 열었거나 글을 넣은 질문(질문 하나, 복수 선택 탭, 단일 선택 탭), 답한 뒤
+        for name in ("idle-start", "hello2", "idle-plan", "working", "question-custom-typing", "question-multi-free-open",
+                     "question-multi-free-filled", "question-multi-tab2-free-open", "question-dismissed", "write-reject",
                      "plan-exit-yes"):
             self.assertIsNone(card(name), name)
 
     def test_parsers_do_not_cross(self):
-        for name in ("exec", "write", "exec-always-confirm", "question", "question-text", "plan-exit"):
+        for name in ("exec", "write", "exec-always-confirm", "question", "question-text", "plan-exit", "question-multi",
+                     "question-multi-tab2", "question-multi-confirm", "question-multi-one", "question-multi3-q2"):
             for agent in (None, "codex", "gemini", "copilot", "qwen"):
                 self.assertIsNone(hr.parse_prompt(oc(name), agent=agent), (name, agent))
         for f in ("claude-bash-2.1.329.txt", "codex-exec-0.171.0.txt", "gemini-exec-0.70.0.txt",
                   "gemini-question-0.70.0.txt", "copilot-exec-1.0.114.txt", "copilot-question-1.0.114.txt",
-                  "qwen-exec-0.28.3.txt", "qwen-question-0.28.3.txt"):
+                  "qwen-exec-0.28.3.txt", "qwen-question-0.28.3.txt", "qwen-question-multi-0.28.3.txt",
+                  "qwen-question-submit-0.28.3.txt", "claude-question-review-2.1.329.txt"):
             self.assertIsNone(hr.parse_prompt(fixture(f), agent="opencode"), f)
 
     def test_answer_steps(self):
@@ -130,6 +132,96 @@ class OpencodeParseTests(unittest.TestCase):
         self.assertEqual(hr.answer_steps(card("plan-exit"), option_index=1), [("keys", ["2"])])
         with self.assertRaises(hr.ApiError):
             hr.answer_steps(p, text="no")
+
+
+class OpencodeMultiQuestionTests(unittest.TestCase):
+    """여러 질문(탭)·복수 선택·Review(Confirm) 탭. 실측 1.19.6: 복수 선택은 숫자 키 = 토글, tab = 다음 탭.
+    단일 선택 탭은 숫자 = 고르고 다음 탭. Review는 enter = 제출, esc = dismiss. 지금 탭은 화면 글자로 안 보인다."""
+
+    def test_multi_tab_card(self):
+        p = card("question-multi")
+        self.assertEqual((p["kind"], p["agent"], p["title"], p["question"], p["multi_select"]),
+                         ("question", "opencode", None, "Which features do you want?", True))
+        self.assertIsNone(p["tabs"])  # 질문 탭이 여럿이면 지금 탭·답한 탭을 화면 글자로 모른다
+        self.assertEqual(labels(p), ["Logging", "Tests", "CI"])  # 복수 선택의 직접 입력은 뺀다
+        self.assertEqual([o["description"] for o in p["options"]], ["Structured logs", "Unit tests", "GitHub Actions"])
+        self.assertEqual([o["number"] for o in p["options"]], [1, 2, 3])
+        self.assertEqual((p["checked"], p["selected"], p["free_text_index"]), ([], None, None))
+        c = card("question-multi-checked")  # PC에서 1·3 토글: 체크는 id에 안 들어간다
+        self.assertEqual(c["checked"], [0, 2])
+        self.assertEqual(c["id"], p["id"])
+        q2 = card("question-multi3-q2")  # 가운데 탭의 복수 선택
+        self.assertEqual((q2["question"], labels(q2), q2["multi_select"]), ("Which extras?", ["Cheese", "Bacon"], True))
+
+    def test_multi_single_question_card(self):
+        p = card("question-multi-one")  # 질문 하나 복수 선택도 탭 막대(`Langs   Confirm`): 탭 하나라 지금 탭을 안다
+        self.assertEqual((p["title"], p["question"], p["multi_select"]), ("Langs", "Which languages?", True))
+        self.assertEqual(p["tabs"], [{"label": "Langs", "answered": False}])
+        self.assertEqual(labels(p), ["Python", "Go", "Rust"])
+
+    def test_single_tab_card(self):
+        p = card("question-multi-tab2")
+        self.assertEqual((p["kind"], p["title"], p["question"], p["multi_select"], p["tabs"]),
+                         ("question", None, "Which license?", False, None))
+        self.assertEqual(labels(p), ["MIT", "GPL", "Type your own answer"])
+        self.assertEqual((p["selected"], p["free_text_index"]), (None, 2))
+        q1 = card("question-multi3-q1")
+        self.assertEqual((q1["question"], labels(q1), q1["free_text_index"]),
+                         ("Pick a size?", ["Small", "Large", "Type your own answer"], 2))
+
+    def test_review_card(self):
+        p = card("question-multi-confirm")
+        self.assertEqual((p["kind"], p["title"], p["question"]), ("submit", None, "Review"))
+        self.assertEqual(p["body"], "Features: Logging, CI\nLicense: GPL")
+        self.assertEqual(labels(p), ["Submit", "Dismiss"])
+        self.assertEqual((p["reject_index"], p["multi_select"]), (1, False))
+        self.assertEqual(p["tabs"], [{"label": "Features", "answered": True}, {"label": "License", "answered": True}])
+        e = card("question-multi-confirm-empty")
+        self.assertEqual(e["body"], "Features: (not answered)\nLicense: (not answered)")
+        self.assertEqual([t["answered"] for t in e["tabs"]], [False, False])
+        self.assertNotEqual(e["id"], p["id"])
+        t = card("question-multi3-confirm")
+        self.assertEqual(t["body"], "Size: Large\nExtras: Cheese, Bacon\nDrink: Tea")
+        self.assertEqual([x["label"] for x in t["tabs"]], ["Size", "Extras", "Drink"])
+        self.assertEqual(card("question-multi-one-confirm")["tabs"], [{"label": "Langs", "answered": True}])
+
+    def test_broken_screens_have_no_card(self):
+        multi = oc("question-multi")
+        for bad in (multi.replace("Features   License   Confirm", "Features   License"),  # Confirm 탭 없음
+                    multi.replace(" (select all that apply)", ""),  # 복수 선택 표시 없음
+                    multi.replace("enter toggle", "enter confirm"),  # 힌트와 줄 모양이 다름
+                    multi.replace("4. [ ] Type your own answer", "4. [✓] Type your own answer"),  # PC에서 직접 입력 체크
+                    multi.replace("4. [ ] Type your own answer", "4. [ ] Other")):  # 직접 입력 항목 없음
+            self.assertIsNone(hr.parse_prompt(bad, agent="opencode"))
+        rev = oc("question-multi-confirm")
+        for bad in (rev.replace("Review", "Summary"), rev.replace("License: GPL", "Licence: GPL"),
+                    rev.replace("enter submit", "enter confirm")):
+            self.assertIsNone(hr.parse_prompt(bad, agent="opencode"))
+
+    def test_answer_steps(self):
+        m = card("question-multi")
+        self.assertEqual(hr.answer_steps(m, option_indices=[2, 0]), [("keys", ["1", "3", "tab"])])
+        self.assertEqual(hr.answer_steps(m, option_indices=[]), [("keys", ["tab"])])  # 안 골라도 넘어간다(Unanswered)
+        c = card("question-multi-checked")  # 지금 [0, 2] → 원하는 [1, 2]: 1·2 토글 후 tab
+        self.assertEqual(hr.answer_steps(c, option_indices=[1, 2]), [("keys", ["1", "2", "tab"])])
+        self.assertEqual(hr.answer_steps(c, option_indices=[0, 2]), [("keys", ["tab"])])
+        with self.assertRaises(hr.ApiError):
+            hr.answer_steps(c, option_indices=[3])
+        with self.assertRaises(hr.ApiError):
+            hr.answer_steps(m, option_index=0)
+        with self.assertRaises(hr.ApiError):
+            hr.answer_steps(m, text="x")
+        self.assertEqual(hr.answer_steps(card("question-multi-one"), option_indices=[1, 2]), [("keys", ["2", "3", "tab"])])
+        t = card("question-multi-tab2")  # 단일 선택 탭: 숫자 = 고르고 다음 탭, 직접 입력은 숫자 → 붙여넣기+enter
+        self.assertEqual(hr.answer_steps(t, option_index=1), [("keys", ["2"])])
+        self.assertEqual(hr.answer_steps(t, text="Apache 2"), [("keys", ["3"]), ("text", "Apache 2")])
+        with self.assertRaises(hr.ApiError):
+            hr.answer_steps(t, option_indices=[0])
+        r = card("question-multi-confirm")
+        self.assertEqual(hr.answer_steps(r, option_index=0), [("keys", ["enter"])])
+        self.assertEqual(hr.answer_steps(r, option_index=1), [("keys", ["esc"])])
+        with self.assertRaises(hr.ApiError):
+            hr.answer_steps(r, text="x")
 
 
 class OpencodeScreenStatusTests(unittest.TestCase):
@@ -237,17 +329,58 @@ class OpencodeScreenStatusTests(unittest.TestCase):
                          [("HR_BLOCKED", "question"), ("HR_BLOCKED", "plan")])
 
     def test_dialog_without_card_blocks_once(self):
-        # 여러 질문은 카드가 없지만 막힘(제목이 없어 힌트 줄로 안다). 다음 탭으로 넘어가도 같은 막힘
-        self.screen("question-multi")
+        # PC에서 직접 입력 칸을 연 여러 질문은 카드가 없지만 막힘(제목이 없어 힌트 줄로 안다). 다른 탭도 같은 막힘
+        self.screen("question-multi-free-open")
         self.assertEqual([(s, c) for s, c, _ in self.states()], [("blocked", "HR_BLOCKED")])
         self.assertIsNone(self.pusher.payloads[0]["prompt_id"])
         self.assertEqual(self.later, [])
         self.assertIsNone(self.app.api_prompt("o1")["prompt"])
-        self.screen("question-multi-tab2")
-        self.screen("question-multi-confirm")
+        self.screen("question-multi-free-filled")
+        self.screen("question-multi-tab2-free-open")
         self.assertEqual(len(self.pusher.payloads), 1)
         self.screen("hello2")
         self.assertEqual([x["state"] for x in self.pusher.payloads], ["blocked", "done"])
+
+    def test_multi_question_cards(self):
+        self.screen("working")
+        self.screen("question-multi")
+        p = self.app.api_prompt("o1")["prompt"]
+        self.assertEqual([(x["category"], x["kind"], x["prompt_id"]) for x in self.pusher.payloads],
+                         [("HR_BLOCKED", "question", p["id"])])
+        self.assertTrue(p["multi_select"])
+        self.assertEqual(self.err(self.app.api_prompt_answer, "o1", {"prompt_id": p["id"], "option_index": 0}),
+                         (400, "use_option_indices"))
+        self.assertEqual(self.err(self.app.api_prompt_answer, "o1", {"prompt_id": p["id"], "text": "x"}),
+                         (400, "no_free_text"))
+        self.assertEqual(self.err(self.app.api_answer, "o1", {"action": "approve", "prompt_id": p["id"]}),
+                         (409, "needs_manual"))
+        self.hc.screens["o1"] = oc("question-multi-checked")  # PC에서 1·3 토글: 같은 카드, 지금 체크로 계산
+        self.app.api_prompt_answer("o1", {"prompt_id": p["id"], "option_indices": [2]})
+        self.assertEqual(self.hc.keys_calls, [("o1", ["1", "tab"])])
+        # 다음 탭(단일 선택): 새 카드. 옛 카드 id로 답하면 prompt_changed
+        self.hc.screens["o1"] = oc("question-multi-tab2")
+        t = self.app.api_prompt("o1")["prompt"]
+        self.assertNotEqual(t["id"], p["id"])
+        self.assertEqual(self.err(self.app.api_prompt_answer, "o1", {"prompt_id": p["id"], "option_indices": [0]}),
+                         (409, "prompt_changed"))
+        self.app.api_prompt_answer("o1", {"prompt_id": t["id"], "text": "Apache 2"})
+        self.assertEqual(self.hc.keys_calls[-1], ("o1", ["3"]))
+        self.assertEqual(self.hc.send_calls, [("o1", "Apache 2", "force")])
+        # Review 탭: 확인 카드, enter 제출 / esc dismiss
+        self.hc.screens["o1"] = oc("question-multi-confirm")
+        r = self.app.api_prompt("o1")["prompt"]
+        self.assertEqual(r["kind"], "submit")
+        self.app.api_prompt_answer("o1", {"prompt_id": r["id"], "option_index": 0})
+        self.assertEqual(self.hc.keys_calls[-1], ("o1", ["enter"]))
+        self.app.api_prompt_answer("o1", {"prompt_id": r["id"], "option_index": 1})
+        self.assertEqual(self.hc.keys_calls[-1], ("o1", ["esc"]))
+        self.hc.screens["o1"] = oc("question-multi-confirm-empty")  # 요약이 바뀌면 다른 카드
+        self.assertEqual(self.err(self.app.api_prompt_answer, "o1", {"prompt_id": r["id"], "option_index": 0}),
+                         (409, "prompt_changed"))
+        # 탭을 옮겨도 같은 막힘(알림 한 번)
+        self.screen("question-multi-tab2")
+        self.screen("question-multi-confirm")
+        self.assertEqual(len(self.pusher.payloads), 1)
 
     def test_typing_in_open_question_is_not_a_new_block(self):
         self.screen("question")

@@ -1700,7 +1700,14 @@ def is_qwen(info):
 # "Allow always"는 메모리에만 있다("until OpenCode is restarted", 재시작 뒤 다시 물음 실측): 세션 한정.
 # 2차 확인 화면(△ Always allow)의 esc는 Cancel(원래 메뉴로, 커서는 다시 Allow once), esc 두 번이면 거절(실측).
 # 질문(질문 1개·단일 선택)은 번호를 누르면 바로 제출, "Type your own answer"는 번호 → 붙여넣기+enter.
-# 여러 질문(탭)·복수 선택은 카드 없음. plan_exit(실험 플랜 모드)는 질문 모양 Yes/No(No는 턴 끝).
+# 여러 질문이거나 복수 선택이면 위에 탭 막대(`Features   License   Confirm`, 질문 하나 복수 선택도 `Langs   Confirm`)가 있고
+# 카드는 지금 탭 하나만 담는다. 지금 탭·답한 탭은 색으로만 보여 화면 글자로 모른다: 질문 탭이 하나일 때만 tabs를 채우고
+# 여럿이면 tabs 없음. Confirm 탭(Review)은 `<탭>: <답>`/`(not answered)` 요약이라 거기서는 답한 탭을 안다.
+# 키(실측 1.19.6): 복수 선택(`1. [✓] Logging`, `enter toggle`)은 숫자 키 = 토글(커서와 상관없이), tab = 다음 탭(안 골라도
+# 넘어가고 모델은 "Unanswered"를 받는다). 단일 선택 탭(`enter confirm`)은 숫자 = 고르고 다음 탭, 직접 입력은 숫자 → 붙여넣기+enter
+# (입력 뒤 다음 탭). Review(`enter submit`)는 enter = 제출, esc = 질문 dismiss(턴 끝).
+# 직접 입력 칸이 열렸거나 글이 들어간 상태(항목 아래 줄)는 숫자가 칸에 써지므로 카드 없음. 복수 선택 카드엔 직접 입력 없음.
+# plan_exit(실험 플랜 모드)는 질문 모양 Yes/No(No는 턴 끝).
 OPENCODE_SIDEBAR_RE = re.compile(r"• OpenCode \d")
 OPENCODE_PERM_HEAD = "△ Permission required"
 OPENCODE_ALWAYS_HEAD = "△ Always allow"
@@ -1713,13 +1720,21 @@ OPENCODE_SHELL_HEAD = "# Shell command"
 OPENCODE_EDIT_HEAD_RE = re.compile(r"^→ (Edit \S.*)$")
 OPENCODE_Q_HINT = "↑↓ select  enter submit  esc dismiss"
 OPENCODE_FREE = "Type your own answer"
+OPENCODE_Q_HINT_MULTI = "⇆ tab  ↑↓ select  enter toggle  esc dismiss"
+OPENCODE_Q_HINT_TAB = "⇆ tab  ↑↓ select  enter confirm  esc dismiss"
+OPENCODE_REVIEW_HINT = "⇆ tab  enter submit  esc dismiss"
+OPENCODE_REVIEW_HEAD = "Review"
+OPENCODE_CONFIRM_TAB = "Confirm"
+OPENCODE_MULTI_SUFFIX = " (select all that apply)"
+OPENCODE_NOT_ANSWERED = "(not answered)"
+OPENCODE_SUBMIT_LABELS = ("Submit", "Dismiss")
 OPENCODE_PLAN_Q_RE = re.compile(
     r"^Plan at \S+ is complete\. Would you like to switch to the build agent and start implementing\?$")
 OPENCODE_BUSY_RE = re.compile(r"^\s*\S+\s+esc interrupt\b")  # 작업 중 맨 아래 줄 "⬝⬝⬝⬝⬝⬝⬝⬝  esc interrupt"
 # 카드를 못 읽어도 막힘인 대화 상자 힌트(승인·2차 확인 "⇆ select  enter confirm", 질문·여러 질문 "… esc dismiss")
 OPENCODE_DIALOG_RE = re.compile(r"⇆ select {2}enter confirm|\besc dismiss\b")
 OPENCODE_ANSWER_KEYS = {"Allow once": ["enter"], "Allow always": ["right", "enter", "enter"], "Reject": ["esc"],
-                        "Confirm": ["enter"], "Cancel": ["esc"]}
+                        "Confirm": ["enter"], "Cancel": ["esc"], "Submit": ["enter"], "Dismiss": ["esc"]}
 
 
 def _cut_cols(line, col):
@@ -1782,29 +1797,83 @@ def _parse_opencode_approval(inner):
     return p
 
 
+def _opencode_tabs(line):
+    """탭 막대 `Features   License   Confirm` → 질문 탭 라벨 목록(맨 끝 Confirm 뺌) 또는 None."""
+    items = [x for x in re.split(r"\s{2,}", line.strip()) if x]
+    if len(items) < 2 or items[-1] != OPENCODE_CONFIRM_TAB or OPENCODE_CONFIRM_TAB in items[:-1]:
+        return None
+    return items[:-1]
+
+
+def _parse_opencode_review(inner, idx, labels):
+    """Confirm 탭: `Review` + 탭마다 `<라벨>: <답>`(안 답하면 `(not answered)`) → 확인 카드(Submit = enter, Dismiss = esc)."""
+    body = [inner[i].strip() for i in idx[1:-1]]
+    if not body or body[0] != OPENCODE_REVIEW_HEAD:
+        return None
+    entries = []
+    for ln in body[1:]:
+        k = len(entries)
+        if k < len(labels) and ln.startswith(labels[k] + ": "):
+            entries.append(ln)
+        elif entries:
+            entries[-1] += " " + ln  # 긴 답이 줄바꿈됐다
+        else:
+            return None
+    if len(entries) != len(labels):
+        return None
+    tabs = [{"label": lb, "answered": e[len(lb) + 2:].strip() != OPENCODE_NOT_ANSWERED} for lb, e in zip(labels, entries)]
+    return _finish("submit", None, OPENCODE_REVIEW_HEAD, "\n".join(entries),
+                   [(lb, None, None) for lb in OPENCODE_SUBMIT_LABELS], reject_index=1, tabs=tabs)
+
+
 def _parse_opencode_question(inner):
     idx = [i for i, ln in enumerate(inner) if ln.strip()]
-    if len(idx) < 3 or inner[idx[-1]].strip() != OPENCODE_Q_HINT:
-        return None  # 여러 질문(탭: "⇆ tab …")·복수 선택("enter toggle")은 힌트가 다르다
-    rows = _menu_rows(inner, 0, idx[-1])
-    if not rows or any(r["selected"] or r["checkbox"] for r in rows):
+    if len(idx) < 3:
+        return None
+    hint = inner[idx[-1]].strip()
+    labels_tab = None
+    if hint in (OPENCODE_Q_HINT_MULTI, OPENCODE_Q_HINT_TAB, OPENCODE_REVIEW_HINT):
+        labels_tab = _opencode_tabs(inner[idx[0]])
+        if labels_tab is None:
+            return None
+        if hint == OPENCODE_REVIEW_HINT:
+            return _parse_opencode_review(inner, idx, labels_tab)
+        idx = idx[1:]
+    elif hint != OPENCODE_Q_HINT:
+        return None
+    multi = hint == OPENCODE_Q_HINT_MULTI
+    rows = _menu_rows(inner, idx[0], idx[-1])
+    if not rows or any(r["selected"] for r in rows) or any(r["checkbox"] != multi for r in rows):
         return None
     head = [inner[i].strip() for i in idx if i < rows[0]["line"]]
     if not head:
         return None
     question = _norm(" ".join(head))
+    if multi:
+        if not question.endswith(OPENCODE_MULTI_SUFFIX):
+            return None
+        question = question[:-len(OPENCODE_MULTI_SUFFIX)].strip()
     labels = [_norm(r["label"]) for r in rows]
     free = None
     if labels[-1] == OPENCODE_FREE:
-        if rows[-1]["extra"]:
-            return None  # PC에서 직접 입력 칸을 열었다(칸이 항목 아래에 그려진다)
+        if rows[-1]["extra"] or rows[-1]["checked"]:
+            return None  # PC에서 직접 입력 칸을 열었거나 글을 넣었다(칸·글이 항목 아래에 그려진다)
         free = len(rows) - 1
-    opts = [(lb, _norm(" ".join(r["extra"])) or None, r["num"]) for lb, r in zip(labels, rows)]
-    if OPENCODE_PLAN_Q_RE.match(question):
+    elif labels_tab is not None:
+        return None  # 탭 화면은 늘 직접 입력 항목이 끝에 있다(실측)
+    keep = list(range(len(rows)))
+    if multi:
+        keep, free = keep[:-1], None  # 복수 선택의 직접 입력은 체크박스 줄이라 카드에서 뺀다(Claude와 같다)
+    opts = [(labels[k], _norm(" ".join(rows[k]["extra"])) or None, rows[k]["num"]) for k in keep]
+    tabs = title = None
+    if labels_tab is not None and len(labels_tab) == 1:
+        title, tabs = labels_tab[0], [{"label": labels_tab[0], "answered": False}]
+    if labels_tab is None and OPENCODE_PLAN_Q_RE.match(question):
         if labels != ["Yes", "No"]:
             return None
         return _finish("plan", None, question, None, opts, reject_index=1)
-    return _finish("question", None, question, None, opts, free_text_index=free)
+    return _finish("question", title, question, None, opts, multi=multi,
+                   checked=[j for j, k in enumerate(keep) if rows[k]["checked"]], free_text_index=free, tabs=tabs)
 
 
 def _parse_opencode_lines(lines, plan_reader=None):
@@ -1817,11 +1886,27 @@ def _parse_opencode_lines(lines, plan_reader=None):
     return p
 
 
+def _opencode_dialog_group(text):
+    """여러 질문 상자(탭 막대 + 탭 힌트)면 탭 라벨 묶음, 아니면 None."""
+    inner = _opencode_block(screen_lines(text))
+    idx = [i for i, ln in enumerate(inner or []) if ln.strip()]
+    if len(idx) < 2 or inner[idx[-1]].strip() not in (OPENCODE_Q_HINT_MULTI, OPENCODE_Q_HINT_TAB, OPENCODE_REVIEW_HINT):
+        return None
+    tabs = _opencode_tabs(inner[idx[0]])
+    return tuple(tabs) if tabs else None
+
+
 def _pick_opencode(p, option_index):
-    """승인·2차 확인 버튼(번호 없음, 커서가 돌아 화면으로 위치를 모른다): 뜰 때 자리(첫 버튼) 기준 키. 질문은 숫자 키."""
-    if p["kind"] != "approval":
+    """승인·2차 확인 버튼(번호 없음, 커서가 돌아 화면으로 위치를 모른다): 뜰 때 자리(첫 버튼) 기준 키.
+    Review 탭은 enter(제출)·esc(dismiss). 질문은 숫자 키."""
+    if p["kind"] not in ("approval", "submit"):
         return None
     return [("keys", list(OPENCODE_ANSWER_KEYS[p["options"][option_index]["label"]]))]
+
+
+def _multi_opencode(p, num, want):
+    """복수 선택: 숫자 키 = 토글(커서와 상관없이), tab = 다음 탭(실측 1.19.6). 안 골라도 tab으로 넘어간다."""
+    return [("keys", [str(num(i)) for i in sorted(want.symmetric_difference(set(p["checked"])))] + ["tab"])]
 
 
 def _reject_keys_opencode(p):
@@ -6045,6 +6130,8 @@ QWEN_PUSH_PROMPT_WAIT = 1.0
 #   done_settle            (선택) "full"에서 막힘 뒤 바로 끝남으로 보일 때 SCREEN_SETTLE 뒤 한 번 더 본다(답 직후 작업 표시 전 장면)
 #   idle_after_re          (선택) "full"에서 이 msg의 막힘(시작 화면) 뒤에는 끝남이 아니라 idle
 #   dialog_re              "full"에서 카드를 못 읽어도 화면 끝 줄이 이 힌트면 막힘(제목으로 막힘을 모르는 에이전트, 없으면 None)
+#   dialog_group(text)     (선택) "full"에서 여러 질문 상자의 묶음 키(탭 라벨 등, 아니면 None). 막힘 중 같은 묶음의
+#                          다른 탭 카드로 바뀌면 새 막힘이 아니다(알림 한 번, Claude·Qwen의 hc status와 같다)
 #   pick(p, i)             (선택) 그 항목을 고르는 키 단계. None을 주면 숫자·커서 이동 기본 방식
 #   multi(p, num, want)    (선택) 복수 선택 답(want: 고를 index 집합) → 키 단계. 없으면 숫자 토글 + right(Claude)
 #   reject_keys(p)         (선택) reject_index가 없는 카드의 거절 키(기본 esc)
@@ -6094,7 +6181,9 @@ AGENTS = {
                  "preview": lambda path, sid: opencode_preview(path, sid),
                  "push_wait": lambda: PUSH_PROMPT_BUDGET, "retry": False, "screen": "full",
                  "title_blocked": None, "title_working": None, "busy_re": OPENCODE_BUSY_RE,
-                 "dialog_re": OPENCODE_DIALOG_RE, "pick": _pick_opencode, "reject_keys": _reject_keys_opencode,
+                 "dialog_re": OPENCODE_DIALOG_RE, "dialog_group": _opencode_dialog_group,
+                 "pick": _pick_opencode, "multi": _multi_opencode,
+                 "reject_keys": _reject_keys_opencode,
                  "approve_keys": ["enter"],
                  "send_guard": True},
     # Grok Build는 OSC 7501로 승인·계획·폴더 신뢰(permission)·질문(question)을 다 보낸다(실측 1.0.77): 덧씌우기 없음.
@@ -6167,6 +6256,7 @@ class App:
         self._sleep = time.sleep  # 테스트가 바꾼다
         self._agent_kinds = {}  # tid → agent_kind(마지막 hc get). 알림 카드를 어느 화면으로 읽을지 정한다
         self._screen_state = {}  # "full" 에이전트: tid → 마지막으로 판정한 status
+        self._screen_group = {}  # "full" 에이전트: tid → 막힘 중인 여러 질문 상자의 묶음 키(dialog_group)
         self._screen_turns = {}  # "full" 에이전트: tid → 끝남 횟수(Tracker의 turn 대신)
         self._card_states = {}  # card_status 에이전트: tid → 이번 막힘에서 마지막으로 읽은 카드 status
         self.tracker = Tracker(self._notify, prompt_for=self._prompt_for_push, reminders=self.reminders)
@@ -6269,7 +6359,10 @@ class App:
         p = self.parse_screen(text, kind) if text else None
         prev_st = self._screen_state.get(tid) or {}
         prev = prev_st.get("state")
-        if p:
+        group = spec["dialog_group"](text) if p and text and spec.get("dialog_group") else None
+        if p and group is not None and prev == "blocked" and self._screen_group.get(tid) == group:
+            st = prev_st  # 여러 질문 상자의 다른 탭(답해서 다음 탭으로 넘어감): 같은 막힘
+        elif p:
             st = dict({"app": kind}, **_card_status(p))
         elif spec.get("title_blocked") and spec["title_blocked"].search(title):
             if prev == "blocked":
@@ -6303,6 +6396,10 @@ class App:
             if st["state"] == "done" and prev != "done":
                 self._screen_turns[tid] = self._screen_turns.get(tid, 0) + 1
             self._screen_state[tid] = st
+            if st["state"] != "blocked":
+                self._screen_group.pop(tid, None)
+            elif p:
+                self._screen_group[tid] = group
         return st
 
     def _card_state(self, tid, info, commit=False):
@@ -6435,6 +6532,7 @@ class App:
         for tid in set(self._agent_kinds) - live:
             self._agent_kinds.pop(tid, None)
             self._screen_state.pop(tid, None)
+            self._screen_group.pop(tid, None)
             self._screen_turns.pop(tid, None)
             self._card_states.pop(tid, None)
         for tid in self.tracker.known_claude() - live:
