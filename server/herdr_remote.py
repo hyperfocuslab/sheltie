@@ -578,7 +578,7 @@ def prompt_id(p):
 
 
 def _finish(kind, title, question, body, options, selected=None, multi=False, checked=None,
-            free_text_index=None, tabs=None, always_index=None, reject_index=None):
+            free_text_index=None, tabs=None, always_index=None, reject_index=None, persist_index=None):
     """options: (label, description, 화면 번호 또는 None). 번호는 숨긴 줄(Chat about this 등)을 건너뛰어도
     화면에 찍힌 그대로라 키 계산은 index가 아니라 number로 한다."""
     p = {"kind": kind, "title": title, "question": question, "body": body,
@@ -586,7 +586,7 @@ def _finish(kind, title, question, body, options, selected=None, multi=False, ch
                      for k, o in enumerate(options)],
          "selected": selected, "multi_select": bool(multi), "checked": list(checked or []),
          "free_text_index": free_text_index, "tabs": tabs,
-         "always_index": always_index, "reject_index": reject_index}
+         "always_index": always_index, "reject_index": reject_index, "persist_index": persist_index}
     p["id"] = prompt_id(p)
     return p
 
@@ -741,6 +741,26 @@ def reject_index(labels):
     return _safe_index(labels, "no", REJECT_UNSAFE)
 
 
+PERSIST_MARKS = ("don't ask again", "always allow", "this project", "from this project")
+
+
+def allow_more_indices(labels):
+    """(세션 한정 허용, 프로젝트 영구 허용) 선택지 index. auto mode 전환은 둘 다 아니다.
+    세션: "Yes, and switch to accept edits … for this session", "Yes, allow all edits during this session".
+    영구: "Yes, and don't ask again for … in <dir>", "Yes, and always allow access to <dir> from this project"."""
+    session = persist = None
+    for k, lb in enumerate(labels):
+        low = _norm(lb).lower().replace("\u2019", "'")
+        if not re.match(r"^yes\b", low) or low == "yes" or "auto mode" in low:
+            continue
+        if "this session" in low:
+            if session is None:
+                session = k
+        elif persist is None and (low.startswith("yes, and") or any(m in low for m in PERSIST_MARKS)):
+            persist = k
+    return session, persist
+
+
 def _parse_approval(lines):
     h = _hint_index(lines, ESC_HINT_RE)
     if h < 0:
@@ -757,12 +777,11 @@ def _parse_approval(lines):
         return None
     labels = [_norm(" ".join([r["label"]] + r["extra"])) for r in rows]
     title, body = _approval_panel(lines, q)
-    always = next((k for k, lb in enumerate(labels)
-                   if lb.startswith("Yes, and") and "auto mode" not in lb), None)
+    always, persist = allow_more_indices(labels)
     return _finish("approval", title, lines[q].strip(), body,
                    [(lb, None, r["num"]) for lb, r in zip(labels, rows)],
                    selected=next(k for k, r in enumerate(rows) if r["selected"]),
-                   always_index=always, reject_index=reject_index(labels))
+                   always_index=always, reject_index=reject_index(labels), persist_index=persist)
 
 
 def _parse_confirm(lines):
@@ -1639,8 +1658,10 @@ def build_payload(tid, name, state, status, prompt=None, exit_code=None):
         body = msg or "Needs your reply"
         loc_key = None if msg else "push.body.blocked"
     body = body[:200]
-    alert = {"title": name or tid, "subtitle": SUBTITLES[cat], "body": body,
+    alert = {"title": name or "Untitled terminal", "subtitle": SUBTITLES[cat], "body": body,
              "subtitle-loc-key": SUBTITLE_KEYS[cat]}
+    if not name:
+        alert["title-loc-key"] = "push.title.untitled"  # id를 제목으로 보이지 않는다
     if loc_key:
         alert["loc-key"] = loc_key
         if loc_args:
@@ -2811,7 +2832,8 @@ class App:
             if not isinstance(cwd, str):
                 continue
             r = rel_to_home(os.path.realpath(cwd), self.home)
-            if r is not None and r not in recent and os.path.isdir(os.path.join(self.home, r)):
+            # 홈 자체(빈 경로)는 "최근 폴더"로 쓸모가 없다(앱에 이름 없는 줄이 생긴다).
+            if r and r not in recent and os.path.isdir(os.path.join(self.home, r)):
                 recent.append(r)
         return {"path": rel_to_home(p, self.home) or "", "dirs": dirs[:500], "recent": recent[:20]}
 

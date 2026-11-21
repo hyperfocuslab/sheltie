@@ -392,7 +392,10 @@ class ApnsTests(unittest.TestCase):
         self.assertEqual(len(p["aps"]["alert"]["body"]), 200)
         self.assertEqual(p["aps"]["thread-id"], "t12")
         self.assertEqual(p["aps"]["sound"], "default")
-        self.assertEqual(hr.build_payload("t12", None, "done", None)["aps"]["alert"]["title"], "t12")
+        # 이름이 없으면 id 대신 "이름 없는 터미널"(앱 언어로)
+        a = hr.build_payload("t12", None, "done", None)["aps"]["alert"]
+        self.assertEqual((a["title"], a["title-loc-key"]), ("Untitled terminal", "push.title.untitled"))
+        self.assertNotIn("title-loc-key", hr.build_payload("t12", "hrtest", "done", None)["aps"]["alert"])
 
     def _pusher(self, tmp, responses, hosts=None):
         cfg = dict(hr.DEFAULTS, apns_key_path=os.path.join(tmp, "AuthKey.p8"))
@@ -971,20 +974,35 @@ class ParsePromptTests(unittest.TestCase):
         self.assertEqual([o["label"][:30] for o in p["options"]],
                          ["Yes", "Yes, and always allow access t", "Yes, and switch to auto mode ·", "No"])
         self.assertTrue(p["options"][1]["label"].endswith("hrtest/sub from this project"))
-        self.assertEqual((p["selected"], p["always_index"], p["reject_index"]), (0, 1, 3))
+        # "always allow access to <dir> from this project"는 프로젝트 영구 허용: 세션 한정(always)이 아니다
+        self.assertEqual((p["selected"], p["always_index"], p["persist_index"], p["reject_index"]), (0, None, 1, 3))
         self.assertRegex(p["id"], r"^[0-9a-f]{12}$")
 
     def test_approval_write_and_overwrite(self):
         p = self.p("claude-write-2.1.329.txt")
         self.assertEqual((p["kind"], p["title"], p["question"]), ("approval", "Create file", "Do you want to create hello.txt?"))
         self.assertIn("1 hi", p["body"])
-        self.assertEqual((p["always_index"], p["reject_index"], len(p["options"])), (1, 2, 3))
+        self.assertEqual((p["always_index"], p["persist_index"], p["reject_index"], len(p["options"])), (1, None, 2, 3))
         self.assertTrue(p["options"][1]["label"].endswith("for this session (shift+tab)"))
         # 마지막 줄이 이름 붙은 가로줄(── change-hello-txt-to-hey ─)이어도 힌트를 찾는다
         o = self.p("claude-overwrite-2.1.329.txt")
         self.assertEqual((o["title"], o["question"]), ("Overwrite file", "Do you want to overwrite hello.txt?"))
         self.assertIn("1 -hi", o["body"])
         self.assertIn("1 +hey", o["body"])
+
+    def test_approval_session_vs_persist_labels(self):
+        cases = [
+            (["Yes", "Yes, allow all edits during this session (shift+tab)", "No"], 1, None),
+            (["Yes", "Yes, and don't ask again for npm test commands in /Users/dev/proj", "No"], None, 1),
+            (["Yes", "Yes, and don\u2019t ask again this session", "No"], 1, None),
+            (["Yes", "Yes, and switch to accept edits for this session (shift+tab)",
+              "Yes, and always allow access to /tmp/x from this project", "No"], 1, 2),
+            (["Yes", "Yes, and switch to auto mode", "No"], None, None),
+        ]
+        for labels, always, persist in cases:
+            with self.subTest(labels=labels):
+                p = hr.parse_prompt(approval_screen(labels))
+                self.assertEqual((p["always_index"], p["persist_index"]), (always, persist))
 
     def test_question_tabs(self):
         p = self.p("claude-question-2.1.329.txt")
@@ -1127,13 +1145,16 @@ class PushPromptTests(unittest.TestCase):
         self.app.poll(initial=True)
 
     def test_blocked_push_carries_prompt_id_and_always_category(self):
-        self.hc.screens["t1"] = fixture("claude-bash-2.1.329.txt")
+        self.hc.screens["t1"] = fixture("claude-write-2.1.329.txt")
         self.hc.set_status("t1", dict(PERM, msg="approve Bash: mkdir sub"))
         self.app.handle_event_line(status_ev("t1", PERM))
         p = self.pusher.payloads[-1]
-        card = hr.parse_prompt(fixture("claude-bash-2.1.329.txt"))
+        card = hr.parse_prompt(fixture("claude-write-2.1.329.txt"))
         self.assertEqual((p["aps"]["category"], p["category"], p["prompt_id"], p["kind"]),
                          ("HR_PERMISSION_ALWAYS", "HR_PERMISSION_ALWAYS", card["id"], "approval"))
+        # 프로젝트 영구 허용만 있는 카드는 잠금화면 "세션 동안 허용" 버튼을 주지 않는다
+        self.assertEqual(hr.push_category("blocked", PERM, hr.parse_prompt(fixture("claude-bash-2.1.329.txt"))),
+                         "HR_PERMISSION")
         self.assertNotIn("options", p)  # 카드 내용은 푸시에 안 넣는다
         self.assertLess(len(json.dumps(p, ensure_ascii=True)), 4096)
         self.assertEqual(self.hc.read_calls, 1)
@@ -1487,7 +1508,7 @@ class PromptHttpTests(unittest.TestCase):
 
     def test_get_prompt(self):
         p = self.card("t1")
-        self.assertEqual((p["kind"], p["always_index"]), ("approval", 1))
+        self.assertEqual((p["kind"], p["always_index"], p["persist_index"]), ("approval", None, 1))
         self.assertIsNone(self.card("t3"))  # blocked가 아니면 null
         self.assertEqual(self.req("GET", "/api/terminals/sh1/prompt")[0], 403)
         self.assertEqual(self.req("GET", "/api/terminals/t1/prompt", token="x")[0], 401)
@@ -1527,8 +1548,10 @@ class PromptHttpTests(unittest.TestCase):
 
     def test_legacy_answer_with_prompt_id(self):
         pid = self.card("t1")["id"]
-        self.assertEqual(self.req("POST", "/api/terminals/t1/answer", {"action": "always", "prompt_id": pid}),
-                         (200, {"ok": True, "keys": ["2"]}))
+        # 프로젝트 영구 허용은 always(세션 동안 허용)로 누르지 않는다
+        code, body = self.req("POST", "/api/terminals/t1/answer", {"action": "always", "prompt_id": pid})
+        self.assertEqual((code, body["error"]), (409, "no_always"))
+        self.assertEqual(self.hc.keys_calls, [])
         self.assertEqual(self.req("POST", "/api/terminals/t1/answer", {"action": "approve", "prompt_id": pid})[1]["keys"], ["1"])
         self.assertEqual(self.req("POST", "/api/terminals/t1/answer", {"action": "reject", "prompt_id": pid})[1]["keys"], ["4"])
         code, body = self.req("POST", "/api/terminals/t1/answer", {"action": "approve", "prompt_id": "0" * 12})
@@ -1554,6 +1577,10 @@ class PromptHttpTests(unittest.TestCase):
         self.assertEqual(hr._tool_summary("Read", {"file_path": home + "x/a"}), home + "x/a")  # 접두사만 같은 다른 폴더
         self.assertEqual(hr._tool_summary("Read", {"file_path": "/etc/hosts"}), "/etc/hosts")
         self.assertEqual(hr._tool_summary("Bash", {"command": "cat " + home + "/a"}), "cat " + home + "/a")
+
+    def test_folders_recent_skips_home(self):
+        self.hc.infos["t2"]["cwd"] = self.home  # 홈에서 시작한 터미널은 빈 경로라 "최근 폴더"에 넣지 않는다
+        self.assertEqual(self.req("GET", "/api/folders")[1]["recent"], ["proj/a"])
 
     def test_folders(self):
         code, body = self.req("GET", "/api/folders")
@@ -1681,6 +1708,8 @@ class CardAnswerTests(unittest.TestCase):
         self.assertEqual(self.hc.keys_calls, [])
         self.assertEqual(hr.push_category("blocked", PERM, p), "HR_BLOCKED")
         ok = self.show(approval_screen(["Yes", "Yes, and always allow", "No"]))
+        self.assertEqual(hr.push_category("blocked", PERM, ok), "HR_PERMISSION")
+        ok = self.show(approval_screen(["Yes", "Yes, allow all edits during this session", "No"]))
         self.assertEqual(hr.push_category("blocked", PERM, ok), "HR_PERMISSION_ALWAYS")
 
     def test_plan_answer_needs_manual_but_explicit_option_ok(self):
