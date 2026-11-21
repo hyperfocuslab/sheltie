@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import re
@@ -85,6 +86,16 @@ def read_json(p):
     return json.loads(read(p))
 
 
+def messages():
+    """install.ps1의 Base64 문구 표를 PowerShell 없이 읽는다."""
+    t = read(INSTALL)
+    body = t[t.index("# messages begin"):t.index("# messages end")]
+    out = {}
+    for k, v in re.findall(r"^\s*(\w+) = '([A-Za-z0-9+/=]+)'", body, re.M):
+        out[k] = base64.b64decode(v, validate=True).decode("utf-8")
+    return out
+
+
 def free_port():
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
@@ -147,6 +158,16 @@ class InstallPs1Test(unittest.TestCase):
 
     def run_install(self, *args, **extra):
         cmd = [PS, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", INSTALL] + list(args)
+        r = subprocess.run(cmd, env=self.env(**extra), capture_output=True, timeout=120)
+        r.stdout = r.stdout.decode("utf-8", "replace")
+        r.stderr = r.stderr.decode("utf-8", "replace")
+        return r
+
+    def run_iex(self, **extra):
+        # irm | iex와 같은 경로: 파일을 UTF-8 문자열로 읽어 iex로 넘긴다(스크립트 경로 없음, 인자 없음).
+        script = ("$env:HERDR_REMOTE_DRY_RUN='1'; [Console]::OutputEncoding=[Text.Encoding]::UTF8; "
+                  "iex ([IO.File]::ReadAllText('%s', [Text.Encoding]::UTF8))" % INSTALL.replace("'", "''"))
+        cmd = [PS, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script]
         r = subprocess.run(cmd, env=self.env(**extra), capture_output=True, timeout=120)
         r.stdout = r.stdout.decode("utf-8", "replace")
         r.stderr = r.stderr.decode("utf-8", "replace")
@@ -215,6 +236,21 @@ class InstallPs1Test(unittest.TestCase):
         self.assertIn("+ schtasks /Create", r.stdout)
         self.assertIn("+ ", r.stdout)
 
+    def test_iex_dry_run_has_no_errors_and_korean_intact(self):
+        r = self.run_iex()
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertEqual(r.stderr.strip(), "", r.stderr)
+        self.assertIn("+ schtasks /Create", r.stdout)
+        self.assertIn("+ 복사 ", r.stdout)
+        self.assertIn("(토큰 인증)", r.stdout)
+        self.assertNotIn("\ufffd", r.stdout)
+        self.assertFalse(any(x.startswith("schtasks") for x in self.calls()), self.calls())
+        self.assertFalse(os.path.exists(os.path.join(self.local, "herdr-remote")))
+
+    def test_iex_error_message_is_korean(self):
+        r = self.run_iex(HERDR_REMOTE_PORT="abc")
+        self.assertIn("HERDR_REMOTE_PORT는 숫자여야 한다: abc", r.stderr)
+
     def test_bad_port_rejected(self):
         for bad in ("abc", "0", "70000", "80;rm", "123456789012345678901"):
             r = self.run_install(HERDR_REMOTE_PORT=bad)
@@ -236,6 +272,15 @@ class InstallPs1Test(unittest.TestCase):
         self.assertEqual(r.returncode, 1, r.stdout)
         self.assertIn("herdr-core", r.stderr)
         self.assertFalse(any(x.startswith("schtasks") for x in self.calls()))
+
+    def test_py_launcher_without_python(self):
+        # py 런처는 있는데 파이썬이 없으면 출력이 비어도 죽지 않고 "python이 없다"로 끝나야 한다(7950 실측: null-valued 오류).
+        with open(os.path.join(self.bin, "py.cmd"), "w", newline="") as f:
+            f.write("@exit /b 1\r\n")
+        r = self.run_install(HERDR_REMOTE_PYTHON="")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("python이 없다", r.stderr)
+        self.assertNotIn("null", r.stderr)
 
     def test_hc_found_in_default_location(self):
         d = os.path.join(self.local, "Programs", "herdr-core")
@@ -368,13 +413,40 @@ class InstallPs1StaticTest(unittest.TestCase):
         t = read(INSTALL)
         m = re.search(r"@'\r?\n(.*?)\r?\n'@", t, re.S)
         self.assertIsNotNone(m)
+        msgs = messages()
+        # 내장 사본의 한글 자리(@XML_COMMENT@, @XML_DESC@)는 표에서 채운다.
+        builtin = m.group(1).replace("@XML_COMMENT@", msgs["xml_comment"]).replace("@XML_DESC@", msgs["xml_desc"])
         norm = lambda s: s.replace("\r\n", "\n").strip("\n")
-        self.assertEqual(norm(m.group(1)), norm(read(TEMPLATE)))
+        self.assertEqual(norm(builtin), norm(read(TEMPLATE)))
 
-    def test_script_has_utf8_bom(self):
-        # BOM이 없으면 Windows PowerShell 5.1이 한글을 깨뜨린다.
+    def test_script_is_pure_ascii_without_bom(self):
+        # BOM이 있으면 irm | iex가 첫 줄을 명령으로 읽어 오류가 나고,
+        # BOM 없이 비ASCII가 있으면 PS 5.1 -File이 cp949로 읽어 깨진다.
         with open(INSTALL, "rb") as f:
-            self.assertEqual(f.read(3), b"\xef\xbb\xbf")
+            raw = f.read()
+        self.assertFalse(raw.startswith(b"\xef\xbb\xbf"))
+        self.assertTrue(all(b < 0x80 for b in raw), "ASCII 밖 바이트가 있다")
+
+    def test_messages_decode_as_utf8(self):
+        msgs = messages()
+        self.assertGreater(len(msgs), 40)
+        for k, v in msgs.items():
+            self.assertTrue(v.strip(), k)
+        used = set(re.findall(r"\(?T '(\w+)'", read(INSTALL)))
+        self.assertFalse(used - set(msgs), used - set(msgs))
+
+    def test_representative_messages(self):
+        msgs = messages()
+        self.assertEqual(msgs["unknown_opt"], "알 수 없는 옵션: {0} (-DryRun, -Uninstall)")
+        self.assertEqual(msgs["uninstalled"], "해제 완료. 설정과 토큰은 남겼다: {0} (지우려면 직접 삭제)")
+        self.assertEqual(msgs["src_empty"], "받은 서버 파일이 비어 있다: {0}")
+        self.assertEqual(msgs["no_health"], '서버가 응답하지 않는다. 로그를 확인해라: Get-Content -Tail 30 "{0}"')
+        self.assertEqual(msgs["help1"], "herdr-remote 설치기(Windows). 사용: powershell -File install.ps1 [-DryRun] [-Uninstall] [-Help]")
+        self.assertTrue(msgs["no_hc"].startswith("hc(herdr-core)가 없다."))
+        self.assertIn("%LOCALAPPDATA%\\Programs\\herdr-core\\hc.exe", msgs["no_hc"])
+
+    def test_dry_run_env_supported(self):
+        self.assertIn("HERDR_REMOTE_DRY_RUN", read(INSTALL))
 
     def test_no_ps7_only_syntax(self):
         t = read(INSTALL)
