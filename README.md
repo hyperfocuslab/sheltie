@@ -2,10 +2,13 @@
 
 Server for the **Sheltie** iOS app. It runs on a Mac or a Windows PC. Sheltie watches Claude Code agents running under [herdr-core](https://herdr.dev) (`hc`) and lets you answer them from your iPhone: permission prompts, questions and plan approvals show up as notifications with Allow / Always allow / Deny buttons, so you can reply from the lock screen without opening the app.
 
+**Get the iPhone app:** [Sheltie on the App Store](https://apps.apple.com/app/id6837271201)
+
 Not affiliated with herdr or Anthropic.
 
 ## Requirements
 
+- The [Sheltie app](https://apps.apple.com/app/id6837271201) on your iPhone (iOS 18+)
 - macOS with `python3` (3.9+), or Windows 10/11 (x64) with Python 3.9+ from [python.org](https://www.python.org/downloads/)
 - herdr-core (`hc`) running your Claude Code agents
 - [Tailscale](https://tailscale.com) on the computer and the iPhone. The server listens on `127.0.0.1` and is exposed only inside your tailnet with `tailscale serve`. It never uses Funnel.
