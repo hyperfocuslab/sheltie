@@ -330,6 +330,7 @@ class InstallTest(unittest.TestCase):
 
 HOOK_EVENTS_CLAUDE = {"PermissionRequest", "PreToolUse", "SessionStart", "SessionEnd", "UserPromptSubmit", "Stop"}
 HOOK_EVENTS_CODEX = {"PermissionRequest", "SessionStart", "SessionEnd", "UserPromptSubmit", "Stop"}
+HOOK_EVENTS_QWEN = HOOK_EVENTS_CODEX
 
 
 @unittest.skipIf(os.name == "nt", "맥 전용")
@@ -499,6 +500,145 @@ class InstallHooksTest(InstallTest):
         r = self.run_install("--uninstall")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(read(self.settings()), "[oops")
+
+    # --- Qwen Code(~/.qwen/settings.json)·OpenCode(~/.config/opencode/plugins/sheltie.js)
+    def qwen_settings(self):
+        return os.path.join(self.home, ".qwen", "settings.json")
+
+    def oc_dir(self):
+        return os.path.join(self.home, ".config", "opencode")
+
+    def oc_plugin(self):
+        return os.path.join(self.oc_dir(), "plugins", "sheltie.js")
+
+    def test_qwen_and_opencode_fresh_install(self):
+        os.makedirs(os.path.join(self.home, ".qwen"))
+        os.makedirs(self.oc_dir())
+        r = self.run_install()
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        q = read_json(self.qwen_settings())
+        self.assertEqual(set(q["hooks"]), HOOK_EVENTS_QWEN)
+        self.assertEqual(q["hooks"]["PermissionRequest"],
+                         [{"matcher": "*", "hooks": [{"type": "command", "command": self.cmd("qwen"), "timeout": 600}]}])
+        self.assertEqual(q["hooks"]["Stop"], [{"hooks": [{"type": "command", "command": self.cmd("qwen"), "timeout": 10}]}])
+        self.assertFalse(os.path.exists(self.qwen_settings() + ".sheltie-bak"))
+        js = read(self.oc_plugin())
+        self.assertTrue(js.startswith("// sheltie-opencode-plugin\n"))
+        self.assertIn("const PY = %s\n" % json.dumps(self.py()), js)
+        self.assertIn("const SERVER = %s\n" % json.dumps(self.server), js)
+        self.assertIn("qwen 훅 등록", r.stdout)
+        self.assertIn("opencode 훅 등록", r.stdout)
+        self.assertIn("OpenCode를 새로 시작", r.stdout)
+        self.assertEqual(os.listdir(os.path.dirname(self.oc_plugin())), ["sheltie.js"])  # 임시·백업 파일 없음
+
+    def test_qwen_opencode_dirs_missing_are_skipped(self):
+        r = self.run_install()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".qwen")))
+        self.assertFalse(os.path.exists(self.oc_dir()))
+        self.assertIn("opencode: %s 없음" % self.oc_dir(), r.stdout)
+
+    def test_opencode_uses_xdg_config_home(self):
+        xdg = os.path.join(self.tmp, "xdg")
+        os.makedirs(os.path.join(xdg, "opencode"))
+        r = self.run_install(XDG_CONFIG_HOME=xdg)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(read(os.path.join(xdg, "opencode", "plugins", "sheltie.js")).startswith("// sheltie-opencode-plugin"))
+        self.assertFalse(os.path.exists(self.oc_dir()))
+
+    def test_qwen_merge_keeps_other_hooks_backup_once_no_duplicates(self):
+        orig = {"model": {"name": "qwen3"}, "hooks": {
+            "Stop": [{"hooks": [{"type": "command", "command": "echo mine"}]}],
+            "PreToolUse": [{"matcher": "run_shell_command", "hooks": [{"type": "command", "command": "lint.sh"}]}]}}
+        self.write_json(self.qwen_settings(), orig)
+        before = read(self.qwen_settings())
+        for _ in range(2):
+            r = self.run_install()
+            self.assertEqual(r.returncode, 0, r.stderr)
+        q = read_json(self.qwen_settings())
+        self.assertEqual(q["model"], {"name": "qwen3"})
+        self.assertEqual(q["hooks"]["PreToolUse"], orig["hooks"]["PreToolUse"])
+        self.assertEqual(q["hooks"]["Stop"][0], orig["hooks"]["Stop"][0])
+        for ev, groups in q["hooks"].items():
+            self.assertEqual(len(self.ours(groups)), 0 if ev == "PreToolUse" else 1, ev)
+        self.assertEqual(read(self.qwen_settings() + ".sheltie-bak"), before)
+        self.assertIn("qwen 훅이 이미 등록돼 있다", r.stdout)
+
+    def test_opencode_reinstall_and_update(self):
+        os.makedirs(self.oc_dir())
+        self.run_install()
+        first = read(self.oc_plugin())
+        r = self.run_install()
+        self.assertIn("opencode 훅이 이미 등록돼 있다", r.stdout)
+        self.assertEqual(read(self.oc_plugin()), first)
+        # 예전 내용(우리 표시 있음)은 새 내용으로 바꾼다
+        with open(self.oc_plugin(), "w") as f:
+            f.write("// sheltie-opencode-plugin\n// old\n")
+        r = self.run_install()
+        self.assertIn("opencode 훅 갱신", r.stdout)
+        self.assertEqual(read(self.oc_plugin()), first)
+
+    def test_opencode_foreign_file_untouched(self):
+        os.makedirs(os.path.dirname(self.oc_plugin()))
+        with open(self.oc_plugin(), "w") as f:
+            f.write("export const Mine = async () => ({})\n")
+        r = self.run_install()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(read(self.oc_plugin()), "export const Mine = async () => ({})\n")
+        self.assertIn(self.oc_plugin(), r.stderr)
+        r = self.run_install("--uninstall")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(read(self.oc_plugin()), "export const Mine = async () => ({})\n")
+
+    def test_qwen_broken_json_untouched(self):
+        os.makedirs(os.path.join(self.home, ".qwen"))
+        with open(self.qwen_settings(), "w") as f:
+            f.write("{ // comment\n}")
+        r = self.run_install()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(read(self.qwen_settings()), "{ // comment\n}")
+        self.assertFalse(os.path.exists(self.qwen_settings() + ".sheltie-bak"))
+        self.assertIn("올바른 JSON이 아니라", r.stderr)
+
+    def test_qwen_opencode_no_hooks_and_dry_run(self):
+        os.makedirs(os.path.join(self.home, ".qwen"))
+        os.makedirs(self.oc_dir())
+        r = self.run_install("--no-hooks")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(os.path.exists(self.qwen_settings()))
+        self.assertFalse(os.path.exists(os.path.join(self.oc_dir(), "plugins")))
+        self.write_json(self.qwen_settings(), {"a": 1})
+        before = read(self.qwen_settings())
+        r = self.run_install("--dry-run")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("(dry-run) qwen 훅 등록", r.stdout)
+        self.assertIn("(dry-run) opencode 훅 등록", r.stdout)
+        self.assertEqual(read(self.qwen_settings()), before)
+        self.assertFalse(os.path.exists(self.qwen_settings() + ".sheltie-bak"))
+        self.assertFalse(os.path.exists(os.path.join(self.oc_dir(), "plugins")))
+
+    def test_qwen_opencode_uninstall_removes_only_ours(self):
+        self.write_json(self.qwen_settings(), {"model": "x", "hooks": {
+            "Stop": [{"hooks": [{"type": "command", "command": "mine.sh"}]}]}})
+        os.makedirs(os.path.join(self.oc_dir(), "plugins"))
+        other = os.path.join(self.oc_dir(), "plugins", "other.js")
+        with open(other, "w") as f:
+            f.write("// other\n")
+        self.run_install()
+        self.assertTrue(os.path.exists(self.oc_plugin()))
+        r = self.run_install("--uninstall", "--dry-run")
+        self.assertIn("(dry-run) opencode 훅 해제", r.stdout)
+        self.assertTrue(os.path.exists(self.oc_plugin()))
+        r = self.run_install("--uninstall")
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertEqual(read_json(self.qwen_settings()),
+                         {"model": "x", "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "mine.sh"}]}]}})
+        self.assertTrue(os.path.exists(self.qwen_settings() + ".sheltie-bak"))
+        self.assertFalse(os.path.exists(self.oc_plugin()))
+        self.assertEqual(read(other), "// other\n")
+        self.assertIn("opencode 훅 해제", r.stdout)
+        r = self.run_install("--uninstall")
+        self.assertIn("opencode: 우리 훅이 없다", r.stdout)
 
     def test_hooks_merge_script_identical_in_ps1(self):
         def block(path):
@@ -713,6 +853,18 @@ class InstallMigrateTest(InstallTest):
         self.assertFalse(os.path.exists(os.path.join(self.old_data, OLD_LABEL + ".plist")))
         self.assertIn(os.path.join(self.home, ".claude/settings.json"), r.stderr)
         self.assertIn(self.old_data, r.stderr)
+
+    def test_qwen_hooks_file_with_old_server_keeps_old_folder(self):
+        self.make_old_install(hooks=False)
+        q = os.path.join(self.home, ".qwen", "settings.json")
+        os.makedirs(os.path.dirname(q))
+        with open(q, "w") as f:
+            json.dump({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": '"/x/python3" "%s" hook qwen'
+                                                      % self.old_server}]}]}}, f)
+        r = self.run_install("--no-hooks")
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertTrue(os.path.exists(self.old_server))
+        self.assertIn(q, r.stderr)
 
     def test_broken_hooks_file_keeps_old_server_file(self):
         self.make_old_install(hooks=False)

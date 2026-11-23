@@ -1,0 +1,19 @@
+{
+ "hook_event_name": "PermissionRequest",
+ "session_id": "ses_df72331a4fferjkvc85gV6PDCf",
+ "cwd": "/Users/me/work/demo",
+ "opencode_db": "/Users/me/.local/share/opencode/opencode.db",
+ "tool_name": "bash",
+ "tool_input": {
+  "patterns": [
+   "touch hooko1.txt"
+  ],
+  "metadata": {
+   "command": "touch hooko1.txt"
+  }
+ },
+ "always": [
+  "touch *"
+ ],
+ "request_id": "per_208dcd02c00146rPho1PtLLeDu"
+}

@@ -5,6 +5,7 @@ import io
 import json
 import logging
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -600,6 +601,431 @@ class HookCommandTests(HookBase):
         proc.stderr.close()
         self.assertEqual(json.loads(out)["hookSpecificOutput"]["decision"]["behavior"], "deny")
         self.assertFalse(os.path.exists(log_path))
+
+
+# ---------------------------------------------------------------- Qwen Code·OpenCode·다른 에이전트
+
+
+def qwen_chat_path(home, sid):
+    return os.path.join(home, ".qwen", "projects", "-Users-me-work-demo", "chats", sid + ".jsonl")
+
+
+class QwenHookTests(HookBase):
+    """Qwen Code 0.28.3 공식 훅(Claude와 같은 스키마, 실측 fixture qwen-*-0.28.3)."""
+
+    def setUp(self):
+        super().setUp()
+        env = mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("QWEN_HOME", None)
+
+    def test_shell_allow_card_status_push(self):
+        body = load("qwen-permission-shell-0.28.3.json")
+        tid = self.tid_of(body)
+        box = self.hook_bg("qwen", body)
+        p = self.blocked(tid)
+        self.assertEqual((p["kind"], p["title"], p["always_index"]), ("approval", "Shell", None))
+        self.assertIn("touch hook1.txt", p["body"])
+        self.assertEqual([o["label"] for o in p["options"]], ["Yes, allow once", "No"])
+        self.assertEqual(self.status(tid), {"state": "blocked", "kind": "permission",
+                                            "msg": "approve run_shell_command", "app": "qwen-code"})
+        push = self.pusher.payloads[-1]
+        self.assertEqual((push["aps"]["category"], push["terminal"], push["prompt_id"]), ("HR_PERMISSION", tid, p["id"]))
+        self.assertEqual(self.answer(tid, {"action": "approve", "prompt_id": p["id"]})[0], 200)
+        self.assertEqual(self.result(box), (200, {"hookSpecificOutput": {
+            "hookEventName": "PermissionRequest", "decision": {"behavior": "allow"}}}))
+        wait_for(lambda: self.status(tid)["state"] == "working")
+
+    def test_write_and_edit_cards_and_deny(self):
+        body = load("qwen-permission-write-0.28.3.json")
+        tid = self.tid_of(body)
+        box = self.hook_bg("qwen", body)
+        p = self.blocked(tid)
+        self.assertEqual(p["title"], "WriteFile")
+        self.assertIn("/Users/me/work/demo/hook3.txt", p["body"])
+        self.assertIn("hi", p["body"].split("\n\n")[1])
+        self.assertEqual(self.prompt_answer(tid, {"prompt_id": p["id"], "option_index": 1})[0], 200)  # No
+        self.assertEqual(self.result(box)[1], {"hookSpecificOutput": {
+            "hookEventName": "PermissionRequest",
+            "decision": {"behavior": "deny", "message": "Rejected from phone (Sheltie)"}}})
+        box = self.hook_bg("qwen", load("qwen-permission-edit-doc.json"))
+        wait_for(lambda: self.app.hooks.active(tid) and self.app.hooks.active(tid).state == "waiting")
+        p = self.app.hooks.current_prompt(tid)
+        self.assertEqual(p["title"], "Edit")
+        self.assertIn("- hi\n+ hello", p["body"])
+        self.assertEqual(self.answer(tid, {"action": "reject"})[0], 200)
+        self.assertEqual(self.result(box)[1]["hookSpecificOutput"]["decision"]["behavior"], "deny")
+
+    def test_no_always(self):
+        body = load("qwen-permission-shell-0.28.3.json")
+        tid = self.tid_of(body)
+        box = self.hook_bg("qwen", body)
+        p = self.blocked(tid)
+        self.assertEqual(self.answer(tid, {"action": "always", "prompt_id": p["id"]})[1]["error"], "no_always")
+        self.answer(tid, {"action": "approve", "prompt_id": p["id"]})
+        self.assertNotIn("updatedPermissions", self.result(box)[1]["hookSpecificOutput"]["decision"])
+
+    def test_interactive_tools_not_held(self):
+        # allow를 줘도 Qwen이 대화상자를 띄우는 도구(ask_user_question 등)는 붙잡지 않는다
+        for tool in ("ask_user_question", "exit_plan_mode", "propose_goal"):
+            with self.subTest(tool=tool):
+                body = load("qwen-permission-shell-0.28.3.json", tool_name=tool, tool_input={"x": 1})
+                self.assertEqual(self.hook("qwen", body), (200, {}))
+                self.assertIsNone(self.app.hooks.current_prompt(self.tid_of(body)))
+                self.assertNotEqual(self.status(self.tid_of(body))["state"], "blocked")
+
+    def test_timeout_and_disconnect(self):
+        now = [100.0]
+        self.app.hook_clock = lambda: now[0]
+        body = load("qwen-permission-shell-0.28.3.json")
+        tid = self.tid_of(body)
+        box = self.hook_bg("qwen", body)
+        p = self.blocked(tid)
+        now[0] += 541
+        self.assertEqual(self.result(box), (200, {}))
+        self.assertEqual(self.answer(tid, {"action": "approve", "prompt_id": p["id"]})[1]["error"], "needs_pc")
+        self.hook("qwen", load("qwen-stop-0.28.3.json"))
+        self.assertEqual(self.status(tid)["state"], "done")
+        # 연결 끊김 = PC에서 답함
+        data = json.dumps(body).encode()
+        s = socket.create_connection(("127.0.0.1", self.port))
+        s.sendall(b"POST /hook/qwen HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer %s\r\n"
+                  b"Content-Type: application/json\r\nContent-Length: %d\r\n\r\n" % (TOKEN.encode(), len(data)) + data)
+        p = wait_for(lambda: self.app.hooks.active(tid) and self.app.hooks.active(tid).state == "waiting"
+                     and self.app.hooks.current_prompt(tid))
+        s.close()
+        wait_for(lambda: self.status(tid)["state"] == "working", timeout=3)
+        self.assertEqual(self.answer(tid, {"action": "approve", "prompt_id": p["id"]})[1]["error"], "prompt_changed")
+
+    def test_stale_prompt_id_409(self):
+        body = load("qwen-permission-shell-0.28.3.json")
+        tid = self.tid_of(body)
+        box = self.hook_bg("qwen", body)
+        p = self.blocked(tid)
+        code, err = self.answer(tid, {"action": "approve", "prompt_id": "0123456789ab"})
+        self.assertEqual((code, err["error"]), (409, "prompt_changed"))
+        self.answer(tid, {"action": "reject", "prompt_id": p["id"]})
+        self.result(box)
+
+    def test_lifecycle_transcript_and_terminals(self):
+        start = load("qwen-session-start-0.28.3.json")
+        sid = start["session_id"]
+        tid = self.tid_of(start)
+        tpath = qwen_chat_path(self.home, sid)
+        os.makedirs(os.path.dirname(tpath))
+        with open(tpath, "w", encoding="utf-8") as f:
+            f.write(base.fixture("qwen-session-0.28.3.jsonl"))
+        self.assertEqual(self.hook("qwen", dict(start, transcript_path=tpath)), (200, None))
+        h = {t["id"]: t for t in self.req("GET", "/api/terminals")[1]["terminals"]}[tid]
+        self.assertEqual((h["caps"], h["agent"], h["agent_kind"], h["claude"], h["name"], h["status"]),
+                         ([], "qwen", "qwen", True, "demo", {"state": "idle", "app": "qwen-code"}))
+        self.assertTrue(h["preview"])
+        tr = self.req("GET", "/api/terminals/%s/transcript" % tid)[1]
+        self.assertEqual(tr["session_id"], sid)
+        self.assertTrue(tr["turns"])
+        self.hook("qwen", load("qwen-user-prompt-submit-0.28.3.json"))
+        self.assertEqual(self.status(tid)["state"], "working")
+        n = len(self.pusher.payloads)
+        stop = load("qwen-stop-0.28.3.json")
+        self.hook("qwen", stop)
+        self.hook("qwen", stop)  # 같은 prompt_id의 Stop: 다시 알리지 않는다
+        self.hook("qwen", dict(stop, prompt_id=sid + "########2"))  # 다음 턴: 다시 알린다
+        self.assertEqual([p["aps"]["category"] for p in self.pusher.payloads[n:]], ["HR_DONE", "HR_DONE"])
+        self.assertEqual(self.hook("claude", stop)[1]["error"], "agent_mismatch")
+        n = len(self.pusher.payloads)
+        self.hook("qwen", load("qwen-session-end-0.28.3.json"))
+        self.assertFalse(self.app.hooks.has(tid))
+        self.assertEqual(len(self.pusher.payloads), n)
+
+    def test_transcript_outside_qwen_projects_ignored(self):
+        start = load("qwen-session-start-0.28.3.json")
+        tid = self.tid_of(start)
+        for path in (os.path.join(self.tmp, "x.jsonl"), os.path.join(self.home, ".qwen", "x.jsonl")):
+            with self.subTest(path=path):
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(base.fixture("qwen-session-0.28.3.jsonl"))
+                self.hook("qwen", dict(start, transcript_path=path))
+                self.assertEqual(self.req("GET", "/api/terminals/%s/transcript" % tid)[1]["turns"], [])
+
+
+class OpencodeHookTests(HookBase):
+    """OpenCode 1.19.6 플러그인(sheltie.js)이 보내는 본문(fixture opencode-permission-bash-plugin)."""
+
+    def setUp(self):
+        super().setUp()
+        import test_opencode
+        env = mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("XDG_DATA_HOME", None)
+        d = os.path.join(self.home, ".local", "share", "opencode")
+        os.makedirs(d)
+        self.db = os.path.join(d, "opencode.db")
+        self.sid = test_opencode.build_db(self.db, ["opencode-session-1.19.6.jsonl"])[0]
+
+    def body(self, **over):
+        return load("opencode-permission-bash-plugin.json", **dict({"session_id": self.sid, "opencode_db": self.db}, **over))
+
+    def test_always_card_and_answers(self):
+        body = self.body()
+        tid = self.tid_of(body)
+        box = self.hook_bg("opencode", body)
+        p = self.blocked(tid)
+        self.assertEqual((p["kind"], p["title"], p["always_index"], p["reject_index"]),
+                         ("approval", "Shell command", 1, 2))
+        self.assertEqual([o["label"] for o in p["options"]], ["Allow once", "Allow always: touch *", "Reject"])
+        self.assertIn("touch hooko1.txt", p["body"])
+        self.assertEqual(self.status(tid), {"state": "blocked", "kind": "permission", "msg": "approve bash",
+                                            "app": "opencode"})
+        self.assertEqual(self.pusher.payloads[-1]["aps"]["category"], "HR_PERMISSION_ALWAYS")
+        self.assertEqual(self.answer(tid, {"action": "always", "prompt_id": p["id"]})[0], 200)
+        self.assertEqual(self.result(box)[1], {"hookSpecificOutput": {
+            "hookEventName": "PermissionRequest",
+            "decision": {"behavior": "allow", "updatedPermissions": ["touch *"]}}})
+        # once(카드 0번)·reject
+        box = self.hook_bg("opencode", body)
+        wait_for(lambda: self.app.hooks.active(tid) and self.app.hooks.active(tid).state == "waiting")
+        p = self.app.hooks.current_prompt(tid)
+        self.assertEqual(self.prompt_answer(tid, {"prompt_id": p["id"], "option_index": 0})[0], 200)
+        self.assertEqual(self.result(box)[1]["hookSpecificOutput"]["decision"], {"behavior": "allow"})
+        box = self.hook_bg("opencode", body)
+        wait_for(lambda: self.app.hooks.active(tid) and self.app.hooks.active(tid).state == "waiting")
+        p = self.app.hooks.current_prompt(tid)
+        self.assertEqual(self.prompt_answer(tid, {"prompt_id": p["id"], "option_index": 2})[0], 200)
+        self.assertEqual(self.result(box)[1]["hookSpecificOutput"]["decision"]["behavior"], "deny")
+
+    def test_no_always_patterns_is_409(self):
+        body = self.body(always=[])
+        tid = self.tid_of(body)
+        box = self.hook_bg("opencode", body)
+        p = self.blocked(tid)
+        self.assertIsNone(p["always_index"])
+        self.assertEqual([o["label"] for o in p["options"]], ["Allow once", "Reject"])
+        self.assertEqual(self.answer(tid, {"action": "always", "prompt_id": p["id"]})[1]["error"], "no_always")
+        self.answer(tid, {"action": "approve", "prompt_id": p["id"]})
+        self.assertEqual(self.result(box)[1]["hookSpecificOutput"]["decision"], {"behavior": "allow"})
+
+    def test_edit_card_body(self):
+        body = self.body(tool_name="edit", always=["*"], tool_input={
+            "patterns": ["hello.py"], "metadata": {"filepath": "/Users/me/work/demo/hello.py",
+                                                   "diff": "-print(1)\n+print(2)"}})
+        tid = self.tid_of(body)
+        box = self.hook_bg("opencode", body)
+        p = self.blocked(tid)
+        self.assertEqual(p["title"], "Edit file")
+        self.assertIn("/Users/me/work/demo/hello.py", p["body"])
+        self.assertIn("+print(2)", p["body"])
+        self.answer(tid, {"action": "reject"})
+        self.result(box)
+
+    def test_terminals_transcript_preview_and_screen_poll(self):
+        start = self.body(hook_event_name="SessionStart")
+        for k in ("tool_name", "tool_input", "always", "request_id"):
+            start.pop(k)
+        tid = self.tid_of(start)
+        self.assertEqual(self.hook("opencode", start), (200, None))
+        code, body = self.req("GET", "/api/terminals")
+        self.assertEqual(code, 200, body)
+        h = {t["id"]: t for t in body["terminals"]}[tid]
+        self.assertEqual((h["caps"], h["agent_kind"], h["claude"], h["status"]),
+                         ([], "opencode", True, {"state": "idle", "app": "opencode"}))
+        self.assertTrue(h["preview"])
+        tr = self.req("GET", "/api/terminals/%s/transcript" % tid)[1]
+        self.assertEqual(tr["session_id"], self.sid)
+        self.assertEqual(tr["turns"][0], {"role": "user", "parts": [{"kind": "text", "text": "hello"}]})
+        # 화면이 없는 훅 세션은 화면 판정 주기에서 빠진다(hc read를 부르지 않는다)
+        self.app.screen_poll()
+        self.assertEqual(self.req("GET", "/api/terminals/%s/prompt" % tid), (200, {"prompt": None}))
+        # 턴: busy → UserPromptSubmit, idle → Stop(플러그인이 센 turn_id)
+        self.hook("opencode", dict(start, hook_event_name="UserPromptSubmit"))
+        self.assertEqual(self.status(tid)["state"], "working")
+        n = len(self.pusher.payloads)
+        self.hook("opencode", dict(start, hook_event_name="Stop", turn_id=self.sid + "#1"))
+        self.assertEqual(self.status(tid)["state"], "done")
+        self.assertEqual([p["aps"]["category"] for p in self.pusher.payloads[n:]], ["HR_DONE"])
+        self.hook("opencode", dict(start, hook_event_name="SessionEnd", reason="exit"))
+        self.assertFalse(self.app.hooks.has(tid))
+
+    def test_db_path_must_be_opencode_db_under_home(self):
+        other = os.path.join(self.home, "other.db")
+        shutil.copy(self.db, other)
+        outside = os.path.join(self.tmp, "opencode.db")
+        shutil.copy(self.db, outside)
+        link_dir = os.path.join(self.home, "lnk")
+        os.makedirs(link_dir)
+        os.symlink(outside, os.path.join(link_dir, "opencode.db"))
+        for path in (other, outside, os.path.join(link_dir, "opencode.db"), os.path.join(self.home, "opencode.db"),
+                     None, 5):
+            with self.subTest(path=path):
+                self.app.hooks.sessions.clear()
+                start = self.body(hook_event_name="SessionStart", opencode_db=path)
+                tid = self.tid_of(start)
+                self.hook("opencode", start)
+                self.assertEqual(self.req("GET", "/api/terminals/%s/transcript" % tid)[1]["turns"], [])
+
+    def test_agent_mismatch(self):
+        body = self.body(hook_event_name="SessionStart")
+        self.hook("opencode", body)
+        self.assertEqual(self.hook("qwen", body)[1]["error"], "agent_mismatch")
+
+
+class ForeignHookTests(HookBase):
+    def test_cursor_borrowing_claude_hooks_makes_no_session(self):
+        # Cursor 2026.11.19는 ~/.claude/settings.json의 훅을 Claude 훅으로 같이 부른다(cursor_version·conversation_id)
+        for ev in ("UserPromptSubmit", "Stop", "SessionStart", "PermissionRequest"):
+            with self.subTest(ev=ev):
+                self.assertEqual(self.hook("claude", load("cursor-claude-compat-doc.json", hook_event_name=ev)),
+                                 (200, None))
+        self.assertEqual(self.app.hooks.sessions, {})
+
+    def test_unknown_event_makes_no_session(self):
+        body = load("claude-session-start-2.1.329.json")
+        for ev in ("beforeShellExecution", "Notification", "PostToolUse", "SubagentStop"):
+            with self.subTest(ev=ev):
+                self.assertEqual(self.hook("claude", dict(body, hook_event_name=ev)), (200, None))
+        self.assertEqual(self.app.hooks.sessions, {})
+        self.assertEqual(self.pusher.payloads, [])
+
+
+class HookCommandMoreTests(HookCommandTests):
+    """`sheltie.py hook qwen|opencode` 왕복(부모 테스트는 상속만 하므로 다시 돌지 않게 비운다)."""
+
+    def test_qwen_and_opencode_round_trip(self):
+        for agent, body in (("qwen", load("qwen-permission-shell-0.28.3.json")),
+                            ("opencode", load("opencode-permission-bash-plugin.json"))):
+            with self.subTest(agent=agent):
+                tid = self.tid_of(body)
+                box = {}
+                th = threading.Thread(target=lambda: box.update(r=self.run_cmd(agent, body)), daemon=True)
+                th.start()
+                p = self.blocked(tid)
+                self.answer(tid, {"action": "approve", "prompt_id": p["id"]})
+                th.join(5)
+                rc, out = box["r"]
+                self.assertEqual(rc, 0)
+                self.assertEqual(json.loads(out)["hookSpecificOutput"]["decision"], {"behavior": "allow"})
+        rc, out = self.run_cmd("qwen", load("qwen-permission-shell-0.28.3.json"), env={"HC_TERMINAL_ID": "t3"})
+        self.assertEqual((rc, out), (0, b""))
+
+
+for _n in [n for n in dir(HookCommandTests) if n.startswith("test_")]:
+    setattr(HookCommandMoreTests, _n, None)
+
+
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# 가짜 sheltie.py: stdin 본문을 LOG에 한 줄 쓰고, request_id로 답을 고른다(per_hold는 오래 붙잡는다).
+FAKE_HOOK_SERVER = r"""import json, os, sys, time
+body = json.loads(sys.stdin.read())
+with open(os.environ["FAKE_LOG"], "a") as f:
+    f.write(json.dumps({"argv": sys.argv[1:], "body": body}) + "\n")
+rid = body.get("request_id")
+if rid == "per_hold":
+    time.sleep(30)
+d = {"per_once": {"behavior": "allow"}, "per_always": {"behavior": "allow", "updatedPermissions": ["touch *"]},
+     "per_deny": {"behavior": "deny", "message": "no"}}.get(rid)
+if d:
+    sys.stdout.write(json.dumps({"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": d}}))
+"""
+
+PLUGIN_HARNESS = r"""
+const mod = await import(process.argv[2])
+const calls = []
+const client = { postSessionIdPermissionsPermissionId: async (a) => { calls.push(a); return { data: true } } }
+const hooks = await mod.SheltiePlugin({ directory: "/Users/me/work/demo", client: client, serverUrl: new URL("http://localhost:4096") })
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+const ev = (type, properties) => hooks.event({ event: { id: "evt_1", type: type, properties: properties } })
+const sid = "ses_df72331a4fferjkvc85gV6PDCf"
+const asked = (id) => ({ id: id, sessionID: sid, permission: "bash", patterns: ["touch x"], metadata: { command: "touch x" },
+  always: ["touch *"], tool: { messageID: "msg_1", callID: "call_1" } })
+await ev("session.created", { sessionID: sid, info: { id: sid, directory: "/Users/me/work/demo" } })
+await ev("session.created", { sessionID: "ses_child00000001", info: { id: "ses_child00000001", parentID: sid } })
+await ev("session.status", { sessionID: sid, status: { type: "busy" } })
+await ev("session.status", { sessionID: sid, status: { type: "busy" } })
+await ev("session.status", { sessionID: "ses_child00000001", status: { type: "busy" } })
+for (const id of ["per_once", "per_always", "per_deny"]) await ev("permission.asked", asked(id))
+await ev("permission.asked", Object.assign(asked("per_child"), { sessionID: "ses_child00000001" }))
+await ev("permission.asked", asked("per_hold"))
+const t0 = Date.now()
+while (calls.length < 3 && Date.now() - t0 < 10000) await sleep(50)
+await sleep(300)
+await ev("permission.replied", { sessionID: sid, requestID: "per_hold", reply: "once" })
+await sleep(500)
+await ev("session.status", { sessionID: sid, status: { type: "idle" } })
+await ev("session.idle", { sessionID: sid })
+await ev("session.idle", { sessionID: sid })
+await sleep(1500)
+console.log(JSON.stringify({ calls: calls, ms: Date.now() - t0 }))
+process.exit(0)
+"""
+
+
+@unittest.skipUnless(shutil.which("node"), "node가 없다")
+class OpencodePluginTests(unittest.TestCase):
+    """설치기가 쓰는 OpenCode 플러그인(sheltie.js)을 node로 돌린다. 가짜 client·가짜 sheltie.py."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.log = os.path.join(self.tmp, "log.jsonl")
+        self.server = os.path.join(self.tmp, "fake sheltie.py")
+        with open(self.server, "w") as f:
+            f.write(FAKE_HOOK_SERVER)
+        with open(os.path.join(ROOT, "install.sh"), encoding="utf-8") as f:
+            t = f.read()
+        merge = t[t.index("# ---- hooks_merge.py begin"):t.index("# ---- hooks_merge.py end")]
+        self.plugin = os.path.join(self.tmp, "plugins", "sheltie.js")
+        r = subprocess.run([sys.executable, "-c", merge, "install", "opencode", self.plugin, sys.executable,
+                            self.server, "posix"], capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.stdout.strip(), "added", r.stderr)
+
+    def run_harness(self):
+        mjs = os.path.join(self.tmp, "plugin.mjs")
+        shutil.copy(self.plugin, mjs)
+        h = os.path.join(self.tmp, "harness.mjs")
+        with open(h, "w") as f:
+            f.write(PLUGIN_HARNESS)
+        env = dict(os.environ, FAKE_LOG=self.log, HOME=self.tmp, USERPROFILE=self.tmp)  # node os.homedir(): 윈도우는 USERPROFILE
+        env.pop("XDG_DATA_HOME", None)
+        r = subprocess.run(["node", h, "file://" + mjs], capture_output=True, text=True, timeout=60, env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout.strip().splitlines()[-1])
+
+    def test_marker_first_line(self):
+        with open(self.plugin, encoding="utf-8") as f:
+            self.assertEqual(f.readline().rstrip("\n"), "// sheltie-opencode-plugin")
+
+    def test_asked_replied_turns(self):
+        out = self.run_harness()
+        got = {c["path"]["permissionID"]: (c["path"]["id"], c["body"]["response"]) for c in out["calls"]}
+        sid = "ses_df72331a4fferjkvc85gV6PDCf"
+        self.assertEqual(got, {"per_once": (sid, "once"), "per_always": (sid, "always"), "per_deny": (sid, "reject")})
+        with open(self.log) as f:
+            recs = [json.loads(line) for line in f]
+        self.assertTrue(all(r["argv"] == ["hook", "opencode"] for r in recs))
+        bodies = [r["body"] for r in recs]
+        evs = [b["hook_event_name"] for b in bodies]
+        self.assertEqual(evs.count("SessionStart"), 1)       # 하위 세션(parentID)은 세션을 만들지 않는다
+        self.assertEqual(evs.count("UserPromptSubmit"), 1)   # busy가 두 번 와도 한 번
+        self.assertEqual(evs.count("Stop"), 1)               # idle이 두 번 와도 한 번
+        self.assertEqual(evs.count("PermissionRequest"), 5)
+        perm = next(b for b in bodies if b.get("request_id") == "per_always")
+        self.assertEqual(perm, {"hook_event_name": "PermissionRequest", "session_id": sid,
+                                "cwd": "/Users/me/work/demo",
+                                "opencode_db": os.path.join(self.tmp, ".local", "share", "opencode", "opencode.db"),
+                                "tool_name": "bash", "tool_input": {"patterns": ["touch x"],
+                                                                    "metadata": {"command": "touch x"}},
+                                "always": ["touch *"], "request_id": "per_always"})
+        child = next(b for b in bodies if b.get("request_id") == "per_child")
+        self.assertEqual(child["session_id"], sid)  # 하위 세션 요청은 최상위 세션 카드로(답은 하위 세션 id로)
+        self.assertTrue(all(b["session_id"] == sid for b in bodies))
+        stop = next(b for b in bodies if b["hook_event_name"] == "Stop")
+        self.assertTrue(stop.get("turn_id"))
+        self.assertLess(out["ms"], 25000)  # per_hold(30초 붙잡기)는 replied에서 끊겼다
+        # 끝날 때 SessionEnd
+        self.assertEqual(bodies[-1]["hook_event_name"], "SessionEnd")
 
 
 if __name__ == "__main__":

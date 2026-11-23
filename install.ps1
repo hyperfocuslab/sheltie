@@ -92,10 +92,10 @@
     hk_absent = 'ezB9OiDsmrDrpqwg7ZuF7J20IOyXhuuLpCh7MX0p' # hk_absent
     hk_broken = '6rK96rOgOiB7MH0g7J20IOyYrOuwlOuluCBKU09O7J20IOyVhOuLiOudvCDqsbTrk5zrpqzsp4Ag7JWK7JWY64ukLiDqs6DsuZwg65KkIOuLpOyLnCDsi6TtlontlbTrnbwu' # hk_broken
     hk_fail = '6rK96rOgOiB7MH0g7ZuFIOyymOumrOyXkCDsi6TtjKjtlojri6QoezF9KS4g7ISk7LmY64qUIOqzhOyGje2VnOuLpC4=' # hk_fail
-    hk_nopy = 'cHl0aG9u7J20IOyXhuyWtCBDbGF1ZGUgQ29kZcK3Q29kZXgg7ZuF7J2AIOq3uOuMgOuhnOuLpC4gJVVTRVJQUk9GSUxFJVwuY2xhdWRlXHNldHRpbmdzLmpzb24sICVVU0VSUFJPRklMRSVcLmNvZGV4XGhvb2tzLmpzb24g7JeQ7IScICdzaGVsdGllLnB5JyBob29rIO2VreuqqeydhCDsp4HsoJEg7KeA7JuM6528Lg==' # hk_nopy
+    hk_nopy = 'cHl0aG9u7J20IOyXhuyWtCDsl5DsnbTsoITtirgg7ZuF7J2AIOq3uOuMgOuhnOuLpC4gJVVTRVJQUk9GSUxFJVwuY2xhdWRlXHNldHRpbmdzLmpzb24sICVVU0VSUFJPRklMRSVcLmNvZGV4XGhvb2tzLmpzb24sICVVU0VSUFJPRklMRSVcLnF3ZW5cc2V0dGluZ3MuanNvbiDsl5DshJwgJ3NoZWx0aWUucHknIGhvb2sg7ZWt66qp7J2ELCAlVVNFUlBST0ZJTEUlXC5jb25maWdcb3BlbmNvZGVccGx1Z2luc1xzaGVsdGllLmpzIOulvCDsp4HsoJEg7KeA7JuM6528Lg==' # hk_nopy
     hk_off = 'KC1Ob0hvb2tzOiDtm4Ug65Ox66GdIOqxtOuEiOucgCk=' # hk_off
-    hk_restart = 'Q2xhdWRlIENvZGXCt0NvZGV466W8IOyDiOuhnCDsi5zsnpHtlbTslbwg7ZuF7J20IOyggeyaqeuQnOuLpChDb2RleOuKlCAvaG9va3Mg7JeQ7IScIO2VnCDrsogg7Iug66Kw7ZW07JW8IO2VnOuLpCku' # hk_restart
-    help5 = 'ICAtTm9Ib29rczogQ2xhdWRlIENvZGXCt0NvZGV4IO2bhSDrk7HroZ0o7ZW07KCcKeydhCDqsbTrhIjrnIAuIGhj6rCAIOyXhuyWtOuPhCDshKTsuZjripQg6rOE7IaN7ZWc64ukKOqzteyLnSDtm4XsnLzroZzrp4wg64+Z7J6RKS4=' # help5
+    hk_restart = 'Q2xhdWRlIENvZGXCt0NvZGV4wrdRd2VuIENvZGXCt09wZW5Db2Rl66W8IOyDiOuhnCDsi5zsnpHtlbTslbwg7ZuF7J20IOyggeyaqeuQnOuLpChDb2RleOuKlCAvaG9va3Mg7JeQ7IScIO2VnCDrsogg7Iug66Kw7ZW07JW8IO2VnOuLpCku' # hk_restart
+    help5 = 'ICAtTm9Ib29rczogQ2xhdWRlIENvZGXCt0NvZGV4wrdRd2VuIENvZGUg7ZuF6rO8IE9wZW5Db2RlIO2UjOufrOq3uOyduCDrk7HroZ0o7ZW07KCcKeydhCDqsbTrhIjrnIAuIGhj6rCAIOyXhuyWtOuPhCDshKTsuZjripQg6rOE7IaN7ZWc64ukKOqzteyLnSDtm4XsnLzroZzrp4wg64+Z7J6RKS4=' # help5
     port_busy = '7Y+s7Yq4IHswfeydhCjrpbwpIOuLpOuluCDtlITroZzqt7jrnqjsnbQg6rOE7IaNIOyTsOqzoCDsnojri6QuIOq3uCDtlITroZzqt7jrnqjsnYQg64GE6rOgIOuLpOyLnCDsi6TtlontlbTrnbwu' # port still in use
     old_health = '7JibIOyEnOuyhOqwgCDslYTsp4Eg7J2R64u17ZWc64ukLiDsg4gg7ISc67KE66W8IOq4sOuLpOumrOuKlCDspJEuLi4=' # old server answered
     unexpected = '7JiI7IOB7ZWY7KeAIOuqu+2VnCDsmKTrpZg6IHswfQ==' # unexpected error
@@ -162,10 +162,12 @@
 </Task>
 '@
 
-  # Merge script for Claude Code / Codex hook files. Same text as in install.sh (a test compares them). Needs python.exe, not pythonw.
+  # Merge script for Claude Code / Codex / Qwen Code hook files and the OpenCode plugin file. Same text as in install.sh (a test compares them). Needs python.exe, not pythonw.
   $HOOKS_PY = @'
 # ---- hooks_merge.py begin (install.sh and install.ps1 embed this identical text; a test compares them)
-# usage: hooks_merge.py <install|uninstall> <claude|codex> <settings-file> <python-exe> <server-file> <posix|windows> [dry]
+# usage: hooks_merge.py <install|uninstall> <claude|codex|qwen|opencode> <settings-file> <python-exe> <server-file> <posix|windows> [dry]
+# For opencode <settings-file> is the plugin file (plugins/sheltie.js): written or removed whole, only when it carries
+# our mark on its first line (another file with that name is left alone: broken).
 # Prints exactly one status word: added | updated | unchanged | removed | absent | broken | error
 import json, os, shutil, sys
 
@@ -190,6 +192,10 @@ def spec():
     if target == "claude":
         return [("PermissionRequest", "*", 600), ("PreToolUse", "AskUserQuestion|ExitPlanMode", 600),
                 ("SessionStart", None, 10), ("SessionEnd", None, 10), ("UserPromptSubmit", None, 10), ("Stop", None, 10)]
+    if target == "qwen":
+        # Qwen Code reads hook timeouts in seconds (default 60): PermissionRequest must outlast the server hold.
+        return [("PermissionRequest", "*", 600), ("SessionStart", None, 10), ("SessionEnd", None, 10),
+                ("UserPromptSubmit", None, 10), ("Stop", None, 10)]
     return [("PermissionRequest", "*", 600), ("SessionStart", None, 10), ("SessionEnd", None, 3),
             ("UserPromptSubmit", None, 10), ("Stop", None, 10)]
 
@@ -197,8 +203,8 @@ def spec():
 def handler(timeout):
     h = {"type": "command"}
     if flavor == "windows":
-        if target == "claude":
-            h["command"] = '& "%s" "%s" hook claude' % (py, server)
+        if target in ("claude", "qwen"):
+            h["command"] = '& "%s" "%s" hook %s' % (py, server, target)
             h["shell"] = "powershell"
         else:
             # Codex does not document its Windows shell: go through powershell.exe explicitly.
@@ -232,7 +238,194 @@ def strip(groups):
     return out, pos, found
 
 
+PLUGIN_MARK = "// sheltie-opencode-plugin"
+PLUGIN = r'''// sheltie-opencode-plugin
+// Written by the Sheltie installer and removed by its uninstaller. Hands OpenCode permission prompts and turn
+// events to the local Sheltie server ("sheltie.py hook opencode") so they can be answered from the phone.
+// Any failure is ignored: the OpenCode dialog stays as it is.
+import { spawn, spawnSync } from "child_process"
+import os from "os"
+import path from "path"
+
+const PY = __SHELTIE_PY__
+const SERVER = __SHELTIE_SERVER__
+const DB = path.join(process.env.XDG_DATA_HOME || path.join(os.homedir(), ".local", "share"), "opencode", "opencode.db")
+
+export const SheltiePlugin = async (input) => {
+  let dir = process.cwd()
+  let client = null
+  if (input) {
+    if (typeof input.directory === "string") dir = input.directory
+    client = input.client
+  }
+  const parents = {}
+  const busy = {}
+  const ran = {}
+  const turns = {}
+  const live = {}
+  const pending = {}
+  // A subagent session asks under its own id: show it as its top session, answer with its own id.
+  const root = (sid) => {
+    let s = sid
+    for (let i = 0; i < 20; i++) {
+      if (!parents[s]) break
+      s = parents[s]
+    }
+    return s
+  }
+  const base = (sid, ev) => {
+    const r = root(sid)
+    live[r] = true
+    return { hook_event_name: ev, session_id: r, cwd: dir, opencode_db: DB }
+  }
+  const send = (body, done) => {
+    try {
+      const child = spawn(PY, [SERVER, "hook", "opencode"], { stdio: ["pipe", "pipe", "ignore"], windowsHide: true })
+      let out = ""
+      child.on("error", () => {})
+      child.stdout.on("data", (d) => { out += d })
+      child.on("close", () => {
+        if (done) {
+          try { done(out) } catch (e) {}
+        }
+      })
+      child.stdin.on("error", () => {})
+      child.stdin.end(JSON.stringify(body))
+      return child
+    } catch (e) {
+      return null
+    }
+  }
+  // Server answer (Claude hook shape) -> OpenCode reply: allow + updatedPermissions = always, allow = once, deny = reject.
+  const answer = async (sid, id, out) => {
+    delete pending[id]
+    let dec = null
+    try { dec = JSON.parse(out).hookSpecificOutput.decision } catch (e) { return }
+    if (!dec) return
+    let response = null
+    if (dec.behavior === "allow") {
+      response = "once"
+      if (Array.isArray(dec.updatedPermissions)) {
+        if (dec.updatedPermissions.length > 0) response = "always"
+      }
+    } else if (dec.behavior === "deny") {
+      response = "reject"
+    }
+    if (!response) return
+    if (!client) return
+    try {
+      await client.postSessionIdPermissionsPermissionId({ path: { id: sid, permissionID: id }, body: { response: response } })
+    } catch (e) {}
+  }
+  process.on("exit", () => {
+    for (const sid of Object.keys(live)) {
+      try {
+        const body = JSON.stringify({ hook_event_name: "SessionEnd", session_id: sid, cwd: dir, reason: "exit" })
+        spawnSync(PY, [SERVER, "hook", "opencode"], { input: body, stdio: ["pipe", "ignore", "ignore"], timeout: 3000, windowsHide: true })
+      } catch (e) {}
+    }
+  })
+  return {
+    event: async ({ event }) => {
+      try {
+        if (!event) return
+        const p = event.properties || {}
+        const sid = p.sessionID
+        if (typeof sid !== "string") return
+        if (event.type === "session.created") {
+          const info = p.info || {}
+          if (typeof info.parentID === "string") {
+            parents[sid] = info.parentID
+            return
+          }
+          send(base(sid, "SessionStart"))
+        } else if (event.type === "session.status") {
+          if (parents[sid]) return
+          let t = null
+          if (p.status) t = p.status.type
+          if (t === "busy") {
+            if (!busy[sid]) {
+              busy[sid] = true
+              ran[sid] = true
+              send(base(sid, "UserPromptSubmit"))
+            }
+          } else {
+            busy[sid] = false
+          }
+        } else if (event.type === "session.idle") {
+          if (parents[sid]) return
+          busy[sid] = false
+          if (!ran[sid]) return
+          ran[sid] = false
+          turns[sid] = (turns[sid] || 0) + 1
+          const b = base(sid, "Stop")
+          b.turn_id = sid + "#" + turns[sid]
+          send(b)
+        } else if (event.type === "permission.asked") {
+          const id = p.id
+          if (typeof id !== "string") return
+          const b = base(sid, "PermissionRequest")
+          b.tool_name = "tool"
+          if (typeof p.permission === "string") b.tool_name = p.permission
+          let meta = {}
+          if (p.metadata) {
+            if (typeof p.metadata === "object") meta = p.metadata
+          }
+          let pats = []
+          if (Array.isArray(p.patterns)) pats = p.patterns
+          b.tool_input = { patterns: pats, metadata: meta }
+          b.always = []
+          if (Array.isArray(p.always)) b.always = p.always.filter((x) => typeof x === "string")
+          b.request_id = id
+          const child = send(b, (out) => answer(sid, id, out))
+          if (child) pending[id] = child
+        } else if (event.type === "permission.replied") {
+          // Answered on the PC (or by us): drop the held request so the server sees the hook go away.
+          const c = pending[p.requestID]
+          if (c) {
+            delete pending[p.requestID]
+            try { c.kill() } catch (e) {}
+          }
+        }
+      } catch (e) {}
+    },
+  }
+}
+'''
+
+
+def plugin_main():
+    existed = os.path.exists(path)
+    cur = None
+    if existed:
+        try:
+            with open(path, encoding="utf-8") as f:
+                cur = f.read()
+        except (ValueError, OSError):
+            return "broken"
+        if not cur.startswith(PLUGIN_MARK):
+            return "broken"
+    if action == "uninstall":
+        if not existed:
+            return "absent"
+        if not dry:
+            os.remove(path)
+        return "removed"
+    text = PLUGIN.replace("__SHELTIE_PY__", json.dumps(py)).replace("__SHELTIE_SERVER__", json.dumps(server))
+    if cur == text:
+        return "unchanged"
+    if not dry:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".sheltie-tmp"
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    return "updated" if existed else "added"
+
+
 def main():
+    if target == "opencode":
+        return plugin_main()
     doc = {}
     existed = os.path.exists(path)
     if existed:
@@ -314,17 +507,22 @@ except Exception:
     if ($Quiet) { & $Exe @A 2>$null | Out-Null } else { & $Exe @A | Out-Host }
     return $LASTEXITCODE
   }
-  # Add/remove our hook entries in ~/.claude/settings.json and ~/.codex/hooks.json (only agents that exist).
+  # Add/remove our hook entries in ~/.claude/settings.json, ~/.codex/hooks.json, ~/.qwen/settings.json and write/remove
+  # ~/.config/opencode/plugins/sheltie.js (only agents whose folder exists).
   function Apply-Hooks([string]$Act, [string]$Py) {
     $script = Join-Path ([IO.Path]::GetTempPath()) ('hooks_merge.' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.py')
     [IO.File]::WriteAllText($script, $HOOKS_PY, (New-Object System.Text.UTF8Encoding($false)))
     $pre = ''
     if ($DRY) { $pre = '(dry-run) ' }
     try {
-      foreach ($agent in @('claude', 'codex')) {
+      foreach ($agent in @('claude', 'codex', 'qwen', 'opencode')) {
         $dir = Join-Path $env:USERPROFILE ".$agent"
         $name = 'settings.json'
         if ($agent -eq 'codex') { $name = 'hooks.json' }
+        if ($agent -eq 'opencode') {
+          $dir = Join-Path $env:USERPROFILE '.config\opencode'
+          $name = 'plugins\sheltie.js'
+        }
         $file = Join-Path $dir $name
         if (-not (Test-Path -LiteralPath $dir -PathType Container)) { Say (T 'hk_skip' $agent $dir); continue }
         $pa = @($script, $Act, $agent, $file, $Py, $SERVER, 'windows')
@@ -536,7 +734,9 @@ if n != c:
     $left = @()
     # Dry-run does not change hook files: if hooks would be updated, count them as updated.
     if (-not ($DRY -and -not $NOHOOKS)) {
-      foreach ($f in @((Join-Path $env:USERPROFILE '.claude\settings.json'), (Join-Path $env:USERPROFILE '.codex\hooks.json'))) {
+      $hookFiles = @((Join-Path $env:USERPROFILE '.claude\settings.json'), (Join-Path $env:USERPROFILE '.codex\hooks.json'),
+        (Join-Path $env:USERPROFILE '.qwen\settings.json'), (Join-Path $env:USERPROFILE '.config\opencode\plugins\sheltie.js'))
+      foreach ($f in $hookFiles) {
         if ((Test-Path -LiteralPath $f -PathType Leaf) -and ([IO.File]::ReadAllText($f).Contains($OLD_SERVER_NAME))) { $left += $f }
       }
     }

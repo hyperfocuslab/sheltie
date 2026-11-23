@@ -1,0 +1,10 @@
+{
+ "session_id": "7938bb0b-caae-4887-8e41-8b97e5b3e89e",
+ "transcript_path": "/Users/me/.qwen/projects/-Users-me-work-demo/chats/7938bb0b-caae-4887-8e41-8b97e5b3e89e.jsonl",
+ "cwd": "/Users/me/work/demo",
+ "hook_event_name": "SessionStart",
+ "timestamp": "2026-11-23T14:37:16.639Z",
+ "permission_mode": "default",
+ "source": "startup",
+ "model": "mock-model"
+}

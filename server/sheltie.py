@@ -9,7 +9,7 @@ hc는 항상 argv 리스트(shell=False)로 부르며, 임의 명령을 실행�
   python3 sheltie.py serve      서버 실행(기본 동작).
   python3 sheltie.py test-push  등록된 모든 기기에 시험 푸시 1건.
   python3 sheltie.py pair       앱 연결용 QR과 sheltie:// 주소 출력(설정 public_url, 없으면 Tailscale 이름).
-  python3 sheltie.py hook claude|codex  에이전트 훅이 부른다(stdin 훅 JSON → 로컬 서버 → stdout 결정 JSON).
+  python3 sheltie.py hook claude|codex|qwen|opencode  에이전트 훅이 부른다(stdin 훅 JSON → 로컬 서버 → stdout 결정 JSON).
 
 폰 접속: 맥미니 방화벽이 Homebrew Python의 들어오는 연결을 막으므로 127.0.0.1에만 열고
 tailscale serve로 tailnet 안에만 HTTPS로 내보낸다(다른 맥미니 서비스와 같은 방식, Funnel 아님):
@@ -6600,17 +6600,28 @@ class BranchCache:
 
 # ---------------------------------------------------------------- 훅 세션(herdr 없이)
 #
-# Claude Code·Codex 공식 훅이 `sheltie.py hook <claude|codex>`로 이벤트 JSON을 POST /hook/<agent>에 보낸다.
+# Claude Code·Codex·Qwen Code 공식 훅과 OpenCode 플러그인(설치기가 쓰는 sheltie.js)이
+# `sheltie.py hook <claude|codex|qwen|opencode>`로 이벤트 JSON을 POST /hook/<agent>에 보낸다.
 # 막힘(PermissionRequest, PreToolUse AskUserQuestion·ExitPlanMode)은 폰 답이 올 때까지 그 요청을 붙잡았다가
 # 결정을 돌려준다. 세션 하나가 터미널 하나(id "h" + session_id 영숫자 끝 12자)이고, App은 MultiBackend로
 # hc 터미널과 같은 자리에서 다룬다. 화면·키·글 보내기·새 작업은 없다(caps []).
 
-HOOK_AGENTS = ("claude", "codex")
-# Claude·Codex가 아닌 에이전트가 우리 훅을 부를 때의 표시(Grok Build 1.0.77 실측: GROK_* 환경변수,
-# camelCase 필드 hookEventName·sessionId·workspaceRoot를 snake_case와 같이 보낸다).
+HOOK_AGENTS = ("claude", "codex", "qwen", "opencode")
+# 우리 훅을 빌려 부르는 다른 에이전트의 표시(Grok Build 1.0.77 실측: GROK_* 환경변수,
+# camelCase 필드 hookEventName·sessionId·workspaceRoot를 snake_case와 같이 보낸다. Cursor 2026.11.19는
+# ~/.claude/settings.json 훅을 claude-code 호환으로 부르며 cursor_version·conversation_id를 넣는다).
 FOREIGN_HOOK_ENV = ("GROK_SESSION_ID", "GROK_HOOK_EVENT")
-FOREIGN_HOOK_KEYS = ("workspaceRoot", "hookEventName")
-HOOK_APPS = {"claude": "claude-code", "codex": "codex"}
+FOREIGN_HOOK_KEYS = ("workspaceRoot", "hookEventName", "cursor_version")
+# app 값은 hc status가 그 에이전트에 쓰는 이름(Qwen "qwen-code")이나 에이전트 이름 그대로
+HOOK_APPS = {"claude": "claude-code", "codex": "codex", "qwen": "qwen-code", "opencode": "opencode"}
+# 우리가 등록하는 이벤트. 그 밖의 이름은 세션을 만들지 않고 넘긴다(다른 에이전트가 빌려 부르는 이벤트 등)
+HOOK_EVENTS = ("SessionStart", "SessionEnd", "UserPromptSubmit", "Stop", "PermissionRequest", "PreToolUse")
+HOOK_ALWAYS_AGENTS = ("claude", "opencode")  # 계속 허용을 결정으로 돌려줄 수 있는 에이전트
+# Qwen은 이 도구들에 allow를 줘도 대화상자를 띄운다(requiresUserInteraction, 0.28.3 번들): 붙잡지 않는다
+QWEN_HOOK_INTERACTIVE = ("ask_user_question", "exit_plan_mode", "propose_goal")
+QWEN_HOOK_TITLES = {"run_shell_command": "Shell", "write_file": "WriteFile", "edit": "Edit"}
+OPENCODE_HOOK_TITLES = {"bash": "Shell command", "edit": "Edit file", "write": "Write file"}
+OPENCODE_HOOK_MAX_ALWAYS = 50
 HOOK_HOLD_SEC = 540           # 훅 타임아웃(600초)보다 짧게. 지나면 결정 없이 {} → 터미널 대화상자로
 HOOK_CLIENT_TIMEOUT = 590     # hook 하위 명령이 서버 답을 기다리는 상한(초)
 HOOK_POLL = 0.2               # 붙잡은 동안 폰 답·연결 끊김을 보는 간격(초)
@@ -6636,18 +6647,35 @@ def hook_session_tid(session_id):
 
 
 def hook_transcript_path(path, home):
-    """훅이 준 transcript_path가 ~/.claude/projects 또는 Codex sessions 아래 .jsonl이면 실제 경로, 아니면 None."""
+    """훅이 준 transcript_path가 ~/.claude/projects, Codex sessions, Qwen projects 아래 .jsonl이면 실제 경로, 아니면 None."""
     if not isinstance(path, str) or not path.endswith(".jsonl") or "\x00" in path or len(path) > 4096:
         return None
     try:
         real = os.path.realpath(path)
-        for base in (os.path.join(home, ".claude", "projects"), codex_sessions_dir(home)):
+        for base in (os.path.join(home, ".claude", "projects"), codex_sessions_dir(home),
+                     os.path.join(qwen_dir(home), "projects")):
             rb = os.path.realpath(base)
             if real.startswith(rb.rstrip(os.sep) + os.sep):
                 return real
     except (OSError, ValueError):
         pass
     return None
+
+
+def hook_opencode_db(path, home):
+    """OpenCode 플러그인이 준 opencode_db가 home 아래 실제 파일이고 이름이 opencode.db면 실제 경로, 아니면 None."""
+    if not isinstance(path, str) or not path or "\x00" in path or len(path) > 4096:
+        return None
+    try:
+        real = os.path.realpath(path)
+        rh = os.path.realpath(home)
+        if os.path.basename(real) != "opencode.db" or not real.startswith(rh.rstrip(os.sep) + os.sep):
+            return None
+        if not stat.S_ISREG(os.stat(real).st_mode):
+            return None
+        return real
+    except (OSError, ValueError):
+        return None
 
 
 def _hook_str(v, n=MAX_PROMPT_BODY):
@@ -6662,11 +6690,11 @@ def hook_tool_body(tool, inp):
         v = _hook_str(inp.get(k))
         if v:
             parts.append(v)
-    if tool == "Write":
+    if tool in ("Write", "write_file"):  # Qwen write_file·edit은 Claude Write·Edit와 같은 인자다
         v = _hook_str(inp.get("content"), 4000)
         if v:
             parts.append(v)
-    elif tool == "Edit":
+    elif tool in ("Edit", "edit"):
         old, new = _hook_str(inp.get("old_string"), 2000), _hook_str(inp.get("new_string"), 2000)
         if old or new:
             parts.append("- %s\n+ %s" % (old or "", new or ""))
@@ -6676,6 +6704,37 @@ def hook_tool_body(tool, inp):
     if not parts:
         parts.append(json.dumps(inp, ensure_ascii=False, indent=2)[:MAX_PROMPT_BODY] if inp else (tool or "tool"))
     return "\n\n".join(parts)[:MAX_PROMPT_BODY]
+
+
+def opencode_hook_body(inp):
+    """OpenCode 카드 본문: permission.asked의 metadata(command·filepath·diff), 없으면 patterns."""
+    inp = inp if isinstance(inp, dict) else {}
+    meta = inp.get("metadata") if isinstance(inp.get("metadata"), dict) else {}
+    parts = []
+    for k in ("command", "filepath", "filePath", "path", "url"):
+        v = _hook_str(meta.get(k))
+        if v:
+            parts.append(v)
+    diff = _hook_str(meta.get("diff"), 4000)
+    if diff:
+        parts.append(diff)
+    if not parts:
+        pats = inp.get("patterns") if isinstance(inp.get("patterns"), list) else []
+        pats = [x for x in pats if isinstance(x, str) and x]
+        if pats:
+            parts.append("\n".join(pats))
+    if not parts:
+        parts.append(json.dumps(meta, ensure_ascii=False, indent=2)[:MAX_PROMPT_BODY] if meta else "tool")
+    return "\n\n".join(parts)[:MAX_PROMPT_BODY]
+
+
+def hook_opencode_always(patterns):
+    """permission.asked의 always 패턴(이 OpenCode 프로세스 안에서만 남는 허용). 이상하면 []."""
+    if not isinstance(patterns, list) or not 1 <= len(patterns) <= OPENCODE_HOOK_MAX_ALWAYS:
+        return []
+    if not all(isinstance(x, str) and x and len(x) <= 500 for x in patterns):
+        return []
+    return list(patterns)
 
 
 def _hook_rule_text(rule):
@@ -6755,25 +6814,41 @@ def hook_permission_hold(agent, body):
     tool = body.get("tool_name") if isinstance(body.get("tool_name"), str) else "tool"
     inp = body.get("tool_input") if isinstance(body.get("tool_input"), dict) else {}
     nonce = secrets.token_hex(8)
-    perms = hook_always_rules(body.get("permission_suggestions")) if agent == "claude" else []
+    perms = []
+    if agent == "claude":
+        perms = hook_always_rules(body.get("permission_suggestions"))
+    elif agent == "opencode":
+        perms = hook_opencode_always(body.get("always"))
+    yes, no, text = "Yes", "No", None
     if agent == "codex":
         title = CODEX_APPROVAL_TITLES.get("make the following edits" if tool == "apply_patch"
                                           else "run the following command") if tool in ("Bash", "apply_patch") else tool
         question = ("Would you like to make the following edits?" if tool == "apply_patch"
                     else "Would you like to run the following command?" if tool == "Bash"
                     else "Allow %s?" % tool)
+    elif agent == "qwen":
+        title = QWEN_HOOK_TITLES.get(tool, tool)
+        question = "Do you want to proceed?"
+        yes = QWEN_APPROVE_FIRST
+    elif agent == "opencode":
+        title = OPENCODE_HOOK_TITLES.get(tool, tool)
+        question = "Permission required"
+        yes, no, text = OPENCODE_PERM_LABELS[0], OPENCODE_PERM_LABELS[2], opencode_hook_body(inp)
     else:
         title = {"Bash": "Bash command", "Write": "Create file", "Edit": "Edit file"}.get(tool, tool)
         question = "Do you want to proceed?"
-    options = [("Yes", None)]
+    options = [(yes, None)]
     always = None
     if perms:
-        rules = [_hook_rule_text(r) for s in perms for r in s["rules"]]
         always = len(options)
-        options.append(("Yes, and don't ask again for %s" % ", ".join(rules)[:300], None))
+        if agent == "opencode":
+            options.append(("%s: %s" % (OPENCODE_PERM_LABELS[1], ", ".join(perms))[:300], None))
+        else:
+            rules = [_hook_rule_text(r) for s in perms for r in s["rules"]]
+            options.append(("Yes, and don't ask again for %s" % ", ".join(rules)[:300], None))
     reject = len(options)
-    options.append(("No", None))
-    p = _finish("approval", title, question, hook_tool_body(tool, inp), options, selected=0,
+    options.append((no, None))
+    p = _finish("approval", title, question, text or hook_tool_body(tool, inp), options, selected=0,
                 always_index=always, reject_index=reject)
     status = {"state": "blocked", "kind": "permission", "msg": "approve %s" % tool, "app": HOOK_APPS[agent]}
     return HookHold(agent, "PermissionRequest", "permission", tool, inp, status,
@@ -6845,7 +6920,10 @@ class HookBackend:
         """세션 등록·갱신. 끝난(시간 초과) 붙잡기는 PC에서 풀렸을 것이라 지운다. 반환: 새로 만들었는지."""
         now = self.wall()
         cwd = body.get("cwd") if isinstance(body.get("cwd"), str) else None
-        tp = hook_transcript_path(body.get("transcript_path"), home)
+        if agent == "opencode":  # 기록은 SQLite 하나(플러그인이 opencode_db로 알려 준다)
+            tp = hook_opencode_db(body.get("opencode_db"), home)
+        else:
+            tp = hook_transcript_path(body.get("transcript_path"), home)
         with self.lock:
             s = self.sessions.get(tid)
             new = s is None
@@ -7693,7 +7771,9 @@ class App:
     def effective_info(self, tid, info):
         """화면으로 판정한 막힘이 있으면 status를 바꾼 사본(카드·답·목록이 막힘으로 다룬다).
         "overlay"(Codex 계획 실행 메뉴, Copilot 폴더 신뢰·autopilot 권한)는 그 메뉴만, hc status가 없는 에이전트("full")는
-        status 전체."""
+        status 전체. 훅 세션은 화면이 없어 그대로."""
+        if self.hooks.has(tid):
+            return info
         spec = agent_spec(agent_kind(info))
         if spec["screen"] == "full":
             st = self._screen_status(tid, info)
@@ -7901,6 +7981,8 @@ class App:
         """hc status가 없는 에이전트("full")와 상태 이벤트 없이 상자가 뜨는 에이전트(overlay poll) 터미널만
         화면으로 다시 판정한다(제목 이벤트를 놓치거나 working 중에 상자가 떠도 잡히게)."""
         for tid, kind in list(self._agent_kinds.items()):
+            if self.hooks.has(tid):
+                continue  # 훅 세션(OpenCode 플러그인 등)은 화면이 없다: 이벤트로만 판정한다
             spec = agent_spec(kind) if kind else None
             if spec and (spec["screen"] == "full" or (spec.get("overlay") or {}).get("poll")):
                 self.refresh(tid)
@@ -7934,6 +8016,8 @@ class App:
         tid = hook_session_tid(body.get("session_id"))
         if not isinstance(ev, str) or tid is None or not ID_RE.match(tid):
             raise ApiError(400, "bad_hook")
+        if ev not in HOOK_EVENTS:
+            return None  # 우리가 등록하지 않은 이벤트: 세션을 만들지 않는다
         if self.hooks.has(tid) and self.hooks.get(tid)["agent"] != agent:
             raise ApiError(409, "agent_mismatch")
         if ev == "SessionEnd":
@@ -7961,6 +8045,8 @@ class App:
         if ev == "PermissionRequest":
             if tool in HOOK_HOLD_TOOLS:
                 return {}  # 질문·계획은 PreToolUse가 붙잡는다
+            if agent == "qwen" and tool in QWEN_HOOK_INTERACTIVE:
+                return {}  # allow를 줘도 Qwen이 대화상자를 띄운다: 터미널에서 답한다
             return self._hook_hold(tid, hook_permission_hold(agent, body), alive)
         if ev == "PreToolUse":
             hold = None
@@ -8072,7 +8158,7 @@ class App:
             elif hold.kind == "question":
                 raise ApiError(409, "needs_manual", prompt=p)
             elif action == "always":
-                if not hold.always_perms or hold.agent != "claude":
+                if not hold.always_perms or hold.agent not in HOOK_ALWAYS_AGENTS:
                     raise ApiError(409, "no_always", prompt=p)
                 result = hold.allow(perms=hold.always_perms)
             elif hold.kind == "plan":
@@ -8129,7 +8215,7 @@ class App:
                 if oi == p.get("reject_index"):
                     result = hold.deny()
                 elif oi == p.get("always_index"):
-                    if not hold.always_perms or hold.agent != "claude":
+                    if not hold.always_perms or hold.agent not in HOOK_ALWAYS_AGENTS:
                         raise ApiError(409, "no_always", prompt=p)
                     result = hold.allow(perms=hold.always_perms)
                 else:
@@ -8137,10 +8223,22 @@ class App:
             self._hook_decide(tid, hold, result)
         return {"ok": True}
 
+    def _hook_record(self, tid):
+        """훅 세션 기록: (session_id, 경로, OpenCode SQLite인지). 경로는 쓸 때마다 다시 검사한다."""
+        sid, path = self.hooks.transcript(tid)
+        try:
+            agent = self.hooks.get(tid)["agent"]
+        except HcError:
+            return sid, None, False
+        if agent == "opencode":
+            return sid, hook_opencode_db(path, self.home), True
+        return sid, hook_transcript_path(path, self.home), False
+
     def _hook_preview(self, tid):
-        _, path = self.hooks.transcript(tid)
-        path = hook_transcript_path(path, self.home)
-        return preview_for_path(path) if path else None
+        sid, path, sqlite = self._hook_record(tid)
+        if not path:
+            return None
+        return opencode_preview(path, sid) if sqlite else preview_for_path(path)
 
     # --- API
     def term_lock(self, tid):
@@ -8440,8 +8538,10 @@ class App:
         if not 1 <= n <= 200:
             raise ApiError(400, "bad_limit")
         if self.hooks.has(tid):
-            sid, path = self.hooks.transcript(tid)
-            path = hook_transcript_path(path, self.home)
+            sid, path, sqlite = self._hook_record(tid)
+            if sqlite and path:
+                turns, cut = read_opencode_transcript(path, sid, n)
+                return {"session_id": sid, "turns": turns, "truncated": cut}
         else:
             info = self.require_claude(tid)
             sid, path = find_agent_transcript(info, self.home, runner=self.runner)
@@ -9241,7 +9341,7 @@ ROUTES = [
     ("GET", re.compile(r"^/api/usage$"), "usage"),
     ("GET", re.compile(r"^/api/push/status$"), "push_status"),
     ("POST", re.compile(r"^/api/push/test$"), "push_test"),
-    ("POST", re.compile(r"^/hook/(claude|codex)$"), "hook"),
+    ("POST", re.compile(r"^/hook/(claude|codex|qwen|opencode)$"), "hook"),
 ]
 
 
@@ -9639,7 +9739,7 @@ def cmd_pair(out=None, cfg=None, runner=None, enable_vt=None):
 
 
 def cmd_hook(args, stdin=None, stdout=None, env=None, timeout=HOOK_CLIENT_TIMEOUT):
-    """`sheltie.py hook <claude|codex>`: 에이전트 훅이 부른다. stdin의 훅 JSON을 로컬 서버에 넘기고
+    """`sheltie.py hook <claude|codex|qwen|opencode>`: 에이전트 훅(OpenCode는 플러그인)이 부른다. stdin의 훅 JSON을 로컬 서버에 넘기고
     서버 응답(JSON)을 그대로 stdout에 쓴다. herdr 안(HC_TERMINAL_ID)이거나 서버가 꺼져 있거나 어떤 오류든
     아무것도 쓰지 않고 0으로 끝난다 → 에이전트가 평소 터미널 대화상자를 띄운다. 로그 파일은 열지 않는다."""
     env = os.environ if env is None else env
@@ -9694,7 +9794,7 @@ def main(argv=None):
         return cmd_test_push()
     if cmd == "pair":
         return cmd_pair()
-    print("사용법: sheltie.py [init|serve|test-push|pair|hook <claude|codex>]", file=sys.stderr)
+    print("사용법: sheltie.py [init|serve|test-push|pair|hook <claude|codex|qwen|opencode>]", file=sys.stderr)
     return 2
 
 

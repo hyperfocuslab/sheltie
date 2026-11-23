@@ -327,6 +327,31 @@ class InstallPs1Test(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertFalse(os.path.exists(cl))
 
+    def test_hooks_qwen_and_opencode(self):
+        q = os.path.join(self.profile, ".qwen", "settings.json")
+        oc = os.path.join(self.profile, ".config", "opencode")
+        plugin = os.path.join(oc, "plugins", "sheltie.js")
+        os.makedirs(os.path.dirname(q))
+        os.makedirs(oc)
+        with open(q, "w", encoding="utf-8") as f:
+            json.dump({"model": "x", "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "mine"}]}]}}, f)
+        for _ in range(2):  # 두 번 설치해도 중복 없음
+            r = self.run_install()
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        c = read_json(q)
+        want = '& "%s" "%s" hook qwen' % (sys.executable, self.server_path())
+        self.assertEqual(c["hooks"]["PermissionRequest"][0]["hooks"][0],
+                         {"type": "command", "command": want, "shell": "powershell", "timeout": 600})
+        self.assertEqual([h["command"] for g in c["hooks"]["Stop"] for h in g["hooks"]], ["mine", want])
+        self.assertTrue(os.path.exists(q + ".sheltie-bak"))
+        js = read(plugin)
+        self.assertTrue(js.startswith("// sheltie-opencode-plugin"))
+        self.assertIn("const SERVER = %s" % json.dumps(self.server_path()), js)
+        r = self.run_install("-Uninstall")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(read_json(q), {"model": "x", "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "mine"}]}]}})
+        self.assertFalse(os.path.exists(plugin))
+
     def test_py_launcher_without_python(self):
         # py 런처는 있는데 파이썬이 없으면 출력이 비어도 죽지 않고 "python이 없다"로 끝나야 한다(7950 실측: null-valued 오류).
         with open(os.path.join(self.bin, "py.cmd"), "w", newline="") as f:

@@ -1,0 +1,13 @@
+{
+ "conversation_id": "c0ffee00-1111-4222-8333-444455556666",
+ "generation_id": "0a0b0c0d-1111-4222-8333-444455556666",
+ "session_id": "c0ffee00-1111-4222-8333-444455556666",
+ "hook_event_name": "UserPromptSubmit",
+ "cursor_version": "2026.11.19",
+ "workspace_roots": [
+  "/Users/me/work/demo"
+ ],
+ "cwd": "/Users/me/work/demo",
+ "prompt": "hi",
+ "transcript_path": null
+}

@@ -1,0 +1,15 @@
+{
+ "session_id": "7938bb0b-caae-4887-8e41-8b97e5b3e89e",
+ "transcript_path": "/Users/me/.qwen/projects/-Users-me-work-demo/chats/7938bb0b-caae-4887-8e41-8b97e5b3e89e.jsonl",
+ "cwd": "/Users/me/work/demo",
+ "hook_event_name": "PermissionRequest",
+ "timestamp": "2026-11-23T14:38:25.500Z",
+ "permission_mode": "default",
+ "prompt_id": "7938bb0b-caae-4887-8e41-8b97e5b3e89e########3",
+ "tool_name": "edit",
+ "tool_input": {
+  "file_path": "/Users/me/work/demo/hook3.txt",
+  "old_string": "hi",
+  "new_string": "hello"
+ }
+}

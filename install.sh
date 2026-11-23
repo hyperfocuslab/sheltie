@@ -1,6 +1,6 @@
 #!/bin/sh
 # Sheltie 설치기(macOS). 사용: sh install.sh [--dry-run] [--uninstall] [--no-hooks]
-#   --no-hooks: Claude Code·Codex 훅 등록(해제)을 건너뜀. hc(herdr-core)가 없어도 설치는 계속한다(공식 훅으로만 동작).
+#   --no-hooks: Claude Code·Codex·Qwen Code 훅과 OpenCode 플러그인 등록(해제)을 건너뜀. hc(herdr-core)가 없어도 설치는 계속한다(공식 훅으로만 동작).
 #   환경변수: SHELTIE_SRC(서버 파일 https URL 또는 로컬 경로. 기본: 옆의 server/ 파일, 없으면 GitHub raw), SHELTIE_HC(hc 경로),
 #   SHELTIE_PORT(기본 8790), SHELTIE_TAILSCALE(tailscale CLI 경로),
 #   SHELTIE_SKIP_TAILSCALE=1(tailscale 점검·serve·pair 건너뜀, 시험용),
@@ -28,6 +28,8 @@ OLD_LOG="$HOME/Library/Logs/herdr-remote.log"
 OLD_SERVER_NAME="herdr_remote.py"
 OLD_PLIST="$PLIST_DIR/$OLD_LABEL.plist"
 OLD_SYS_PLIST="${SHELTIE_SYS_AGENTS_DIR:-/Library/LaunchAgents}/$OLD_LABEL.plist"
+# OpenCode 전역 설정 폴더(XDG_CONFIG_HOME 우선, OpenCode 1.19.6 로더와 같다). 플러그인은 그 안 plugins/
+OPENCODE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/opencode"
 UID_N=$(id -u)
 DRY=0
 MODE=install
@@ -165,7 +167,8 @@ old_cleanup() {
     old_service_down
     _left=""
     # dry-run은 훅 파일을 안 바꾸므로 훅을 고칠 예정이면(--no-hooks가 아니면) 고쳐졌다고 본다.
-    [ "$DRY" = 1 ] && [ "$NOHOOKS" != 1 ] || for _f in "$HOME/.claude/settings.json" "$HOME/.codex/hooks.json"; do
+    [ "$DRY" = 1 ] && [ "$NOHOOKS" != 1 ] || for _f in "$HOME/.claude/settings.json" "$HOME/.codex/hooks.json" \
+        "$HOME/.qwen/settings.json" "$OPENCODE_DIR/plugins/sheltie.js"; do
       [ ! -f "$_f" ] || ! grep -F "$OLD_SERVER_NAME" "$_f" >/dev/null 2>&1 || _left="${_left:+$_left, }$_f"
     done
     if [ -n "$_left" ] && [ -d "$OLD_DATA_DIR" ]; then
@@ -180,10 +183,12 @@ old_cleanup() {
   fi
 }
 
-# Claude Code·Codex 훅 병합 스크립트(이 한 곳만 고친다. install.ps1에 같은 글자로 들어 있고 테스트가 비교한다).
+# Claude Code·Codex·Qwen Code 훅 병합과 OpenCode 플러그인 쓰기 스크립트(이 한 곳만 고친다. install.ps1에 같은 글자로 들어 있고 테스트가 비교한다).
 HOOKS_PY=$(cat <<'HOOKS_PY_EOF'
 # ---- hooks_merge.py begin (install.sh and install.ps1 embed this identical text; a test compares them)
-# usage: hooks_merge.py <install|uninstall> <claude|codex> <settings-file> <python-exe> <server-file> <posix|windows> [dry]
+# usage: hooks_merge.py <install|uninstall> <claude|codex|qwen|opencode> <settings-file> <python-exe> <server-file> <posix|windows> [dry]
+# For opencode <settings-file> is the plugin file (plugins/sheltie.js): written or removed whole, only when it carries
+# our mark on its first line (another file with that name is left alone: broken).
 # Prints exactly one status word: added | updated | unchanged | removed | absent | broken | error
 import json, os, shutil, sys
 
@@ -208,6 +213,10 @@ def spec():
     if target == "claude":
         return [("PermissionRequest", "*", 600), ("PreToolUse", "AskUserQuestion|ExitPlanMode", 600),
                 ("SessionStart", None, 10), ("SessionEnd", None, 10), ("UserPromptSubmit", None, 10), ("Stop", None, 10)]
+    if target == "qwen":
+        # Qwen Code reads hook timeouts in seconds (default 60): PermissionRequest must outlast the server hold.
+        return [("PermissionRequest", "*", 600), ("SessionStart", None, 10), ("SessionEnd", None, 10),
+                ("UserPromptSubmit", None, 10), ("Stop", None, 10)]
     return [("PermissionRequest", "*", 600), ("SessionStart", None, 10), ("SessionEnd", None, 3),
             ("UserPromptSubmit", None, 10), ("Stop", None, 10)]
 
@@ -215,8 +224,8 @@ def spec():
 def handler(timeout):
     h = {"type": "command"}
     if flavor == "windows":
-        if target == "claude":
-            h["command"] = '& "%s" "%s" hook claude' % (py, server)
+        if target in ("claude", "qwen"):
+            h["command"] = '& "%s" "%s" hook %s' % (py, server, target)
             h["shell"] = "powershell"
         else:
             # Codex does not document its Windows shell: go through powershell.exe explicitly.
@@ -250,7 +259,194 @@ def strip(groups):
     return out, pos, found
 
 
+PLUGIN_MARK = "// sheltie-opencode-plugin"
+PLUGIN = r'''// sheltie-opencode-plugin
+// Written by the Sheltie installer and removed by its uninstaller. Hands OpenCode permission prompts and turn
+// events to the local Sheltie server ("sheltie.py hook opencode") so they can be answered from the phone.
+// Any failure is ignored: the OpenCode dialog stays as it is.
+import { spawn, spawnSync } from "child_process"
+import os from "os"
+import path from "path"
+
+const PY = __SHELTIE_PY__
+const SERVER = __SHELTIE_SERVER__
+const DB = path.join(process.env.XDG_DATA_HOME || path.join(os.homedir(), ".local", "share"), "opencode", "opencode.db")
+
+export const SheltiePlugin = async (input) => {
+  let dir = process.cwd()
+  let client = null
+  if (input) {
+    if (typeof input.directory === "string") dir = input.directory
+    client = input.client
+  }
+  const parents = {}
+  const busy = {}
+  const ran = {}
+  const turns = {}
+  const live = {}
+  const pending = {}
+  // A subagent session asks under its own id: show it as its top session, answer with its own id.
+  const root = (sid) => {
+    let s = sid
+    for (let i = 0; i < 20; i++) {
+      if (!parents[s]) break
+      s = parents[s]
+    }
+    return s
+  }
+  const base = (sid, ev) => {
+    const r = root(sid)
+    live[r] = true
+    return { hook_event_name: ev, session_id: r, cwd: dir, opencode_db: DB }
+  }
+  const send = (body, done) => {
+    try {
+      const child = spawn(PY, [SERVER, "hook", "opencode"], { stdio: ["pipe", "pipe", "ignore"], windowsHide: true })
+      let out = ""
+      child.on("error", () => {})
+      child.stdout.on("data", (d) => { out += d })
+      child.on("close", () => {
+        if (done) {
+          try { done(out) } catch (e) {}
+        }
+      })
+      child.stdin.on("error", () => {})
+      child.stdin.end(JSON.stringify(body))
+      return child
+    } catch (e) {
+      return null
+    }
+  }
+  // Server answer (Claude hook shape) -> OpenCode reply: allow + updatedPermissions = always, allow = once, deny = reject.
+  const answer = async (sid, id, out) => {
+    delete pending[id]
+    let dec = null
+    try { dec = JSON.parse(out).hookSpecificOutput.decision } catch (e) { return }
+    if (!dec) return
+    let response = null
+    if (dec.behavior === "allow") {
+      response = "once"
+      if (Array.isArray(dec.updatedPermissions)) {
+        if (dec.updatedPermissions.length > 0) response = "always"
+      }
+    } else if (dec.behavior === "deny") {
+      response = "reject"
+    }
+    if (!response) return
+    if (!client) return
+    try {
+      await client.postSessionIdPermissionsPermissionId({ path: { id: sid, permissionID: id }, body: { response: response } })
+    } catch (e) {}
+  }
+  process.on("exit", () => {
+    for (const sid of Object.keys(live)) {
+      try {
+        const body = JSON.stringify({ hook_event_name: "SessionEnd", session_id: sid, cwd: dir, reason: "exit" })
+        spawnSync(PY, [SERVER, "hook", "opencode"], { input: body, stdio: ["pipe", "ignore", "ignore"], timeout: 3000, windowsHide: true })
+      } catch (e) {}
+    }
+  })
+  return {
+    event: async ({ event }) => {
+      try {
+        if (!event) return
+        const p = event.properties || {}
+        const sid = p.sessionID
+        if (typeof sid !== "string") return
+        if (event.type === "session.created") {
+          const info = p.info || {}
+          if (typeof info.parentID === "string") {
+            parents[sid] = info.parentID
+            return
+          }
+          send(base(sid, "SessionStart"))
+        } else if (event.type === "session.status") {
+          if (parents[sid]) return
+          let t = null
+          if (p.status) t = p.status.type
+          if (t === "busy") {
+            if (!busy[sid]) {
+              busy[sid] = true
+              ran[sid] = true
+              send(base(sid, "UserPromptSubmit"))
+            }
+          } else {
+            busy[sid] = false
+          }
+        } else if (event.type === "session.idle") {
+          if (parents[sid]) return
+          busy[sid] = false
+          if (!ran[sid]) return
+          ran[sid] = false
+          turns[sid] = (turns[sid] || 0) + 1
+          const b = base(sid, "Stop")
+          b.turn_id = sid + "#" + turns[sid]
+          send(b)
+        } else if (event.type === "permission.asked") {
+          const id = p.id
+          if (typeof id !== "string") return
+          const b = base(sid, "PermissionRequest")
+          b.tool_name = "tool"
+          if (typeof p.permission === "string") b.tool_name = p.permission
+          let meta = {}
+          if (p.metadata) {
+            if (typeof p.metadata === "object") meta = p.metadata
+          }
+          let pats = []
+          if (Array.isArray(p.patterns)) pats = p.patterns
+          b.tool_input = { patterns: pats, metadata: meta }
+          b.always = []
+          if (Array.isArray(p.always)) b.always = p.always.filter((x) => typeof x === "string")
+          b.request_id = id
+          const child = send(b, (out) => answer(sid, id, out))
+          if (child) pending[id] = child
+        } else if (event.type === "permission.replied") {
+          // Answered on the PC (or by us): drop the held request so the server sees the hook go away.
+          const c = pending[p.requestID]
+          if (c) {
+            delete pending[p.requestID]
+            try { c.kill() } catch (e) {}
+          }
+        }
+      } catch (e) {}
+    },
+  }
+}
+'''
+
+
+def plugin_main():
+    existed = os.path.exists(path)
+    cur = None
+    if existed:
+        try:
+            with open(path, encoding="utf-8") as f:
+                cur = f.read()
+        except (ValueError, OSError):
+            return "broken"
+        if not cur.startswith(PLUGIN_MARK):
+            return "broken"
+    if action == "uninstall":
+        if not existed:
+            return "absent"
+        if not dry:
+            os.remove(path)
+        return "removed"
+    text = PLUGIN.replace("__SHELTIE_PY__", json.dumps(py)).replace("__SHELTIE_SERVER__", json.dumps(server))
+    if cur == text:
+        return "unchanged"
+    if not dry:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".sheltie-tmp"
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    return "updated" if existed else "added"
+
+
 def main():
+    if target == "opencode":
+        return plugin_main()
     doc = {}
     existed = os.path.exists(path)
     if existed:
@@ -319,12 +515,17 @@ except Exception:
 HOOKS_PY_EOF
 )
 
-# hooks_apply <install|uninstall> <python>: 있는 에이전트(~/.claude, ~/.codex)의 훅 설정 파일에 우리 항목을 넣거나 뺀다.
+# hooks_apply <install|uninstall> <python>: 있는 에이전트(~/.claude, ~/.codex, ~/.qwen)의 훅 설정 파일에 우리 항목을
+# 넣거나 빼고, OpenCode(설정 폴더가 있을 때)는 전역 플러그인 파일(plugins/sheltie.js)을 쓰거나 지운다.
 hooks_apply() {
   _act=$1; _py=$2
   _dryarg=""; [ "$DRY" != 1 ] || _dryarg=dry
-  for _t in claude codex; do
-    _dir="$HOME/.$_t"; _file="$_dir/settings.json"; [ "$_t" = codex ] && _file="$_dir/hooks.json"
+  for _t in claude codex qwen opencode; do
+    _dir="$HOME/.$_t"; _file="$_dir/settings.json"
+    case "$_t" in
+      codex) _file="$_dir/hooks.json" ;;
+      opencode) _dir=$OPENCODE_DIR; _file="$_dir/plugins/sheltie.js" ;;
+    esac
     if [ ! -d "$_dir" ]; then say "($_t: $_dir 없음, 훅 건너뜀)"; continue; fi
     _res=$("$_py" -c "$HOOKS_PY" "$_act" "$_t" "$_file" "$_py" "$SERVER" posix $_dryarg 2>/dev/null) || _res=error
     _pre=""; [ "$DRY" != 1 ] || _pre="(dry-run) "
@@ -351,7 +552,7 @@ if [ "$MODE" = uninstall ]; then
   [ ! -e "$SYS_PLIST" ] || say "/Library/LaunchAgents에도 설치돼 있다. 지우려면: sudo rm $SYS_PLIST"
   if [ "$NOHOOKS" != 1 ]; then
     if UPY=$(command -v python3 2>/dev/null) && [ -n "$UPY" ]; then hooks_apply uninstall "$UPY"
-    else say "python3가 없어 Claude Code·Codex 훅은 그대로다. ~/.claude/settings.json, ~/.codex/hooks.json 에서 'sheltie.py' hook 항목을 직접 지워라."; fi
+    else say "python3가 없어 에이전트 훅은 그대로다. ~/.claude/settings.json, ~/.codex/hooks.json, ~/.qwen/settings.json 에서 'sheltie.py' hook 항목을, $OPENCODE_DIR/plugins/sheltie.js 를 직접 지워라."; fi
   fi
   _kept=$CONFIG_DIR; [ -d "$_kept" ] || [ ! -d "$OLD_CONFIG_DIR" ] || _kept=$OLD_CONFIG_DIR
   say "해제 완료. 설정과 토큰은 남겼다: $_kept (지우려면 직접 삭제)"
@@ -442,7 +643,7 @@ else
   [ -n "$PORT" ] || PORT=8790
 fi
 
-# ---- 2b. Claude Code·Codex 훅
+# ---- 2b. Claude Code·Codex·Qwen Code 훅, OpenCode 플러그인
 if [ "$NOHOOKS" = 1 ]; then say "(--no-hooks: 훅 등록 건너뜀)"; else hooks_apply install "$PYTHON"; fi
 
 # ---- 3. LaunchAgent
@@ -558,5 +759,5 @@ else
   say "(tailscale 없이 설치해서 pair는 건너뜀)"
 fi
 if [ "$NOHOOKS" != 1 ]; then
-  say "Claude Code·Codex를 새로 시작해야 훅이 적용된다(Codex는 /hooks 에서 한 번 신뢰해야 한다)."
+  say "Claude Code·Codex·Qwen Code·OpenCode를 새로 시작해야 훅이 적용된다(Codex는 /hooks 에서 한 번 신뢰해야 한다)."
 fi
