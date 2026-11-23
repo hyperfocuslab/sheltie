@@ -15,7 +15,7 @@ import urllib.request
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from test_herdr_remote import TOKEN, hr, make_app, st  # noqa: E402
+from test_sheltie import TOKEN, hr, make_app, st  # noqa: E402
 
 
 class FilesHttpTests(unittest.TestCase):

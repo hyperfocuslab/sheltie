@@ -1,7 +1,7 @@
                                                                                                               │                                                                                       ✕
  ▐▛███▛█   Claude Code v2.1.329                                                                               │[ 펼침 ] [ 접음 ]
 ▝▜██████▀  Opus 5.5 · Claude Max                                                                              │
- ▝▝   ▝▝   ~/Documents/github/_scratch/herdr-remote/hrtest                                                    │지금 / 방금
+ ▝▝   ▝▝   ~/Documents/github/_scratch/sheltie/hrtest                                                         │지금 / 방금
                                                                                                               │🟡 AskUserQuestion ×1                                                                내장
                                                                                                               │
 ❯ hello.txt 파일을 만들고 hi라고 써줘.                                                                        │▾ 🟡 실행중 1
@@ -10,7 +10,7 @@
   ⎿  Wrote 1 line to hello.txt                                                                                │▸ 🟢 사용함 0
       1 hi                                                                                                    │▸ 🔴 오류 0
                                                                                                               │▸ 🔵 꺼냄 35
-⏺ 만들었어. /Users/dev/Documents/github/_scratch/herdr-remote/hrtest/hello.txt 파일에 hi라고│▸ ⚪ 미사용 66
+⏺ 만들었어. /Users/dev/Documents/github/_scratch/sheltie/hrtest/hello.txt 파일에 hi라고     │▸ ⚪ 미사용 66
   적었어.                                                                                                     │
                                                                                                               │▸ 스킬                                                                         7.3k  0/55
 ✻ Brewed for 3s · done 오후 7:02                                                                              │▸ 플러그인                                                                       157  0/1

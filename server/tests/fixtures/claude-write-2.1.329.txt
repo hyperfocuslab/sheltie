@@ -1,7 +1,7 @@
                                                                                                               │                                                                                       ✕
  ▐▛███▛█   Claude Code v2.1.329                                                                               │[ 펼침 ] [ 접음 ]
 ▝▜██████▀  Opus 5.5 · Claude Max                                                                              │
- ▝▝   ▝▝   ~/Documents/github/_scratch/herdr-remote/hrtest                                                    │지금 / 방금
+ ▝▝   ▝▝   ~/Documents/github/_scratch/sheltie/hrtest                                                         │지금 / 방금
                                                                                                               │🟡 Write ×1                                                                          내장
                                                                                                               │
 ❯ hello.txt 파일을 만들고 hi라고 써줘.                                                                        │▾ 🟡 실행중 1

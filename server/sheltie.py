@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""herdr-remote: 맥미니의 herdr-core(`hc`) 위 Claude Code 에이전트를 아이폰에서 지켜보고 답하는 개인용 중계 서버.
+"""Sheltie: 맥미니의 herdr-core(`hc`) 위 Claude Code 에이전트를 아이폰에서 지켜보고 답하는 개인용 중계 서버.
 
 Tailscale 주소에만 열리고, 모든 요청에 Bearer 토큰이 필요하다. 표준 라이브러리만 쓴다.
 hc는 항상 argv 리스트(shell=False)로 부르며, 임의 명령을 실행하는 경로는 없다.
 
 명령
-  python3 herdr_remote.py init       설정이 없으면 토큰을 만들어 저장하고 한 번 출력한다(있으면 그대로 둔다).
-  python3 herdr_remote.py serve      서버 실행(기본 동작).
-  python3 herdr_remote.py test-push  등록된 모든 기기에 시험 푸시 1건.
-  python3 herdr_remote.py pair       앱 연결용 QR과 sheltie:// 주소 출력(설정 public_url, 없으면 Tailscale 이름).
-  python3 herdr_remote.py hook claude|codex  에이전트 훅이 부른다(stdin 훅 JSON → 로컬 서버 → stdout 결정 JSON).
+  python3 sheltie.py init       설정이 없으면 토큰을 만들어 저장하고 한 번 출력한다(있으면 그대로 둔다).
+  python3 sheltie.py serve      서버 실행(기본 동작).
+  python3 sheltie.py test-push  등록된 모든 기기에 시험 푸시 1건.
+  python3 sheltie.py pair       앱 연결용 QR과 sheltie:// 주소 출력(설정 public_url, 없으면 Tailscale 이름).
+  python3 sheltie.py hook claude|codex  에이전트 훅이 부른다(stdin 훅 JSON → 로컬 서버 → stdout 결정 JSON).
 
 폰 접속: 맥미니 방화벽이 Homebrew Python의 들어오는 연결을 막으므로 127.0.0.1에만 열고
 tailscale serve로 tailnet 안에만 HTTPS로 내보낸다(다른 맥미니 서비스와 같은 방식, Funnel 아님):
@@ -18,10 +18,10 @@ ssh my-mac '/opt/homebrew/bin/tailscale serve --bg --https=8790 http://127.0.0.1
 
 상시 실행 설치(홈이 외장 볼륨이면 ~/Library/LaunchAgents는 bootstrap이 실패한다.
 /Library/LaunchAgents에 root 소유로 두고 사용자 gui 도메인에 올린다. sudo 비밀번호가 필요하다):
-ssh -t my-mac 'python3 ~/Documents/github/herdr-remote/server/herdr_remote.py init && sudo install -o root -g wheel -m 644 ~/Documents/github/herdr-remote/deploy/com.hyperfocuslab.herdr-remote.plist /Library/LaunchAgents/ && launchctl bootstrap gui/$(id -u) /Library/LaunchAgents/com.hyperfocuslab.herdr-remote.plist'
-재시작: launchctl kickstart -k gui/$(id -u)/com.hyperfocuslab.herdr-remote; tail ~/Library/Logs/herdr-remote.log
-해제: launchctl bootout gui/$(id -u)/com.hyperfocuslab.herdr-remote && sudo rm /Library/LaunchAgents/com.hyperfocuslab.herdr-remote.plist
-APNs 키: Apple Developer에서 받은 .p8을 ~/.config/herdr-remote/AuthKey.p8 (0600)에 둔다. 없으면 푸시만 꺼진다.
+ssh -t my-mac 'python3 ~/Documents/github/sheltie/server/sheltie.py init && sudo install -o root -g wheel -m 644 ~/Documents/github/sheltie/deploy/com.hyperfocuslab.sheltie.plist /Library/LaunchAgents/ && launchctl bootstrap gui/$(id -u) /Library/LaunchAgents/com.hyperfocuslab.sheltie.plist'
+재시작: launchctl kickstart -k gui/$(id -u)/com.hyperfocuslab.sheltie; tail ~/Library/Logs/sheltie.log
+해제: launchctl bootout gui/$(id -u)/com.hyperfocuslab.sheltie && sudo rm /Library/LaunchAgents/com.hyperfocuslab.sheltie.plist
+APNs 키: Apple Developer에서 받은 .p8을 ~/.config/sheltie/AuthKey.p8 (0600)에 둔다. 없으면 푸시만 꺼진다.
 중계 모드: APNs 키 파일이 없고 설정의 push_relay_url이 비어 있으면 기본 중계(DEFAULT_RELAY_URL)로 키 없이 보낸다
 (App Store판 앱, 기기마다 relay_sig 필요). push_relay_url에 https 주소를 넣으면 그 중계를 쓰고, "off"면 중계를 끈다.
 키 파일이 있고 push_relay_url이 비어 있으면 지금처럼 APNs 직접 모드.
@@ -29,13 +29,13 @@ Android(env "fcm") 기기는 APNs 키가 있어도 항상 중계로 보낸다: p
 "off"면 보내지 않고 발송 상태에 실패(fcm_relay_off)로 남긴다.
 
 환경변수
-  HERDR_REMOTE_CONFIG  설정 파일(기본 ~/.config/herdr-remote/config.json). devices.json은 같은 폴더.
-  HERDR_REMOTE_LOG     로그 파일(기본 ~/Library/Logs/herdr-remote.log, 1MB 회전)
+  SHELTIE_CONFIG  설정 파일(기본 ~/.config/sheltie/config.json). devices.json은 같은 폴더.
+  SHELTIE_LOG     로그 파일(기본 ~/Library/Logs/sheltie.log, 1MB 회전)
 
 Windows(Python 3.9+, 표준 라이브러리만): 같은 파일 하나로 돈다. 맥과 다른 점만 적는다.
-  설정·devices.json은 맥과 같은 ~/.config/herdr-remote/ (토큰이 든 파일이라 로밍 %APPDATA%에 두지 않는다).
-  로그 기본 %LOCALAPPDATA%\\herdr-remote\\herdr-remote.log. hc 기본 %LOCALAPPDATA%\\Programs\\herdr-core\\hc.exe.
-  상시 실행은 작업 스케줄러(로그온 시)로 `pythonw.exe herdr_remote.py serve`(콘솔 없음 → 자식 프로세스는 CREATE_NO_WINDOW).
+  설정·devices.json은 맥과 같은 ~/.config/sheltie/ (토큰이 든 파일이라 로밍 %APPDATA%에 두지 않는다).
+  로그 기본 %LOCALAPPDATA%\\sheltie\\sheltie.log. hc 기본 %LOCALAPPDATA%\\Programs\\herdr-core\\hc.exe.
+  상시 실행은 작업 스케줄러(로그온 시)로 `pythonw.exe sheltie.py serve`(콘솔 없음 → 자식 프로세스는 CREATE_NO_WINDOW).
   에이전트는 PATH·흔한 설치 폴더에서 .exe 우선으로 찾아 절대 경로로 hc에 넘긴다(hc 코어는 PATH를 띄운 환경에서 물려받는다).
   APNs 직접 모드(curl·openssl)는 지원하지 않는다: 푸시는 중계 모드만 쓴다.
 """
@@ -69,8 +69,8 @@ import uuid
 IS_WINDOWS = os.name == "nt"
 CREATE_NO_WINDOW = 0x08000000
 
-DEFAULT_CONFIG_PATH = "~/.config/herdr-remote/config.json"
-DEFAULT_LOG_PATH = "~/Library/Logs/herdr-remote.log"
+DEFAULT_CONFIG_PATH = "~/.config/sheltie/config.json"
+DEFAULT_LOG_PATH = "~/Library/Logs/sheltie.log"
 
 
 def _local_appdata():
@@ -79,7 +79,7 @@ def _local_appdata():
 
 def default_log_path():
     if IS_WINDOWS:
-        return os.path.join(_local_appdata(), "herdr-remote", "herdr-remote.log")
+        return os.path.join(_local_appdata(), "sheltie", "sheltie.log")
     return DEFAULT_LOG_PATH
 
 
@@ -109,7 +109,7 @@ DEFAULTS = {
     "port": 8790,
     "token": "",
     "hc_path": default_hc_path(),
-    "apns_key_path": "~/.config/herdr-remote/AuthKey.p8",
+    "apns_key_path": "~/.config/sheltie/AuthKey.p8",
     "apns_key_id": "5BN2SS5X65",
     "team_id": "2CU9248L85",
     "topic": "com.hyperfocuslab.sheltie",
@@ -168,13 +168,13 @@ MAX_TEXT = 4000
 TRUST_MSG = "trust this folder"
 TAILSCALE_NET = ipaddress.ip_network("100.64.0.0/10")
 
-log = logging.getLogger("herdr-remote")
+log = logging.getLogger("sheltie")
 
 
 # ---------------------------------------------------------------- 설정·파일
 
 def config_path():
-    return os.path.expanduser(os.environ.get("HERDR_REMOTE_CONFIG") or DEFAULT_CONFIG_PATH)
+    return os.path.expanduser(os.environ.get("SHELTIE_CONFIG") or DEFAULT_CONFIG_PATH)
 
 
 def ensure_private_dir(d):
@@ -276,7 +276,7 @@ def init_config(path=None, out=None):
 
 
 def setup_logging(path=None):
-    path = os.path.expanduser(path or os.environ.get("HERDR_REMOTE_LOG") or default_log_path())
+    path = os.path.expanduser(path or os.environ.get("SHELTIE_LOG") or default_log_path())
     os.makedirs(os.path.dirname(path), exist_ok=True)
     h = logging.handlers.RotatingFileHandler(path, maxBytes=1024 * 1024, backupCount=2, encoding="utf-8")
     h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
@@ -6600,7 +6600,7 @@ class BranchCache:
 
 # ---------------------------------------------------------------- 훅 세션(herdr 없이)
 #
-# Claude Code·Codex 공식 훅이 `herdr_remote.py hook <claude|codex>`로 이벤트 JSON을 POST /hook/<agent>에 보낸다.
+# Claude Code·Codex 공식 훅이 `sheltie.py hook <claude|codex>`로 이벤트 JSON을 POST /hook/<agent>에 보낸다.
 # 막힘(PermissionRequest, PreToolUse AskUserQuestion·ExitPlanMode)은 폰 답이 올 때까지 그 요청을 붙잡았다가
 # 결정을 돌려준다. 세션 하나가 터미널 하나(id "h" + session_id 영숫자 끝 12자)이고, App은 MultiBackend로
 # hc 터미널과 같은 자리에서 다룬다. 화면·키·글 보내기·새 작업은 없다(caps []).
@@ -9246,7 +9246,7 @@ ROUTES = [
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
-    server_version = "herdr-remote"
+    server_version = "Sheltie"
     sys_version = ""
     protocol_version = "HTTP/1.1"
 
@@ -9582,7 +9582,7 @@ def cmd_test_push():
             print("APNs 키 파일이 없다: %s (또는 설정에 push_relay_url)" % cfg["apns_key_path"], file=sys.stderr)
         return 1
     devs = app.devices.list()
-    payload = build_payload("test", "herdr-remote", "done", {})
+    payload = build_payload("test", "Sheltie", "done", {})
     payload["aps"]["alert"] = test_alert()
     sent = app.pusher.push(payload, ttl=PUSH_TTL_TEST)
     print("시험 푸시: 기기 %d대 중 %d대 성공" % (len(devs), sent))
@@ -9639,7 +9639,7 @@ def cmd_pair(out=None, cfg=None, runner=None, enable_vt=None):
 
 
 def cmd_hook(args, stdin=None, stdout=None, env=None, timeout=HOOK_CLIENT_TIMEOUT):
-    """`herdr_remote.py hook <claude|codex>`: 에이전트 훅이 부른다. stdin의 훅 JSON을 로컬 서버에 넘기고
+    """`sheltie.py hook <claude|codex>`: 에이전트 훅이 부른다. stdin의 훅 JSON을 로컬 서버에 넘기고
     서버 응답(JSON)을 그대로 stdout에 쓴다. herdr 안(HC_TERMINAL_ID)이거나 서버가 꺼져 있거나 어떤 오류든
     아무것도 쓰지 않고 0으로 끝난다 → 에이전트가 평소 터미널 대화상자를 띄운다. 로그 파일은 열지 않는다."""
     env = os.environ if env is None else env
@@ -9694,7 +9694,7 @@ def main(argv=None):
         return cmd_test_push()
     if cmd == "pair":
         return cmd_pair()
-    print("사용법: herdr_remote.py [init|serve|test-push|pair|hook <claude|codex>]", file=sys.stderr)
+    print("사용법: sheltie.py [init|serve|test-push|pair|hook <claude|codex>]", file=sys.stderr)
     return 2
 
 

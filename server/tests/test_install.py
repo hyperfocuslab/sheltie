@@ -14,7 +14,7 @@ INSTALL = os.path.join(ROOT, "install.sh")
 STUB_SERVER = '''#!/usr/bin/env python3
 import json, os, sys
 cmd = sys.argv[1] if len(sys.argv) > 1 else "serve"
-p = os.path.expanduser("~/.config/herdr-remote/config.json")
+p = os.path.expanduser("~/.config/sheltie/config.json")
 if cmd == "init":
     if not os.path.exists(p):
         os.makedirs(os.path.dirname(p), exist_ok=True)
@@ -75,9 +75,9 @@ class InstallTest(unittest.TestCase):
 
     def run_install(self, *args, **extra):
         env = {"HOME": self.home, "PATH": self.bin + ":/usr/bin:/bin", "FAKE_LOG": self.log,
-               "TS_SERVE_FILE": self.ts_serve_file, "HERDR_REMOTE_SRC": self.stub,
-               "HERDR_REMOTE_HEALTH_TRIES": "2", "TS_SERVE_JSON": self.ts_serve_json,
-               "HERDR_REMOTE_SYS_AGENTS_DIR": self.sys_dir}
+               "TS_SERVE_FILE": self.ts_serve_file, "SHELTIE_SRC": self.stub,
+               "SHELTIE_HEALTH_TRIES": "2", "TS_SERVE_JSON": self.ts_serve_json,
+               "SHELTIE_SYS_AGENTS_DIR": self.sys_dir}
         env.update(extra)
         return subprocess.run(["sh", INSTALL] + list(args), env=env, capture_output=True, text=True, timeout=60)
 
@@ -86,7 +86,7 @@ class InstallTest(unittest.TestCase):
             return [l.strip() for l in f if l.strip()]
 
     def plist(self):
-        return os.path.join(self.home, "Library/LaunchAgents/com.hyperfocuslab.herdr-remote.plist")
+        return os.path.join(self.home, "Library/LaunchAgents/com.hyperfocuslab.sheltie.plist")
 
     def test_normal_install_order(self):
         r = self.run_install()
@@ -101,14 +101,14 @@ class InstallTest(unittest.TestCase):
         self.assertIn("launchctl bootstrap gui/%s %s" % (uid, self.plist()), c)
         self.assertIn("tailscale serve --bg --https=8790 http://127.0.0.1:8790", c)
         self.assertIn("PAIR-OK", r.stdout)
-        server = os.path.join(self.home, ".local/share/herdr-remote/herdr_remote.py")
+        server = os.path.join(self.home, ".local/share/sheltie/sheltie.py")
         self.assertEqual(stat.S_IMODE(os.stat(server).st_mode), 0o755)
         text = read(self.plist())
         self.assertIn("<string>%s</string><string>serve</string>" % server, text)
-        self.assertIn(os.path.join(self.home, "Library/Logs/herdr-remote.log"), text)
+        self.assertIn(os.path.join(self.home, "Library/Logs/sheltie.log"), text)
         self.assertIn(self.bin, text)  # hc 위치가 PATH에 들어간다
         self.assertNotRegex(text, r"@[A-Z]+@")
-        cfg = read_json(os.path.join(self.home, ".config/herdr-remote/config.json"))
+        cfg = read_json(os.path.join(self.home, ".config/sheltie/config.json"))
         self.assertEqual(cfg["hc_path"], os.path.join(self.bin, "hc"))
 
     def test_health_sends_token_via_stdin_not_argv(self):
@@ -118,15 +118,15 @@ class InstallTest(unittest.TestCase):
         self.assertNotIn("tok-0123456789", " ".join(curl))
 
     def test_custom_port(self):
-        r = self.run_install(HERDR_REMOTE_PORT="18790")
+        r = self.run_install(SHELTIE_PORT="18790")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("tailscale serve --bg --https=18790 http://127.0.0.1:18790", self.calls())
-        cfg = read_json(os.path.join(self.home, ".config/herdr-remote/config.json"))
+        cfg = read_json(os.path.join(self.home, ".config/sheltie/config.json"))
         self.assertEqual(cfg["port"], 18790)
 
     def test_bad_port_rejected(self):
         for bad in ("abc", "0", "70000", "80;rm"):
-            r = self.run_install(HERDR_REMOTE_PORT=bad)
+            r = self.run_install(SHELTIE_PORT=bad)
             self.assertEqual(r.returncode, 2, bad)
 
     def test_no_hc(self):
@@ -135,12 +135,12 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
         self.assertIn("herdr-core 없이 설치한다", r.stdout)
         self.assertTrue(os.path.exists(self.plist()))
-        cfg = read_json(os.path.join(self.home, ".config/herdr-remote/config.json"))
+        cfg = read_json(os.path.join(self.home, ".config/sheltie/config.json"))
         self.assertEqual(cfg["hc_path"], "")
 
     def test_no_tailscale(self):
         os.remove(os.path.join(self.bin, "tailscale"))
-        r = self.run_install(HERDR_REMOTE_TAILSCALE="/nonexistent/tailscale")
+        r = self.run_install(SHELTIE_TAILSCALE="/nonexistent/tailscale")
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("tailscale", r.stderr)
         self.assertIn("설치", r.stderr)
@@ -171,7 +171,7 @@ class InstallTest(unittest.TestCase):
 
     def test_rerun_idempotent(self):
         self.assertEqual(self.run_install().returncode, 0)
-        cfg_path = os.path.join(self.home, ".config/herdr-remote/config.json")
+        cfg_path = os.path.join(self.home, ".config/sheltie/config.json")
         tok = read_json(cfg_path)["token"]
         first = read(self.plist())
         with open(self.ts_serve_file, "w") as f:
@@ -186,14 +186,14 @@ class InstallTest(unittest.TestCase):
     def test_rerun_with_system_plist_keeps_service(self):
         # 외장 홈 맥: sudo로 /Library/LaunchAgents에 둔 뒤 재실행하면 bootout 없이 kickstart만
         os.makedirs(self.sys_dir)
-        with open(os.path.join(self.sys_dir, "com.hyperfocuslab.herdr-remote.plist"), "w") as f:
+        with open(os.path.join(self.sys_dir, "com.hyperfocuslab.sheltie.plist"), "w") as f:
             f.write("<plist/>")
         r = self.run_install()
         self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
         c = self.calls()
         uid = str(os.getuid())
         launch = [x for x in c if x.startswith("launchctl")]
-        self.assertEqual(launch, ["launchctl kickstart -k gui/%s/com.hyperfocuslab.herdr-remote" % uid])
+        self.assertEqual(launch, ["launchctl kickstart -k gui/%s/com.hyperfocuslab.sheltie" % uid])
         self.assertFalse(os.path.exists(self.plist()))
         i_kick = c.index(launch[0])
         i_serve = next(i for i, x in enumerate(c) if x.startswith("tailscale serve --bg"))
@@ -203,7 +203,7 @@ class InstallTest(unittest.TestCase):
 
     def test_system_plist_kickstart_failure(self):
         os.makedirs(self.sys_dir)
-        with open(os.path.join(self.sys_dir, "com.hyperfocuslab.herdr-remote.plist"), "w") as f:
+        with open(os.path.join(self.sys_dir, "com.hyperfocuslab.sheltie.plist"), "w") as f:
             f.write("<plist/>")
         r = self.run_install(LAUNCHCTL_RC="3")
         self.assertNotEqual(r.returncode, 0)
@@ -238,7 +238,7 @@ class InstallTest(unittest.TestCase):
         self.assertTrue(any(x.startswith("launchctl bootout") for x in c))
         self.assertIn("tailscale serve --https=8790 off", c)
         self.assertFalse(os.path.exists(self.plist()))
-        self.assertTrue(os.path.exists(os.path.join(self.home, ".config/herdr-remote/config.json")))
+        self.assertTrue(os.path.exists(os.path.join(self.home, ".config/sheltie/config.json")))
 
     def test_dry_run_changes_nothing(self):
         r = self.run_install("--dry-run")
@@ -257,8 +257,8 @@ class InstallTest(unittest.TestCase):
         os.makedirs(lone)
         shutil.copy(INSTALL, lone)
         env = {"HOME": self.home, "PATH": self.bin + ":/usr/bin:/bin", "FAKE_LOG": self.log,
-               "TS_SERVE_FILE": self.ts_serve_file, "HERDR_REMOTE_SRC": self.stub, "HERDR_REMOTE_HEALTH_TRIES": "2",
-               "TS_SERVE_JSON": self.ts_serve_json, "HERDR_REMOTE_SYS_AGENTS_DIR": self.sys_dir}
+               "TS_SERVE_FILE": self.ts_serve_file, "SHELTIE_SRC": self.stub, "SHELTIE_HEALTH_TRIES": "2",
+               "TS_SERVE_JSON": self.ts_serve_json, "SHELTIE_SYS_AGENTS_DIR": self.sys_dir}
         r = subprocess.run(["sh", os.path.join(lone, "install.sh")], env=env, capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(read(self.plist()), with_tpl)
@@ -268,8 +268,8 @@ class InstallTest(unittest.TestCase):
         os.makedirs(lone, exist_ok=True)
         shutil.copy(INSTALL, lone)
         env = {"HOME": self.home, "PATH": self.bin + ":/usr/bin:/bin", "FAKE_LOG": self.log,
-               "TS_SERVE_FILE": self.ts_serve_file, "HERDR_REMOTE_HEALTH_TRIES": "2", "STUB_SRC": self.stub,
-               "TS_SERVE_JSON": self.ts_serve_json, "HERDR_REMOTE_SYS_AGENTS_DIR": self.sys_dir}
+               "TS_SERVE_FILE": self.ts_serve_file, "SHELTIE_HEALTH_TRIES": "2", "STUB_SRC": self.stub,
+               "TS_SERVE_JSON": self.ts_serve_json, "SHELTIE_SYS_AGENTS_DIR": self.sys_dir}
         env.update(extra)
         return subprocess.run(["sh", os.path.join(lone, "install.sh")], env=env, capture_output=True, text=True)
 
@@ -280,22 +280,22 @@ class InstallTest(unittest.TestCase):
         self.fake("curl", self.FAKE_CURL_DL)
         r = self.lone_install()
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertTrue(any("https://raw.githubusercontent.com/" in x and x.endswith("server/herdr_remote.py")
+        self.assertTrue(any("https://raw.githubusercontent.com/" in x and x.endswith("server/sheltie.py")
                             for x in self.calls()))
 
     def test_piped_from_folder_with_server_file_still_uses_github(self):
         # curl | sh 는 $0이 "sh"라서, 서버 파일이 있는 폴더(이 저장소 루트)에서 돌려도 그 파일을 쓰면 안 된다.
         self.fake("curl", self.FAKE_CURL_DL)
         env = {"HOME": self.home, "PATH": self.bin + ":/usr/bin:/bin", "FAKE_LOG": self.log,
-               "TS_SERVE_FILE": self.ts_serve_file, "HERDR_REMOTE_HEALTH_TRIES": "2", "STUB_SRC": self.stub,
-               "TS_SERVE_JSON": self.ts_serve_json, "HERDR_REMOTE_SYS_AGENTS_DIR": self.sys_dir}
+               "TS_SERVE_FILE": self.ts_serve_file, "SHELTIE_HEALTH_TRIES": "2", "STUB_SRC": self.stub,
+               "TS_SERVE_JSON": self.ts_serve_json, "SHELTIE_SYS_AGENTS_DIR": self.sys_dir}
         r = subprocess.run(["sh", "-s"], input=read(INSTALL), cwd=ROOT, env=env, capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertTrue(any("https://raw.githubusercontent.com/" in x and x.endswith("server/herdr_remote.py")
+        self.assertTrue(any("https://raw.githubusercontent.com/" in x and x.endswith("server/sheltie.py")
                             for x in self.calls()))
 
     def test_http_source_rejected(self):
-        r = self.lone_install(HERDR_REMOTE_SRC="http://example.invalid/herdr_remote.py")
+        r = self.lone_install(SHELTIE_SRC="http://example.invalid/sheltie.py")
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("https", r.stderr)
         self.assertFalse(any(x.startswith("launchctl") for x in self.calls()))
@@ -305,7 +305,7 @@ class InstallTest(unittest.TestCase):
         r = self.lone_install()
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("비어", r.stderr)
-        self.assertFalse(os.path.exists(os.path.join(self.home, ".local/share/herdr-remote/herdr_remote.py")))
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".local/share/sheltie/sheltie.py")))
 
     def test_syntax_error_download_aborts(self):
         self.fake("curl", 'while [ $# -gt 0 ]; do [ "$1" = -o ] && echo "def (" > "$2"; shift; done; exit 0')
@@ -323,9 +323,9 @@ class InstallTest(unittest.TestCase):
     def test_url_src_uses_curl(self):
         # 가짜 curl이 -o 파일을 만들어 준다.
         self.fake("curl", self.FAKE_CURL_DL)
-        r = self.run_install(HERDR_REMOTE_SRC="https://example.invalid/herdr_remote.py", STUB_SRC=self.stub)
+        r = self.run_install(SHELTIE_SRC="https://example.invalid/sheltie.py", STUB_SRC=self.stub)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertTrue(any("https://example.invalid/herdr_remote.py" in x for x in self.calls()))
+        self.assertTrue(any("https://example.invalid/sheltie.py" in x for x in self.calls()))
 
 
 HOOK_EVENTS_CLAUDE = {"PermissionRequest", "PreToolUse", "SessionStart", "SessionEnd", "UserPromptSubmit", "Stop"}
@@ -340,7 +340,7 @@ class InstallHooksTest(InstallTest):
         super().setUp()
         self.claude = os.path.join(self.home, ".claude")
         self.codex = os.path.join(self.home, ".codex")
-        self.server = os.path.join(self.home, ".local/share/herdr-remote/herdr_remote.py")
+        self.server = os.path.join(self.home, ".local/share/sheltie/sheltie.py")
 
     def cmd(self, agent):
         return '"%s" "%s" hook %s' % (self.py(), self.server, agent)
@@ -360,7 +360,7 @@ class InstallHooksTest(InstallTest):
         return os.path.join(self.codex, "hooks.json")
 
     def ours(self, groups):
-        return [h for g in groups for h in g["hooks"] if "herdr_remote.py\" hook " in h["command"]]
+        return [h for g in groups for h in g["hooks"] if "sheltie.py\" hook " in h["command"]]
 
     def test_fresh_install_creates_both(self):
         os.makedirs(self.claude)
@@ -419,7 +419,7 @@ class InstallHooksTest(InstallTest):
         first = read(self.settings())
         # 예전 경로로 등록된 우리 항목은 새 경로로 교체된다(중복 금지)
         c = read_json(self.settings())
-        c["hooks"]["Stop"][0]["hooks"][0]["command"] = '"/old/python3" "/old/herdr_remote.py" hook claude'
+        c["hooks"]["Stop"][0]["hooks"][0]["command"] = '"/old/python3" "/old/sheltie.py" hook claude'
         c["hooks"]["Stop"].insert(0, {"hooks": [{"type": "command", "command": "mine.sh"}]})
         self.write_json(self.settings(), c)
         r = self.run_install()
@@ -434,7 +434,7 @@ class InstallHooksTest(InstallTest):
         # 그대로면 파일이 안 바뀐다
         self.run_install()
         self.assertEqual(len(self.ours(read_json(self.settings())["hooks"]["Stop"])), 1)
-        self.assertEqual(first.count("herdr_remote.py"), 6)
+        self.assertEqual(first.count("sheltie.py"), 6)
 
     def test_broken_json_untouched_install_continues(self):
         os.makedirs(self.claude)
@@ -509,8 +509,272 @@ class InstallHooksTest(InstallTest):
         self.assertEqual(block(INSTALL), block(os.path.join(ROOT, "install.ps1")))
 
 
+OLD_LABEL = "com.hyperfocuslab.herdr-remote"  # 이전 설치 이름: 옮기기 시험용
+
+
+@unittest.skipIf(os.name == "nt", "맥 전용")
+class InstallMigrateTest(InstallTest):
+    """이전 설치(옛 경로)가 있는 가짜 HOME에서 설치·해제. 부모 테스트는 상속만 하므로 비운다."""
+
+    def setUp(self):
+        super().setUp()
+        h = self.home
+        self.old_plist = os.path.join(h, "Library/LaunchAgents", OLD_LABEL + ".plist")
+        self.old_data = os.path.join(h, ".local/share/herdr-remote")
+        self.old_cfg_dir = os.path.join(h, ".config/herdr-remote")
+        self.old_log = os.path.join(h, "Library/Logs/herdr-remote.log")
+        self.new_cfg_dir = os.path.join(h, ".config/sheltie")
+        self.old_server = os.path.join(self.old_data, "herdr_remote.py")
+
+    def make_old_install(self, hooks=True):
+        for d in (os.path.dirname(self.old_plist), self.old_data, os.path.dirname(self.old_log)):
+            os.makedirs(d, exist_ok=True)
+        os.makedirs(self.old_cfg_dir, mode=0o700)
+        os.chmod(self.old_cfg_dir, 0o700)
+        for p in (self.old_plist, os.path.join(self.old_data, OLD_LABEL + ".plist")):
+            with open(p, "w") as f:
+                f.write("<plist/>")
+        with open(self.old_server, "w") as f:
+            f.write("# old\n")
+        with open(self.old_log, "w") as f:
+            f.write("old log line\n")
+        cfg = {"token": "tok-OLD-keep-this-token-000", "port": 8790, "hc_path": "x",
+               "apns_key_path": "~/.config/herdr-remote/AuthKey.p8",
+               "extra_abs": os.path.join(self.old_cfg_dir, "sub/file"),
+               "unrelated": "~/.config/herdr-remote-other/x"}
+        self.write_secret(os.path.join(self.old_cfg_dir, "config.json"), json.dumps(cfg))
+        self.write_secret(os.path.join(self.old_cfg_dir, "devices.json"), json.dumps([{"token": "dev1"}]))
+        self.write_secret(os.path.join(self.old_cfg_dir, "AuthKey.p8"), "KEY")
+        if hooks:
+            old_cmd = '"/usr/bin/python3" "%s" hook claude' % self.old_server
+            settings = os.path.join(self.home, ".claude/settings.json")
+            os.makedirs(os.path.dirname(settings))
+            with open(settings, "w") as f:
+                json.dump({"hooks": {
+                    "Stop": [{"hooks": [{"type": "command", "command": "mine.sh"}]},
+                             {"hooks": [{"type": "command", "command": old_cmd, "timeout": 10}]}],
+                    "PermissionRequest": [{"matcher": "*", "hooks": [{"type": "command", "command": old_cmd}]}]}}, f)
+
+    def write_secret(self, p, text):
+        fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+
+    def snapshot(self):
+        out = {}
+        for root, dirs, files in os.walk(self.home):
+            for n in dirs + files:
+                p = os.path.join(root, n)
+                st = os.lstat(p)
+                out[p] = (stat.S_IMODE(st.st_mode), read(p) if os.path.isfile(p) else None)
+        return out
+
+    def test_install_moves_old_install(self):
+        self.make_old_install()
+        r = self.run_install()
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        uid = str(os.getuid())
+        c = self.calls()
+        i_old = c.index("launchctl bootout gui/%s/%s" % (uid, OLD_LABEL))
+        i_new = c.index("launchctl bootstrap gui/%s %s" % (uid, self.plist()))
+        self.assertLess(i_old, i_new)
+        # 설정·토큰·기기 목록·키가 새 폴더로 옮겨지고 권한이 유지된다
+        cfg = read_json(os.path.join(self.new_cfg_dir, "config.json"))
+        self.assertEqual(cfg["token"], "tok-OLD-keep-this-token-000")
+        self.assertEqual(cfg["apns_key_path"], "~/.config/sheltie/AuthKey.p8")
+        self.assertEqual(cfg["extra_abs"], os.path.join(self.new_cfg_dir, "sub/file"))
+        self.assertEqual(cfg["unrelated"], "~/.config/herdr-remote-other/x")
+        self.assertEqual(cfg["hc_path"], os.path.join(self.bin, "hc"))
+        self.assertEqual(read_json(os.path.join(self.new_cfg_dir, "devices.json")), [{"token": "dev1"}])
+        self.assertEqual(read(os.path.join(self.new_cfg_dir, "AuthKey.p8")), "KEY")
+        self.assertEqual(stat.S_IMODE(os.stat(self.new_cfg_dir).st_mode), 0o700)
+        for n in ("config.json", "devices.json", "AuthKey.p8"):
+            self.assertEqual(stat.S_IMODE(os.stat(os.path.join(self.new_cfg_dir, n)).st_mode), 0o600, n)
+        # 이전 서비스·설치 폴더·설정 폴더·로그가 없어진다
+        for p in (self.old_plist, self.old_data, self.old_cfg_dir, self.old_log):
+            self.assertFalse(os.path.exists(p), p)
+        self.assertIn("old log line", read(os.path.join(self.home, "Library/Logs/sheltie.log")))
+        self.assertTrue(os.path.exists(self.plist()))
+        # 이전 훅 항목은 새 항목으로 바뀌고 사용자 훅은 남는다
+        settings = os.path.join(self.home, ".claude/settings.json")
+        text = read(settings)
+        self.assertNotIn("herdr_remote.py", text)
+        s = read_json(settings)
+        new_cmd = '"%s" "%s" hook claude' % (os.path.join(self.bin, "python3"),
+                                              os.path.join(self.home, ".local/share/sheltie/sheltie.py"))
+        stop = [h["command"] for g in s["hooks"]["Stop"] for h in g["hooks"]]
+        self.assertEqual(stop, ["mine.sh", new_cmd])
+        self.assertEqual([h["command"] for g in s["hooks"]["PermissionRequest"] for h in g["hooks"]], [new_cmd])
+        self.assertIn("훅 갱신", r.stdout)
+        # 다시 설치해도 그대로
+        open(self.log, "w").close()
+        r = self.run_install()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("launchctl bootout gui/%s/%s" % (uid, OLD_LABEL), self.calls())
+        self.assertEqual(read_json(os.path.join(self.new_cfg_dir, "config.json"))["token"], "tok-OLD-keep-this-token-000")
+
+    def test_existing_new_config_is_not_overwritten(self):
+        self.make_old_install(hooks=False)
+        os.makedirs(self.new_cfg_dir)
+        self.write_secret(os.path.join(self.new_cfg_dir, "config.json"),
+                          json.dumps({"token": "tok-NEW-0000000000000000", "port": 8790}))
+        r = self.run_install()
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertIn("옮기지 않고", r.stdout)
+        self.assertEqual(read_json(os.path.join(self.new_cfg_dir, "config.json"))["token"], "tok-NEW-0000000000000000")
+        self.assertEqual(read_json(os.path.join(self.old_cfg_dir, "config.json"))["token"], "tok-OLD-keep-this-token-000")
+        self.assertTrue(os.path.exists(os.path.join(self.old_cfg_dir, "AuthKey.p8")))
+        self.assertFalse(os.path.exists(self.old_plist))
+        self.assertFalse(os.path.exists(self.old_data))
+
+    def test_move_failure_keeps_everything(self):
+        self.make_old_install()
+        before_settings = read(os.path.join(self.home, ".claude/settings.json"))
+        parent = os.path.dirname(self.old_cfg_dir)
+        os.chmod(parent, 0o500)  # ~/.config에 쓸 수 없으면 rename이 실패한다
+        try:
+            r = self.run_install()
+        finally:
+            os.chmod(parent, 0o755)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("아무것도 지우지 않았다", r.stderr)
+        self.assertEqual(read_json(os.path.join(self.old_cfg_dir, "config.json"))["token"], "tok-OLD-keep-this-token-000")
+        self.assertTrue(os.path.exists(os.path.join(self.old_cfg_dir, "devices.json")))
+        self.assertFalse(os.path.exists(self.new_cfg_dir))
+        for p in (self.old_plist, self.old_server, self.old_log):
+            self.assertTrue(os.path.exists(p), p)
+        self.assertEqual(read(os.path.join(self.home, ".claude/settings.json")), before_settings)
+        uid = str(os.getuid())
+        c = self.calls()
+        self.assertIn("launchctl bootstrap gui/%s %s" % (uid, self.old_plist), c)  # 이전 서비스를 되살린다
+        self.assertFalse(os.path.exists(self.plist()))
+        self.assertFalse(any(x.startswith("tailscale serve --bg") for x in c))
+
+    def test_old_system_plist_prints_sudo_and_continues(self):
+        self.make_old_install(hooks=False)
+        os.remove(self.old_plist)
+        os.makedirs(self.sys_dir)
+        sys_old = os.path.join(self.sys_dir, OLD_LABEL + ".plist")
+        with open(sys_old, "w") as f:
+            f.write("<plist/>")
+        r = self.run_install()
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertIn("sudo rm '%s'" % sys_old, r.stdout)
+        self.assertTrue(os.path.exists(sys_old), "sudo가 필요한 파일은 지우지 않는다")
+        self.assertIn("launchctl bootout gui/%s/%s" % (os.getuid(), OLD_LABEL), self.calls())
+        self.assertTrue(os.path.exists(self.plist()), "새 서비스는 사용자 위치에 설치된다")
+
+    def test_uninstall_also_removes_old_service(self):
+        self.make_old_install()
+        r = self.run_install("--uninstall")
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        uid = str(os.getuid())
+        c = self.calls()
+        self.assertIn("launchctl bootout gui/%s/%s" % (uid, OLD_LABEL), c)
+        self.assertIn("tailscale serve --https=8790 off", c)
+        self.assertFalse(os.path.exists(self.old_plist))
+        self.assertFalse(os.path.exists(os.path.join(self.old_data, OLD_LABEL + ".plist")))
+        self.assertTrue(os.path.exists(os.path.join(self.old_cfg_dir, "config.json")), "설정과 토큰은 남긴다")
+        self.assertIn(self.old_cfg_dir, r.stdout)
+        s = read_json(os.path.join(self.home, ".claude/settings.json"))
+        self.assertEqual(s, {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "mine.sh"}]}]}})
+
+    def assert_old_untouched(self):
+        for p in (self.old_plist, self.old_server, self.old_log, os.path.join(self.old_cfg_dir, "devices.json")):
+            self.assertTrue(os.path.exists(p), p)
+        self.assertEqual(read_json(os.path.join(self.old_cfg_dir, "config.json"))["token"], "tok-OLD-keep-this-token-000")
+        self.assertFalse(os.path.exists(self.new_cfg_dir))
+
+    def test_download_failure_leaves_old_install(self):
+        # 새 서버 파일을 못 받으면 이전 설치는 하나도 건드리지 않는다
+        self.make_old_install()
+        r = self.run_install(SHELTIE_SRC=os.path.join(self.tmp, "missing.py"))
+        self.assertNotEqual(r.returncode, 0)
+        self.assert_old_untouched()
+        self.assertFalse(any(x.startswith("launchctl") for x in self.calls()), self.calls())
+        self.assertIn("herdr_remote.py", read(os.path.join(self.home, ".claude/settings.json")))
+
+    def test_bootstrap_failure_keeps_old_files(self):
+        # 새 서비스가 안 뜨면 이전 plist·설치 폴더·로그는 지우지 않는다(설정은 새 위치로 옮겨져 있다)
+        self.make_old_install()
+        r = self.run_install(LAUNCHCTL_RC="1")
+        self.assertEqual(r.returncode, 5, r.stderr + r.stdout)
+        for p in (self.old_plist, self.old_server, self.old_log):
+            self.assertTrue(os.path.exists(p), p)
+        self.assertEqual(read_json(os.path.join(self.new_cfg_dir, "config.json"))["token"], "tok-OLD-keep-this-token-000")
+
+    def test_no_hooks_keeps_old_server_file(self):
+        # 훅이 아직 이전 서버 파일을 부르면 그 파일(이전 설치 폴더)은 지우지 않고 경고한다
+        self.make_old_install()
+        r = self.run_install("--no-hooks")
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertTrue(os.path.exists(self.old_server))
+        self.assertFalse(os.path.exists(self.old_plist))
+        self.assertFalse(os.path.exists(os.path.join(self.old_data, OLD_LABEL + ".plist")))
+        self.assertIn(os.path.join(self.home, ".claude/settings.json"), r.stderr)
+        self.assertIn(self.old_data, r.stderr)
+
+    def test_broken_hooks_file_keeps_old_server_file(self):
+        self.make_old_install(hooks=False)
+        codex = os.path.join(self.home, ".codex")
+        os.makedirs(codex)
+        with open(os.path.join(codex, "hooks.json"), "w") as f:
+            f.write('{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "\\"%s\\" hook codex"}]}], '
+                    '"Custom": "x"}}' % self.old_server)
+        r = self.run_install()
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertTrue(os.path.exists(self.old_server))
+        self.assertIn(os.path.join(codex, "hooks.json"), r.stderr)
+
+    def test_symlinked_old_config_stops_install(self):
+        # 이전 설정 폴더가 링크면 옮기지 않고(새 토큰을 만들지 않고) 멈춘다
+        self.make_old_install()
+        real = os.path.join(self.tmp, "dotfiles-cfg")
+        os.rename(self.old_cfg_dir, real)
+        os.symlink(real, self.old_cfg_dir)
+        r = self.run_install()
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("링크", r.stderr)
+        self.assertTrue(os.path.islink(self.old_cfg_dir))
+        self.assertFalse(os.path.lexists(self.new_cfg_dir))
+        self.assertTrue(os.path.exists(self.old_plist))
+        self.assertTrue(os.path.exists(self.old_server))
+        self.assertFalse(any(x.startswith("launchctl") for x in self.calls()), self.calls())
+
+    def test_move_failure_restores_system_old_service(self):
+        self.make_old_install(hooks=False)
+        os.remove(self.old_plist)
+        os.makedirs(self.sys_dir)
+        sys_old = os.path.join(self.sys_dir, OLD_LABEL + ".plist")
+        with open(sys_old, "w") as f:
+            f.write("<plist/>")
+        parent = os.path.dirname(self.old_cfg_dir)
+        os.chmod(parent, 0o500)
+        try:
+            r = self.run_install()
+        finally:
+            os.chmod(parent, 0o755)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("launchctl bootstrap gui/%s %s" % (os.getuid(), sys_old), self.calls())
+        self.assertTrue(os.path.exists(self.old_server))
+
+    def test_dry_run_with_old_install_changes_nothing(self):
+        self.make_old_install()
+        before = self.snapshot()
+        r = self.run_install("--dry-run")
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertIn("+ launchctl bootout gui/%s/%s" % (os.getuid(), OLD_LABEL), r.stdout)
+        self.assertIn("+ mv %s %s" % (self.old_cfg_dir, self.new_cfg_dir), r.stdout)
+        self.assertIn("+ rm -rf %s" % self.old_data, r.stdout)
+        self.assertEqual(self.snapshot(), before)
+        self.assertFalse(any(x.startswith(("launchctl", "curl")) for x in self.calls()))
+        r = self.run_install("--uninstall", "--dry-run")
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertEqual(self.snapshot(), before)
+
 for _n in [n for n in dir(InstallTest) if n.startswith("test_")]:
     setattr(InstallHooksTest, _n, None)  # 상속된 기존 테스트는 InstallTest에서 이미 돈다
+    setattr(InstallMigrateTest, _n, None)
 
 
 if __name__ == "__main__":

@@ -6,8 +6,8 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, ".."))
 sys.path.insert(0, HERE)
-import herdr_remote as hr  # noqa: E402
-from test_herdr_remote import make_app, st  # noqa: E402
+import sheltie as hr  # noqa: E402
+from test_sheltie import make_app, st  # noqa: E402
 
 hr.log.addHandler(logging.NullHandler())
 hr.log.propagate = False

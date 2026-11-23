@@ -19,7 +19,7 @@ import urllib.request
 from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-import herdr_remote as hr  # noqa: E402
+import sheltie as hr  # noqa: E402
 
 hr.log.addHandler(logging.NullHandler())
 hr.log.propagate = False
@@ -527,7 +527,7 @@ class ApnsTests(unittest.TestCase):
 
     @unittest.skipUnless(_openssl_bins(), "openssl 없음")
     def test_real_openssl_jwt_verifies(self):
-        base = os.path.expanduser("~/Documents/github/_scratch/herdr-remote")
+        base = os.path.expanduser("~/Documents/github/_scratch/sheltie")
         os.makedirs(base, exist_ok=True)
         tmp = tempfile.mkdtemp(dir=base)
         try:
@@ -1545,7 +1545,7 @@ class QrTests(unittest.TestCase):
 
     @unittest.skipUnless(_zbarimg(), "zbarimg 없음(brew install zbar)")
     def test_zbar_decodes(self):
-        base = os.path.expanduser("~/Documents/github/_scratch/herdr-remote")
+        base = os.path.expanduser("~/Documents/github/_scratch/sheltie")
         os.makedirs(base, exist_ok=True)
         tmp = tempfile.mkdtemp(dir=base)
         try:

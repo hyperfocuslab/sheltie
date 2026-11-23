@@ -9,8 +9,8 @@ import threading
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-import herdr_remote as hr  # noqa: E402
-import test_herdr_remote as base  # noqa: E402 - 가짜 hc·중계·HTTP 도우미 재사용
+import sheltie as hr  # noqa: E402
+import test_sheltie as base  # noqa: E402 - 가짜 hc·중계·HTTP 도우미 재사용
 
 TOKEN = base.TOKEN
 SIG = base.SIG

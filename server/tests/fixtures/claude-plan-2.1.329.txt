@@ -15,7 +15,7 @@
 
    변경
 
-   - 파일: /Users/dev/Documents/github/_scratch/herdr-remote/hrtest/hello.txt
+   - 파일: /Users/dev/Documents/github/_scratch/sheltie/hrtest/hello.txt
    - 내용 hi\n → bye\n (Write로 덮어쓰기)
 
    검증

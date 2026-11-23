@@ -11,7 +11,7 @@ from unittest import mock
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, ".."))
 sys.path.insert(0, HERE)
-import herdr_remote as hr  # noqa: E402
+import sheltie as hr  # noqa: E402
 
 hr.log.addHandler(logging.NullHandler())
 hr.log.propagate = False
@@ -35,7 +35,7 @@ class WinCase(unittest.TestCase):
 class DefaultsTests(WinCase):
     def test_log_path_localappdata(self):
         with mock.patch.dict(os.environ, {"LOCALAPPDATA": "/L"}):
-            self.assertEqual(hr.default_log_path(), os.path.join("/L", "herdr-remote", "herdr-remote.log"))
+            self.assertEqual(hr.default_log_path(), os.path.join("/L", "sheltie", "sheltie.log"))
             self.assertEqual(hr.default_hc_path(), os.path.join("/L", "Programs", "herdr-core", "hc.exe"))
 
     def test_log_file_is_utf8(self):
@@ -54,7 +54,7 @@ class DefaultsTests(WinCase):
 
     def test_mac_defaults_unchanged(self):
         with mock.patch.object(hr, "IS_WINDOWS", False):
-            self.assertEqual(hr.default_log_path(), "~/Library/Logs/herdr-remote.log")
+            self.assertEqual(hr.default_log_path(), "~/Library/Logs/sheltie.log")
             self.assertEqual(hr.default_hc_path(), "~/.local/bin/hc")
             self.assertEqual(hr.subprocess_kwargs(text=True), {})
 

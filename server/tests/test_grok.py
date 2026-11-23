@@ -10,7 +10,7 @@ import unittest
 import urllib.parse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from test_herdr_remote import ev, fixture, make_app, hr  # noqa: E402
+from test_sheltie import ev, fixture, make_app, hr  # noqa: E402
 
 V = "1.0.77"
 APP = "grok"

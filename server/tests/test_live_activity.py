@@ -7,8 +7,8 @@ import threading
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-import herdr_remote as hr  # noqa: E402
-import test_herdr_remote as base  # noqa: E402
+import sheltie as hr  # noqa: E402
+import test_sheltie as base  # noqa: E402
 
 DEV = "aa" * 32
 ACT = "cc" * 32

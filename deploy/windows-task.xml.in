@@ -2,7 +2,7 @@
 <!-- install.ps1이 @…@ 자리를 채워 UTF-16으로 저장하고 schtasks /Create /XML로 등록한다. install.ps1 안의 내장 사본과 같아야 한다(테스트가 비교). -->
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
-    <Description>Sheltie herdr-remote 서버. 로그온하면 데스크톱 세션에서 시작한다.</Description>
+    <Description>Sheltie 서버. 로그온하면 데스크톱 세션에서 시작한다.</Description>
   </RegistrationInfo>
   <Triggers>
     <LogonTrigger>

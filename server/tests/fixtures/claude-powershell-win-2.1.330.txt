@@ -1,7 +1,7 @@
 
  ▐▛███▛█   Claude Code v2.1.330
 ▝▜██████▀  Opus 5.5 · Claude Ultra
- ▝▝   ▝▝   ~\Documents\github\_scratch\herdr-remote\hctest
+ ▝▝   ▝▝   ~\Documents\github\_scratch\sheltie\hctest
 
   Fable 5.2 is here for your longest and toughest coding tasks. It draws down usage faster than Opus 5.5. Switch with
   /model.

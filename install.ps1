@@ -1,11 +1,11 @@
-# herdr-remote installer (Windows). Usage: powershell -File install.ps1 [-DryRun] [-Uninstall] [-NoHooks] [-Help]
-#   Via irm | iex no arguments can be passed: use HERDR_REMOTE_UNINSTALL=1 / HERDR_REMOTE_DRY_RUN=1 instead.
-#   Env: HERDR_REMOTE_SRC (server file https URL or local path; default: server\ next to this file, else GitHub raw),
-#   HERDR_REMOTE_HC (hc.exe path), HERDR_REMOTE_PORT (default 8790), HERDR_REMOTE_PYTHON (python.exe path),
-#   HERDR_REMOTE_TAILSCALE (tailscale CLI path), HERDR_REMOTE_SKIP_TAILSCALE=1 (skip tailscale check/serve/pair; for tests),
-#   HERDR_REMOTE_HEALTH_TRIES (health check attempts, default 10), HERDR_REMOTE_STOP_WAIT (seconds to wait for the old
+# Sheltie installer (Windows). Usage: powershell -File install.ps1 [-DryRun] [-Uninstall] [-NoHooks] [-Help]
+#   Via irm | iex no arguments can be passed: use SHELTIE_UNINSTALL=1 / SHELTIE_DRY_RUN=1 instead.
+#   Env: SHELTIE_SRC (server file https URL or local path; default: server\ next to this file, else GitHub raw),
+#   SHELTIE_HC (hc.exe path), SHELTIE_PORT (default 8790), SHELTIE_PYTHON (python.exe path),
+#   SHELTIE_TAILSCALE (tailscale CLI path), SHELTIE_SKIP_TAILSCALE=1 (skip tailscale check/serve/pair; for tests),
+#   SHELTIE_HEALTH_TRIES (health check attempts, default 10), SHELTIE_STOP_WAIT (seconds to wait for the old
 #   server to free its port before killing it, default 15)
-# The server starts at logon via Task Scheduler ("Sheltie herdr-remote") in the desktop session, non-elevated.
+# The server starts at logon via Task Scheduler ("Sheltie") in the desktop session, non-elevated.
 # This file must stay pure ASCII with no BOM: irm | iex chokes on a BOM, and PS 5.1 -File reads BOM-less files as cp949.
 # User-facing Korean text lives in $MSG below as Base64 of UTF-8 bytes.
 & {
@@ -14,41 +14,47 @@
   $global:HRCode = 0
 
   # Default source of the server file. Change only this line if the repo is renamed.
-  $DEFAULT_SRC = 'https://raw.githubusercontent.com/hyperfocuslab/sheltie/main/server/herdr_remote.py'
-  $TASK = 'Sheltie herdr-remote'
+  $DEFAULT_SRC = 'https://raw.githubusercontent.com/hyperfocuslab/sheltie/main/server/sheltie.py'
+  $TASK = 'Sheltie'
   $LOCAL = $env:LOCALAPPDATA
   if (-not $LOCAL) { $LOCAL = Join-Path $env:USERPROFILE 'AppData\Local' }
-  $DATA = Join-Path $LOCAL 'herdr-remote'
-  $SERVER = Join-Path $DATA 'herdr_remote.py'
+  $DATA = Join-Path $LOCAL 'sheltie'
+  $SERVER = Join-Path $DATA 'sheltie.py'
   $TASK_COPY = Join-Path $DATA 'windows-task.xml'
-  $LOGFILE = Join-Path $DATA 'herdr-remote.log'
-  $CONFIG_DIR = Join-Path $env:USERPROFILE '.config\herdr-remote'
+  $LOGFILE = Join-Path $DATA 'sheltie.log'
+  $CONFIG_DIR = Join-Path $env:USERPROFILE '.config\sheltie'
   $CONFIG = Join-Path $CONFIG_DIR 'config.json'
+  # Previous install paths: moved and cleaned up on install.
+  $OLD_TASK = 'Sheltie herdr-remote'
+  $OLD_DATA = Join-Path $LOCAL 'herdr-remote'
+  $OLD_SERVER = Join-Path $OLD_DATA 'herdr_remote.py'
+  $OLD_CONFIG_DIR = Join-Path $env:USERPROFILE '.config\herdr-remote'
+  $OLD_SERVER_NAME = 'herdr_remote.py'
   $DRY = $false
   $MODE = 'install'
   $NOHOOKS = $false
-  Remove-Item Env:HERDR_REMOTE_CONFIG -ErrorAction SilentlyContinue
+  Remove-Item Env:SHELTIE_CONFIG -ErrorAction SilentlyContinue
 
   # ---- user-facing messages: Base64 of UTF-8 text, {0} {1} are -f placeholders. Keep keys in sync with T calls.
   # messages begin
   $MSG = @{
     xml_comment = 'PCEtLSBpbnN0YWxsLnBzMeydtCBA4oCmQCDsnpDrpqzrpbwg7LGE7JuMIFVURi0xNuycvOuhnCDsoIDsnqXtlZjqs6Agc2NodGFza3MgL0NyZWF0ZSAvWE1M66GcIOuTseuhne2VnOuLpC4gaW5zdGFsbC5wczEg7JWI7J2YIOuCtOyepSDsgqzrs7jqs7wg6rCZ7JWE7JW8IO2VnOuLpCjthYzsiqTtirjqsIAg67mE6rWQKS4gLS0+' # XML comment line
-    xml_desc = 'U2hlbHRpZSBoZXJkci1yZW1vdGUg7ISc67KELiDroZzqt7jsmKjtlZjrqbQg642w7Iqk7YGs7YaxIOyEuOyFmOyXkOyEnCDsi5zsnpHtlZzri6Qu' # task description
-    help1 = 'aGVyZHItcmVtb3RlIOyEpOy5mOq4sChXaW5kb3dzKS4g7IKs7JqpOiBwb3dlcnNoZWxsIC1GaWxlIGluc3RhbGwucHMxIFstRHJ5UnVuXSBbLVVuaW5zdGFsbF0gWy1IZWxwXQ==' # help line 1
-    help2 = 'ICBpZXjroZwg64+M66a0IOuVjOuKlCDsnbjsnpDrpbwg66q7IOyjvOuvgOuhnCBIRVJEUl9SRU1PVEVfVU5JTlNUQUxMPTEg66GcIOygnOqxsO2VoCDsiJgg7J6I64ukLg==' # help line 2
-    help3 = 'ICDtmZjqsr3rs4DsiJg6IEhFUkRSX1JFTU9URV9TUkMsIEhFUkRSX1JFTU9URV9IQywgSEVSRFJfUkVNT1RFX1BPUlQo6riw67O4IDg3OTApLCBIRVJEUl9SRU1PVEVfUFlUSE9OLA==' # help line 3
-    help4 = 'ICBIRVJEUl9SRU1PVEVfVEFJTFNDQUxFLCBIRVJEUl9SRU1PVEVfU0tJUF9UQUlMU0NBTEU9MSwgSEVSRFJfUkVNT1RFX0hFQUxUSF9UUklFUyjquLDrs7ggMTAp' # help line 4
+    xml_desc = 'U2hlbHRpZSDshJzrsoQuIOuhnOq3uOyYqO2VmOuptCDrjbDsiqTtgazthrEg7IS47IWY7JeQ7IScIOyLnOyeke2VnOuLpC4=' # task description
+    help1 = 'U2hlbHRpZSDshKTsuZjquLAoV2luZG93cykuIOyCrOyaqTogcG93ZXJzaGVsbCAtRmlsZSBpbnN0YWxsLnBzMSBbLURyeVJ1bl0gWy1Vbmluc3RhbGxdIFstSGVscF0=' # help line 1
+    help2 = 'ICBpZXjroZwg64+M66a0IOuVjOuKlCDsnbjsnpDrpbwg66q7IOyjvOuvgOuhnCBTSEVMVElFX1VOSU5TVEFMTD0xIOuhnCDsoJzqsbDtlaAg7IiYIOyeiOuLpC4=' # help line 2
+    help3 = 'ICDtmZjqsr3rs4DsiJg6IFNIRUxUSUVfU1JDLCBTSEVMVElFX0hDLCBTSEVMVElFX1BPUlQo6riw67O4IDg3OTApLCBTSEVMVElFX1BZVEhPTiw=' # help line 3
+    help4 = 'ICBTSEVMVElFX1RBSUxTQ0FMRSwgU0hFTFRJRV9TS0lQX1RBSUxTQ0FMRT0xLCBTSEVMVElFX0hFQUxUSF9UUklFUyjquLDrs7ggMTAp' # help line 4
     unknown_opt = '7JWMIOyImCDsl4bripQg7Ji17IWYOiB7MH0gKC1EcnlSdW4sIC1Vbmluc3RhbGwp' # unknown option
-    port_nan = 'SEVSRFJfUkVNT1RFX1BPUlTripQg7Iir7J6Q7Jes7JW8IO2VnOuLpDogezB9' # port must be numeric
+    port_nan = 'U0hFTFRJRV9QT1JU64qUIOyIq+yekOyXrOyVvCDtlZzri6Q6IHswfQ==' # port must be numeric
     port_range = '7Y+s7Yq4IOuylOychOuKlCAxfjY1NTM1OiB7MH0=' # port range
     no_task = 'KOuTseuhneuQnCDsnpHsl4XsnbQg7JeG64ukKQ==' # no registered task
     serve_off_fail = 'dGFpbHNjYWxlIHNlcnZlIO2VtOygnCDsi6TtjKgo7J2066+4IOyXhuydhCDsiJgg7J6I64ukKQ==' # serve off failed
     dry_delete = 'KyDsgq3soJwgezB9IHsxfQ==' # dry-run delete
     uninstalled = '7ZW07KCcIOyZhOujjC4g7ISk7KCV6rO8IO2GoO2BsOydgCDrgqjqsrzri6Q6IHswfSAo7KeA7Jqw66Ck66m0IOyngeygkSDsgq3soJwp' # uninstall done
     win_only = 'V2luZG93c+yXkOyEnOunjCDshKTsuZjtlaAg7IiYIOyeiOuLpC4=' # Windows only
-    no_python = 'cHl0aG9u7J20IOyXhuuLpC4gaHR0cHM6Ly93d3cucHl0aG9uLm9yZy9kb3dubG9hZHMvIOyXkOyEnCAzLjkg7J207IOB7J2EIOyEpOy5mO2VnCDrkqQg64uk7IucIOyLpO2Wie2VtOudvCjshKTsuZgg7ZmU66m07JeQ7IScICdBZGQgcHl0aG9uLmV4ZSB0byBQQVRIJ+ulvCDsvJzrnbwpLiDri6Trpbgg7JyE7LmY66m0IEhFUkRSX1JFTU9URV9QWVRIT049POqyveuhnD7roZwg7JWM66Ck7KSY6528Lg==' # python missing
+    no_python = 'cHl0aG9u7J20IOyXhuuLpC4gaHR0cHM6Ly93d3cucHl0aG9uLm9yZy9kb3dubG9hZHMvIOyXkOyEnCAzLjkg7J207IOB7J2EIOyEpOy5mO2VnCDrkqQg64uk7IucIOyLpO2Wie2VtOudvCjshKTsuZgg7ZmU66m07JeQ7IScICdBZGQgcHl0aG9uLmV4ZSB0byBQQVRIJ+ulvCDsvJzrnbwpLiDri6Trpbgg7JyE7LmY66m0IFNIRUxUSUVfUFlUSE9OPTzqsr3roZw+66GcIOyVjOugpOykmOudvC4=' # python missing
     old_python = 'cHl0aG9u7J20IDMuOeuztOuLpCDrgq7ri6QoezB9KS4gcHl0aG9uLm9yZ+yXkOyEnCDsg4gg67KE7KCE7J2EIOyEpOy5mO2VtOudvC4=' # python too old
-    no_hc = 'aGMoaGVyZHItY29yZSnqsIAg7JeG64ukLiDrqLzsoIAgaGVyZHItY29yZeulvCDshKTsuZjtlbTrnbw6IHBvd2Vyc2hlbGwgLWMgImlybSBodHRwczovL3JlbGVhc2VzLmhlcmRyLmRldi9jb3JlL2luc3RhbGwucHMxIHwgaWV4IiAo7ISk7LmY65CY66m0ICVMT0NBTEFQUERBVEElXFByb2dyYW1zXGhlcmRyLWNvcmVcaGMuZXhl6rCAIOyDneq4tOuLpCkuIOuLpOuluCDsnITsuZjrqbQgSEVSRFJfUkVNT1RFX0hDPTzqsr3roZw+66GcIOyVjOugpOykmOudvC4=' # hc missing
+    no_hc = 'aGMoaGVyZHItY29yZSnqsIAg7JeG64ukLiDrqLzsoIAgaGVyZHItY29yZeulvCDshKTsuZjtlbTrnbw6IHBvd2Vyc2hlbGwgLWMgImlybSBodHRwczovL3JlbGVhc2VzLmhlcmRyLmRldi9jb3JlL2luc3RhbGwucHMxIHwgaWV4IiAo7ISk7LmY65CY66m0ICVMT0NBTEFQUERBVEElXFByb2dyYW1zXGhlcmRyLWNvcmVcaGMuZXhl6rCAIOyDneq4tOuLpCkuIOuLpOuluCDsnITsuZjrqbQgU0hFTFRJRV9IQz086rK966GcPuuhnCDslYzroKTspJjrnbwu' # hc missing
     no_ts = 'dGFpbHNjYWxl7J20IOyXhuuLpC4gaHR0cHM6Ly90YWlsc2NhbGUuY29tL2Rvd25sb2FkIOyXkOyEnCDshKTsuZjtlZjqs6Ag66Gc6re47J247ZWcIOuSpCDri6Tsi5wg7Iuk7ZaJ7ZW06528Lg==' # tailscale missing
     ts_logged_out = 'dGFpbHNjYWxl7J20IOuhnOq3uOyduOuPvCDsnojsp4Ag7JWK64ukLiBUYWlsc2NhbGUg7JWx7J2EIOyXtOyWtCDroZzqt7jsnbjtlZwg65KkIOuLpOyLnCDsi6TtlontlbTrnbwu' # tailscale logged out
     src_https = '7ISc67KEIO2MjOydvOydgCBodHRwc+uhnOunjCDrsJvripTri6Q6IHswfQ==' # https only
@@ -77,7 +83,7 @@
     dry_pair = 'KyB7MH0gezF9IHBhaXI=' # dry-run pair
     pair_fail = '7ISk7LmY64qUIOuBneuCrOyngOunjCBwYWlyIOuqheugueydtCDsl4bqsbDrgpgg7Iuk7Yyo7ZaI64ukLiDshJzrsoTrpbwg7LWc7IugIOuyhOyghOycvOuhnCDrsJvslYQg64uk7IucIOyLpO2Wie2VmOqxsOuCmCwg7JWx7JeQIOyjvOyGjOyZgCDthqDtgbAoezB9KeydhCDsp4HsoJEg7J6F66Cl7ZW06528Lg==' # pair failed
     pair_skipped = 'KHRhaWxzY2FsZSDsl4bsnbQg7ISk7LmY7ZW07IScIHBhaXLripQg6rG064SI65yAKQ==' # pair skipped
-    no_hc_warn = 'aGVyZHItY29yZSDsl4bsnbQg7ISk7LmY7ZWc64ukOiDqs7Xsi50g7ZuF7Jy866Gc66eMIOuPmeyekSwgaGVyZHIg7YSw66+464SQIOq4sOuKpeydgCDqurzsp5AgKGhj66W8IOyTsOugpOuptCBIRVJEUl9SRU1PVEVfSEM9POqyveuhnD4p' # no_hc_warn
+    no_hc_warn = 'aGVyZHItY29yZSDsl4bsnbQg7ISk7LmY7ZWc64ukOiDqs7Xsi50g7ZuF7Jy866Gc66eMIOuPmeyekSwgaGVyZHIg7YSw66+464SQIOq4sOuKpeydgCDqurzsp5AgKGhj66W8IOyTsOugpOuptCBTSEVMVElFX0hDPTzqsr3roZw+KQ==' # no_hc_warn
     hk_skip = 'KHswfTogezF9IOyXhuydjCwg7ZuFIOqxtOuEiOucgCk=' # hk_skip
     hk_added = 'ezB9ezF9IO2bhSDrk7HroZ06IHsyfQ==' # hk_added
     hk_updated = 'ezB9ezF9IO2bhSDqsLHsi6A6IHsyfQ==' # hk_updated
@@ -86,13 +92,21 @@
     hk_absent = 'ezB9OiDsmrDrpqwg7ZuF7J20IOyXhuuLpCh7MX0p' # hk_absent
     hk_broken = '6rK96rOgOiB7MH0g7J20IOyYrOuwlOuluCBKU09O7J20IOyVhOuLiOudvCDqsbTrk5zrpqzsp4Ag7JWK7JWY64ukLiDqs6DsuZwg65KkIOuLpOyLnCDsi6TtlontlbTrnbwu' # hk_broken
     hk_fail = '6rK96rOgOiB7MH0g7ZuFIOyymOumrOyXkCDsi6TtjKjtlojri6QoezF9KS4g7ISk7LmY64qUIOqzhOyGje2VnOuLpC4=' # hk_fail
-    hk_nopy = 'cHl0aG9u7J20IOyXhuyWtCBDbGF1ZGUgQ29kZcK3Q29kZXgg7ZuF7J2AIOq3uOuMgOuhnOuLpC4gJVVTRVJQUk9GSUxFJVwuY2xhdWRlXHNldHRpbmdzLmpzb24sICVVU0VSUFJPRklMRSVcLmNvZGV4XGhvb2tzLmpzb24g7JeQ7IScICdoZXJkcl9yZW1vdGUucHknIGhvb2sg7ZWt66qp7J2EIOyngeygkSDsp4Dsm4zrnbwu' # hk_nopy
+    hk_nopy = 'cHl0aG9u7J20IOyXhuyWtCBDbGF1ZGUgQ29kZcK3Q29kZXgg7ZuF7J2AIOq3uOuMgOuhnOuLpC4gJVVTRVJQUk9GSUxFJVwuY2xhdWRlXHNldHRpbmdzLmpzb24sICVVU0VSUFJPRklMRSVcLmNvZGV4XGhvb2tzLmpzb24g7JeQ7IScICdzaGVsdGllLnB5JyBob29rIO2VreuqqeydhCDsp4HsoJEg7KeA7JuM6528Lg==' # hk_nopy
     hk_off = 'KC1Ob0hvb2tzOiDtm4Ug65Ox66GdIOqxtOuEiOucgCk=' # hk_off
     hk_restart = 'Q2xhdWRlIENvZGXCt0NvZGV466W8IOyDiOuhnCDsi5zsnpHtlbTslbwg7ZuF7J20IOyggeyaqeuQnOuLpChDb2RleOuKlCAvaG9va3Mg7JeQ7IScIO2VnCDrsogg7Iug66Kw7ZW07JW8IO2VnOuLpCku' # hk_restart
     help5 = 'ICAtTm9Ib29rczogQ2xhdWRlIENvZGXCt0NvZGV4IO2bhSDrk7HroZ0o7ZW07KCcKeydhCDqsbTrhIjrnIAuIGhj6rCAIOyXhuyWtOuPhCDshKTsuZjripQg6rOE7IaN7ZWc64ukKOqzteyLnSDtm4XsnLzroZzrp4wg64+Z7J6RKS4=' # help5
     port_busy = '7Y+s7Yq4IHswfeydhCjrpbwpIOuLpOuluCDtlITroZzqt7jrnqjsnbQg6rOE7IaNIOyTsOqzoCDsnojri6QuIOq3uCDtlITroZzqt7jrnqjsnYQg64GE6rOgIOuLpOyLnCDsi6TtlontlbTrnbwu' # port still in use
     old_health = '7JibIOyEnOuyhOqwgCDslYTsp4Eg7J2R64u17ZWc64ukLiDsg4gg7ISc67KE66W8IOq4sOuLpOumrOuKlCDspJEuLi4=' # old server answered
     unexpected = '7JiI7IOB7ZWY7KeAIOuqu+2VnCDsmKTrpZg6IHswfQ==' # unexpected error
+    mig_found = '7J207KCEIOyEpOy5mOulvCDssL7slZjri6QuIOyEnOu5hOyKpOulvCDrgrTrpqzqs6Ag7IOIIOychOy5mOuhnCDsmK7quLTri6Qu' # previous install found
+    mig_keep = '6rK96rOgOiB7MH0g7J20IOydtOuvuCDsnojslrQg7J207KCEIOyEpOyglSh7MX0p7J2AIOyYruq4sOyngCDslYrqs6Ag6re464yA66GcIOuRlOuLpC4=' # new config exists, old kept
+    mig_dry_mv = 'KyDsnbTrj5kgezB9IC0+IHsxfSAo7JWI7J2YIOqyveuhnOuPhCDsg4gg7Y+0642U66GcKQ==' # dry-run config move
+    mig_fail = '7J207KCEIOyEpOyglSDtj7TrjZTrpbwg7Jiu6riw7KeAIOuqu+2WiOuLpDogezB9IC0+IHsxfS4g7JWE66y06rKD64+EIOyngOyasOyngCDslYrslZjri6QuIOq2jO2VnOydhCDtmZXsnbjtlZjqs6Ag64uk7IucIOyLpO2Wie2VtOudvC4=' # config move failed
+    mig_fix_fail = '7ISk7KCVIO2PtOuNlOuKlCDsmK7qsrzsp4Drp4wg7JWI7J2YIOqyveuhnOulvCDqs6DsuZjsp4Ag66q77ZaI64ukOiB7MH0gKGFwbnNfa2V5X3BhdGgg65Ox7J2EIHsxfSDroZwg7KeB7KCRIOqzoOyzkOudvCk=' # config path fix failed
+    mig_moved = '7ISk7KCV7J2EIOyYruqyvOuLpDogezB9IC0+IHsxfQ==' # config moved
+    mig_link = 'ezB9IOqwgCDrp4Htgazri6QuIOunge2BrCDrjIDsg4Eg7Y+0642U66W8IHsxfSDroZwg7Jiu6riw6rGw64KYIHsxfSDrp4Htgazrpbwg7IOI66GcIOunjOuToCDrkqQg64uk7IucIOyLpO2Wie2VtOudvC4=' # old config is a link
+    mig_hooks_left = '6rK96rOgOiDtm4XsnbQg7JWE7KeBIOydtOyghCDshJzrsoQg7YyM7J287J2EIOu2gOuluOuLpCh7MH0pLiB7MX0g7J2AIOyngOyasOyngCDslYrslZjri6QuIO2bheqzvCDtlajqu5ggaW5zdGFsbC5wczHsnYQg64uk7IucIOyLpO2Wie2VmOqxsOuCmCDqt7gg7YyM7J287JeQ7IScICd7Mn0nIGhvb2sg7ZWt66qp7J2EIOyngOybjOudvC4=' # old hooks left
   }
   # messages end
   function T([string]$Key) {
@@ -157,14 +171,18 @@ import json, os, shutil, sys
 
 action, target, path, py, server, flavor = sys.argv[1:7]
 dry = len(sys.argv) > 7 and sys.argv[7] == "dry"
-MARK = "herdr_remote.py"
+MARK = "sheltie.py"
+OLD_MARKS = ("herdr_remote.py",)  # previous install path: replaced on install, removed on uninstall
 
 
 def ours(cmd):
     if not isinstance(cmd, str):
         return False
-    i = cmd.find(MARK)
-    return i >= 0 and cmd[i + len(MARK):i + len(MARK) + 7] in ('" hook ', "' hook ")
+    for m in (MARK,) + OLD_MARKS:
+        i = cmd.find(m)
+        if i >= 0 and cmd[i + len(m):i + len(m) + 7] in ('" hook ', "' hook "):
+            return True
+    return False
 
 
 def spec():
@@ -327,17 +345,19 @@ except Exception:
       Remove-Item -LiteralPath $script -Force -ErrorAction SilentlyContinue
     }
   }
-  function Read-Config {
-    if (-not (Test-Path -LiteralPath $CONFIG)) { return $null }
-    try { return ([IO.File]::ReadAllText($CONFIG) | ConvertFrom-Json) } catch { return $null }
+  function Read-Config([string]$Path = $CONFIG) {
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    try { return ([IO.File]::ReadAllText($Path) | ConvertFrom-Json) } catch { return $null }
   }
   function Config-Port {
+    # The new config, or the previous install's config if there is no new one yet.
     $c = Read-Config
+    if (-not $c) { $c = Read-Config (Join-Path $OLD_CONFIG_DIR 'config.json') }
     if ($c -and $c.port) { return [int]$c.port }
     return 8790
   }
   function Find-Python {
-    $over = $env:HERDR_REMOTE_PYTHON
+    $over = $env:SHELTIE_PYTHON
     if ($over) {
       if (Test-Path -LiteralPath $over -PathType Leaf) { return $over }
       return $null
@@ -354,7 +374,7 @@ except Exception:
     return $null
   }
   function Find-Tailscale {
-    $over = $env:HERDR_REMOTE_TAILSCALE
+    $over = $env:SHELTIE_TAILSCALE
     if ($over) {
       if (Test-Path -LiteralPath $over -PathType Leaf) { return $over }
       return $null
@@ -366,7 +386,7 @@ except Exception:
     return $null
   }
   function Find-Hc {
-    $over = $env:HERDR_REMOTE_HC
+    $over = $env:SHELTIE_HC
     if ($over) {
       if (Test-Path -LiteralPath $over -PathType Leaf) { return $over }
       return $null
@@ -408,11 +428,11 @@ except Exception:
   # Stop the old server and wait until its port is free. schtasks /End returns before the process exits,
   # so without this wait the old server still answers health (false success) and the new one cannot bind.
   # If our server file still holds the port after the wait, kill that process (not hook calls).
-  function Stop-Old([int[]]$Ports, [switch]$NoDie) {
-    $rc = Run 'schtasks' @('/End', '/TN', $TASK) -Quiet
+  function Stop-Old([int[]]$Ports, [switch]$NoDie, [string]$Task = $TASK, [string]$Srv = $SERVER) {
+    $rc = Run 'schtasks' @('/End', '/TN', $Task) -Quiet
     if ($DRY -or $Ports.Count -eq 0) { return }
     $wait = 15
-    if ($env:HERDR_REMOTE_STOP_WAIT -match '^[0-9]+$') { $wait = [int]$env:HERDR_REMOTE_STOP_WAIT }
+    if ($env:SHELTIE_STOP_WAIT -match '^[0-9]+$') { $wait = [int]$env:SHELTIE_STOP_WAIT }
     $deadline = (Get-Date).AddSeconds($wait)
     $killed = $false
     while ($true) {
@@ -425,7 +445,7 @@ except Exception:
         }
         foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name like 'python%'" -ErrorAction SilentlyContinue)) {
           $cl = [string]$p.CommandLine
-          if ($cl.IndexOf($SERVER, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and -not ($cl -match '\shook(\s|$)')) {
+          if ($cl.IndexOf($Srv, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and -not ($cl -match '\shook(\s|$)')) {
             Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
           }
         }
@@ -433,6 +453,101 @@ except Exception:
         $deadline = (Get-Date).AddSeconds(5)
       }
       Start-Sleep -Milliseconds 200
+    }
+  }
+  # Rewrite absolute or ~ paths inside the config that point into the old config folder (apns_key_path etc.).
+  $FIXPATHS_PY = @'
+import json, os, sys
+p, old, new = sys.argv[1:4]
+home = os.path.expanduser("~")
+nc = os.path.normcase
+def fix(v):
+    if isinstance(v, dict):
+        return {k: fix(x) for k, x in v.items()}
+    if isinstance(v, list):
+        return [fix(x) for x in v]
+    if not isinstance(v, str):
+        return v
+    e = os.path.expanduser(v)
+    if not (nc(e) == nc(old) or nc(e).startswith(nc(old) + os.sep) or nc(e).startswith(nc(old) + "/")):
+        return v
+    rest = e[len(old):]
+    if v.startswith("~") and nc(new).startswith(nc(home)):
+        rel = new[len(home):]
+        if v[1:2] == "/":
+            rel = rel.replace("\\", "/")
+        return "~" + rel + rest
+    return new + rest
+c = json.load(open(p, encoding="utf-8-sig"))
+n = fix(c)
+if n != c:
+    with open(p + ".tmp", "w", encoding="utf-8") as f:
+        json.dump(n, f, indent=2)
+    os.replace(p + ".tmp", p)
+'@
+  # An old config folder that is a link cannot be moved; a fresh token in the new place would break pairing.
+  # Stop before changing anything.
+  function Old-CheckLink {
+    $i = Get-Item -LiteralPath $OLD_CONFIG_DIR -Force -ErrorAction SilentlyContinue
+    if ($i -and ($i.Attributes -band [IO.FileAttributes]::ReparsePoint) -and -not (Test-Path -LiteralPath $CONFIG_DIR)) {
+      Die 1 (T 'mig_link' $OLD_CONFIG_DIR $CONFIG_DIR)
+    }
+  }
+  # Called once the new server file is in place, before init: stop the previous install's task (same port) and
+  # move its config folder (only if the new one does not exist). If the move fails, restart the old task and stop.
+  # Deleting old files waits until the new server answers health (Old-Cleanup).
+  function Old-StopMove {
+    if (Test-Path -LiteralPath $OLD_DATA -PathType Container) {
+      Say (T 'mig_found')
+      $oc = Read-Config (Join-Path $OLD_CONFIG_DIR 'config.json')
+      $ports = @()
+      if ($oc) { $p = 8790; if ($oc.port) { $p = [int]$oc.port }; $ports += $p }
+      if ($PORT) { $ports += [int]$PORT }
+      Stop-Old $ports -NoDie -Task $OLD_TASK -Srv $OLD_SERVER
+    }
+    if (Test-Path -LiteralPath $OLD_CONFIG_DIR -PathType Container) {
+      if (Test-Path -LiteralPath $CONFIG_DIR) {
+        Say (T 'mig_keep' $CONFIG_DIR $OLD_CONFIG_DIR)
+      } elseif ($DRY) {
+        Say (T 'mig_dry_mv' $OLD_CONFIG_DIR $CONFIG_DIR)
+      } else {
+        $moved = $false
+        try { Move-Item -LiteralPath $OLD_CONFIG_DIR -Destination $CONFIG_DIR -ErrorAction Stop; $moved = $true } catch {}
+        if (-not $moved) {
+          if (Test-Path -LiteralPath $OLD_DATA -PathType Container) { $rc = Run 'schtasks' @('/Run', '/TN', $OLD_TASK) -Quiet }
+          Die 1 (T 'mig_fail' $OLD_CONFIG_DIR $CONFIG_DIR)
+        }
+        if (Test-Path -LiteralPath $CONFIG) {
+          $fix = Join-Path ([IO.Path]::GetTempPath()) ('fixpaths.' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.py')
+          [IO.File]::WriteAllText($fix, $FIXPATHS_PY, (New-Object System.Text.UTF8Encoding($false)))
+          try { & $PY $fix $CONFIG $OLD_CONFIG_DIR $CONFIG_DIR 2>$null | Out-Null; $frc = $LASTEXITCODE } catch { $frc = 1 }
+          finally { Remove-Item -LiteralPath $fix -Force -ErrorAction SilentlyContinue }
+          if ($frc -ne 0) { Die 1 (T 'mig_fix_fail' $CONFIG $CONFIG_DIR) }
+        }
+        Say (T 'mig_moved' $OLD_CONFIG_DIR $CONFIG_DIR)
+      }
+    }
+  }
+  # After the new server answered health: delete the old task and install folder. If a hook file still calls the
+  # old server file, keep the folder and warn.
+  function Old-Cleanup {
+    if (-not (Test-Path -LiteralPath $OLD_DATA -PathType Container)) { return }
+    $rc = Run 'schtasks' @('/Delete', '/TN', $OLD_TASK, '/F') -Quiet
+    $left = @()
+    # Dry-run does not change hook files: if hooks would be updated, count them as updated.
+    if (-not ($DRY -and -not $NOHOOKS)) {
+      foreach ($f in @((Join-Path $env:USERPROFILE '.claude\settings.json'), (Join-Path $env:USERPROFILE '.codex\hooks.json'))) {
+        if ((Test-Path -LiteralPath $f -PathType Leaf) -and ([IO.File]::ReadAllText($f).Contains($OLD_SERVER_NAME))) { $left += $f }
+      }
+    }
+    if ($left.Count -gt 0) {
+      [Console]::Error.WriteLine((T 'mig_hooks_left' ($left -join ', ') $OLD_DATA $OLD_SERVER_NAME))
+      $oldCopy = Join-Path $OLD_DATA 'windows-task.xml'
+      if ($DRY) { Say (T 'dry_delete' $oldCopy '') } else { Remove-Item -LiteralPath $oldCopy -Force -ErrorAction SilentlyContinue }
+    } elseif ($DRY) {
+      Say (T 'dry_delete' $OLD_DATA '')
+    } else {
+      Remove-Item -LiteralPath $OLD_DATA -Recurse -Force -ErrorAction SilentlyContinue
     }
   }
   function Fill-Template([string]$Text, $Map) {
@@ -452,11 +567,11 @@ except Exception:
         default { Die 2 (T 'unknown_opt' $a) }
       }
     }
-    if ($env:HERDR_REMOTE_UNINSTALL -eq '1') { $MODE = 'uninstall' }
-    if ($env:HERDR_REMOTE_DRY_RUN -eq '1') { $DRY = $true }
-    if ($env:HERDR_REMOTE_NO_HOOKS -eq '1') { $NOHOOKS = $true }
+    if ($env:SHELTIE_UNINSTALL -eq '1') { $MODE = 'uninstall' }
+    if ($env:SHELTIE_DRY_RUN -eq '1') { $DRY = $true }
+    if ($env:SHELTIE_NO_HOOKS -eq '1') { $NOHOOKS = $true }
 
-    $PORT = $env:HERDR_REMOTE_PORT
+    $PORT = $env:SHELTIE_PORT
     if ($PORT) {
       if ($PORT -notmatch '^[0-9]+$') { Die 2 (T 'port_nan' $PORT) }
       if ($PORT.Length -gt 5 -or [int]$PORT -lt 1 -or [int]$PORT -gt 65535) { Die 2 (T 'port_range' $PORT) }
@@ -464,10 +579,18 @@ except Exception:
 
     if ($MODE -eq 'uninstall') {
       if (-not $PORT) { $PORT = [string](Config-Port) }
+      if (Test-Path -LiteralPath $OLD_DATA -PathType Container) {
+        # Previous install: stop and delete its task first (it holds the same port).
+        Stop-Old @([int]$PORT) -NoDie -Task $OLD_TASK -Srv $OLD_SERVER
+        $rc = Run 'schtasks' @('/Delete', '/TN', $OLD_TASK, '/F') -Quiet
+        $oldCopy = Join-Path $OLD_DATA 'windows-task.xml'
+        if ($DRY) { Say (T 'dry_delete' $OLD_SERVER $oldCopy) }
+        else { Remove-Item -LiteralPath $OLD_SERVER, $oldCopy -Force -ErrorAction SilentlyContinue }
+      }
       Stop-Old @([int]$PORT) -NoDie
       $rc = Run 'schtasks' @('/Delete', '/TN', $TASK, '/F') -Quiet
       if ($rc -ne 0) { Say (T 'no_task') }
-      if ($env:HERDR_REMOTE_SKIP_TAILSCALE -ne '1') {
+      if ($env:SHELTIE_SKIP_TAILSCALE -ne '1') {
         $TS = Find-Tailscale
         if ($TS) {
           $rc = Run $TS @('serve', "--https=$PORT", 'off')
@@ -480,7 +603,9 @@ except Exception:
         $upy = Find-Python
         if ($upy) { Apply-Hooks 'uninstall' $upy } else { Say (T 'hk_nopy') }
       }
-      Say (T 'uninstalled' $CONFIG_DIR)
+      $kept = $CONFIG_DIR
+      if (-not (Test-Path -LiteralPath $CONFIG_DIR) -and (Test-Path -LiteralPath $OLD_CONFIG_DIR)) { $kept = $OLD_CONFIG_DIR }
+      Say (T 'uninstalled' $kept)
       return
     }
 
@@ -500,7 +625,7 @@ except Exception:
     if (-not $HC) { Say (T 'no_hc_warn'); $HC = '' }
 
     $TS = $null
-    if ($env:HERDR_REMOTE_SKIP_TAILSCALE -ne '1') {
+    if ($env:SHELTIE_SKIP_TAILSCALE -ne '1') {
       $TS = Find-Tailscale
       if (-not $TS) { Die 1 (T 'no_ts') }
       $running = $false
@@ -511,14 +636,16 @@ except Exception:
       if (-not $running) { Die 1 (T 'ts_logged_out') }
     }
 
+    Old-CheckLink
+
     # ---- 2. server file
-    $SRC = $env:HERDR_REMOTE_SRC
+    $SRC = $env:SHELTIE_SRC
     # With irm | iex there is no script path. Use sibling files only when run as a file.
     $HERE = ''
     $self = $PSCommandPath
     if ($self -and $self -like '*install.ps1' -and (Test-Path -LiteralPath $self -PathType Leaf)) { $HERE = Split-Path -Parent $self }
-    if (-not $SRC -and $HERE -and (Test-Path -LiteralPath (Join-Path $HERE 'server\herdr_remote.py') -PathType Leaf)) {
-      $SRC = Join-Path $HERE 'server\herdr_remote.py'
+    if (-not $SRC -and $HERE -and (Test-Path -LiteralPath (Join-Path $HERE 'server\sheltie.py') -PathType Leaf)) {
+      $SRC = Join-Path $HERE 'server\sheltie.py'
     }
     if (-not $SRC) { $SRC = $DEFAULT_SRC }
     if ($SRC -like 'http://*') { Die 1 (T 'src_https' $SRC) }
@@ -528,7 +655,7 @@ except Exception:
       Say (T 'dry_copy' $SRC $SERVER)
     } else {
       New-Item -ItemType Directory -Force -Path $DATA | Out-Null
-      $tmp = Join-Path $DATA ('herdr_remote.' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.tmp')
+      $tmp = Join-Path $DATA ('sheltie.' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.tmp')
       try {
         if ($SRC -like 'https://*') {
           try {
@@ -544,15 +671,18 @@ except Exception:
         if ($LASTEXITCODE -ne 0) { Die 1 (T 'src_badpy' $SRC) }
         # A running server may hold the file and the port: stop it and wait for it to exit before replacing.
         # Old port only if a config exists (fresh install: nothing of ours is running).
+        # A previous install still holding the port is stopped right after this (Old-StopMove).
         $ports = @()
         if (Test-Path -LiteralPath $CONFIG) { $ports += Config-Port }
-        if ($PORT) { $ports += [int]$PORT }
+        if ($PORT -and -not (Test-Path -LiteralPath $OLD_DATA -PathType Container)) { $ports += [int]$PORT }
         Stop-Old $ports
         Move-Item -LiteralPath $tmp -Destination $SERVER -Force
       } finally {
         Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
       }
     }
+    # Previous install: only now that the new server file is in place (and before init makes a new token).
+    Old-StopMove
     if ($DRY) { Say (T 'dry_init' $PY $SERVER) }
     else {
       & $PY $SERVER init | Out-Host
@@ -624,7 +754,7 @@ except Exception:
       $cfg = Read-Config
       $token = if ($cfg) { [string]$cfg.token } else { '' }
       $tries = 10
-      if ($env:HERDR_REMOTE_HEALTH_TRIES -match '^[0-9]+$') { $tries = [int]$env:HERDR_REMOTE_HEALTH_TRIES }
+      if ($env:SHELTIE_HEALTH_TRIES -match '^[0-9]+$') { $tries = [int]$env:SHELTIE_HEALTH_TRIES }
       $ok = $false
       $warned = $false
       for ($i = 0; $i -lt $tries; $i++) {
@@ -646,6 +776,7 @@ except Exception:
       if (-not $ok) { Die 7 (T 'no_health' $LOGFILE) }
       Say (T 'health_ok' $PORT)
     }
+    Old-Cleanup
 
     # ---- 6. pairing
     if ($TS) {
@@ -665,7 +796,7 @@ except Exception:
     if (-not $NOHOOKS) { Say (T 'hk_restart') }
   } catch {
     if ($_.Exception.Message -ne 'HRExit') {
-      [Console]::Error.WriteLine((T 'unexpected' $_.Exception.Message)); if ($env:HERDR_REMOTE_DEBUG -eq '1') { [Console]::Error.WriteLine($_.InvocationInfo.PositionMessage) }
+      [Console]::Error.WriteLine((T 'unexpected' $_.Exception.Message)); if ($env:SHELTIE_DEBUG -eq '1') { [Console]::Error.WriteLine($_.InvocationInfo.PositionMessage) }
       $global:HRCode = 1
     }
   }

@@ -17,12 +17,12 @@ import urllib.request
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import test_herdr_remote as base  # noqa: E402
+import test_sheltie as base  # noqa: E402
 
 hr = base.hr
 TOKEN = base.TOKEN
 HOOK_FIX = os.path.join(base.FIX, "hooks")
-SERVER = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "herdr_remote.py")
+SERVER = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "sheltie.py")
 
 
 def load(name, **over):
@@ -504,7 +504,7 @@ class NoHcTests(unittest.TestCase):
         for path in ("", "/nonexistent/hc"):
             with self.subTest(path=path):
                 app = hr.App(cfg, hr.Hc(path), hr.DeviceStore(os.path.join(tmp, "d.json")), base.FakePusher())
-                with self.assertLogs("herdr-remote", level="WARNING") as cm:
+                with self.assertLogs("sheltie", level="WARNING") as cm:
                     app.poll()
                     app.poll()
                     self.assertEqual(app.api_terminals(), {"terminals": []})
@@ -532,7 +532,7 @@ class HookCommandTests(HookBase):
 
     def run_cmd(self, agent, body, env=None):
         out = io.BytesIO()
-        with mock.patch.dict(os.environ, {"HERDR_REMOTE_CONFIG": self.cfg}):
+        with mock.patch.dict(os.environ, {"SHELTIE_CONFIG": self.cfg}):
             rc = hr.cmd_hook([agent], stdin=io.BytesIO(json.dumps(body).encode()), stdout=out,
                              env=env if env is not None else {})
         return rc, out.getvalue()
@@ -561,7 +561,7 @@ class HookCommandTests(HookBase):
         self.write_cfg(port)
         rc, out = self.run_cmd("claude", load("claude-permission-bash-2.1.329.json"))
         self.assertEqual((rc, out), (0, b""))
-        with mock.patch.dict(os.environ, {"HERDR_REMOTE_CONFIG": os.path.join(self.tmp, "none.json")}):
+        with mock.patch.dict(os.environ, {"SHELTIE_CONFIG": os.path.join(self.tmp, "none.json")}):
             self.assertEqual(hr.cmd_hook(["claude"], stdin=io.BytesIO(b"{}"), stdout=io.BytesIO(), env={}), 0)
         self.assertEqual(hr.cmd_hook(["gemini"], stdin=io.BytesIO(b"{}"), stdout=io.BytesIO(), env={}), 0)
 
@@ -583,8 +583,8 @@ class HookCommandTests(HookBase):
                                                                   "decision": {"behavior": "allow"}}})
 
     def test_subprocess_no_log_file(self):
-        log_path = os.path.join(self.tmp, "logs", "herdr-remote.log")
-        env = dict(os.environ, HERDR_REMOTE_CONFIG=self.cfg, HERDR_REMOTE_LOG=log_path)
+        log_path = os.path.join(self.tmp, "logs", "sheltie.log")
+        env = dict(os.environ, SHELTIE_CONFIG=self.cfg, SHELTIE_LOG=log_path)
         env.pop("HC_TERMINAL_ID", None)
         body = load("codex-permission-bash-doc.json")
         tid = self.tid_of(body)

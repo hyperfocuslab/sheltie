@@ -8,7 +8,7 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from test_herdr_remote import fixture, make_app, status_ev, st, hr  # noqa: E402
+from test_sheltie import fixture, make_app, status_ev, st, hr  # noqa: E402
 
 V = "0.171.0"
 BLOCKED_PERM = {"app": "codex", "kind": "permission", "state": "blocked"}

@@ -17,7 +17,7 @@ PS = shutil.which("powershell") or shutil.which("pwsh")
 # 서버 대역: init은 설정을 만들고, pair는 PAIR_FAIL이 있으면 실패하고, serve는 /api/health에 토큰 검사 후 200.
 STUB_SERVER = '''import json, os, sys, time
 cmd = sys.argv[1] if len(sys.argv) > 1 else "serve"
-p = os.path.expanduser("~/.config/herdr-remote/config.json")
+p = os.path.expanduser("~/.config/sheltie/config.json")
 if cmd == "init":
     if not os.path.exists(p):
         os.makedirs(os.path.dirname(p), exist_ok=True)
@@ -64,7 +64,7 @@ if name == "schtasks":
     if args and args[0] == "/Run":
         if os.environ.get("SCHTASKS_NO_START"):
             sys.exit(0)
-        server = os.path.join(os.environ["LOCALAPPDATA"], "herdr-remote", "herdr_remote.py")
+        server = os.path.join(os.environ["LOCALAPPDATA"], "sheltie", "sheltie.py")
         p = subprocess.Popen([sys.executable, server, "serve"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL, close_fds=True,
                              creationflags=0x00000008 | 0x00000200)  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
@@ -134,7 +134,7 @@ class InstallPs1Test(unittest.TestCase):
         self.stub = os.path.join(self.tmp, "stub_server.py")
         with open(self.stub, "w") as f:
             f.write(STUB_SERVER)
-        os.makedirs(os.path.join(self.tmp, "hcdir"))  # PATH 밖: PATH에 있으면 HERDR_REMOTE_HC가 비어도 찾아버린다
+        os.makedirs(os.path.join(self.tmp, "hcdir"))  # PATH 밖: PATH에 있으면 SHELTIE_HC가 비어도 찾아버린다
         self.hc = os.path.join(self.tmp, "hcdir", "hc.exe")
         open(self.hc, "w").close()
         for n in ("schtasks", "tailscale"):
@@ -152,7 +152,7 @@ class InstallPs1Test(unittest.TestCase):
 
     def env(self, **extra):
         sysroot = os.environ.get("SystemRoot", r"C:\Windows")
-        env = {k: v for k, v in os.environ.items() if not k.startswith("HERDR_REMOTE_")}
+        env = {k: v for k, v in os.environ.items() if not k.startswith("SHELTIE_")}
         env.update({
             "PATH": os.pathsep.join([self.bin, os.path.join(sysroot, "System32"), sysroot,
                                      os.path.join(sysroot, "System32", "WindowsPowerShell", "v1.0")]),
@@ -161,8 +161,8 @@ class InstallPs1Test(unittest.TestCase):
             "ProgramFiles": os.path.join(self.tmp, "pf"), "ProgramFiles(x86)": os.path.join(self.tmp, "pf86"),
             "FAKE_LOG": self.log, "FAKE_XML": self.xml, "FAKE_PIDS": self.pids, "FAKE_HELPER": self.helper,
             "FAKE_PY": sys.executable, "TS_SERVE_FILE": self.ts_serve_file, "TS_SERVE_JSON": self.ts_serve_json,
-            "HERDR_REMOTE_SRC": self.stub, "HERDR_REMOTE_PYTHON": sys.executable, "HERDR_REMOTE_HC": self.hc,
-            "HERDR_REMOTE_PORT": self.port, "HERDR_REMOTE_HEALTH_TRIES": "3",
+            "SHELTIE_SRC": self.stub, "SHELTIE_PYTHON": sys.executable, "SHELTIE_HC": self.hc,
+            "SHELTIE_PORT": self.port, "SHELTIE_HEALTH_TRIES": "3",
         })
         env.update(extra)
         return env
@@ -176,7 +176,7 @@ class InstallPs1Test(unittest.TestCase):
 
     def run_iex(self, **extra):
         # irm | iex와 같은 경로: 파일을 UTF-8 문자열로 읽어 iex로 넘긴다(스크립트 경로 없음, 인자 없음).
-        script = ("$env:HERDR_REMOTE_DRY_RUN='1'; [Console]::OutputEncoding=[Text.Encoding]::UTF8; "
+        script = ("$env:SHELTIE_DRY_RUN='1'; [Console]::OutputEncoding=[Text.Encoding]::UTF8; "
                   "iex ([IO.File]::ReadAllText('%s', [Text.Encoding]::UTF8))" % INSTALL.replace("'", "''"))
         cmd = [PS, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script]
         r = subprocess.run(cmd, env=self.env(**extra), capture_output=True, timeout=120)
@@ -193,10 +193,10 @@ class InstallPs1Test(unittest.TestCase):
         return next(i for i, x in enumerate(c) if x.startswith(prefix))
 
     def server_path(self):
-        return os.path.join(self.local, "herdr-remote", "herdr_remote.py")
+        return os.path.join(self.local, "sheltie", "sheltie.py")
 
     def cfg_path(self):
-        return os.path.join(self.profile, ".config", "herdr-remote", "config.json")
+        return os.path.join(self.profile, ".config", "sheltie", "config.json")
 
     def task_xml(self):
         with open(self.xml, "rb") as f:
@@ -212,8 +212,8 @@ class InstallPs1Test(unittest.TestCase):
         i_run = self.idx("schtasks /Run")
         i_serve = self.idx("tailscale serve --bg")
         self.assertTrue(i_end < i_create < i_run < i_serve, c)
-        self.assertIn("schtasks /Create /TN Sheltie herdr-remote /XML %s /F" %
-                      os.path.join(self.local, "herdr-remote", "windows-task.xml"), c)
+        self.assertIn("schtasks /Create /TN Sheltie /XML %s /F" %
+                      os.path.join(self.local, "sheltie", "windows-task.xml"), c)
         self.assertIn("tailscale serve --bg --https=%s http://127.0.0.1:%s" % (self.port, self.port), c)
         self.assertIn("PAIR-OK", r.stdout)
         self.assertTrue(os.path.exists(self.server_path()))
@@ -225,7 +225,7 @@ class InstallPs1Test(unittest.TestCase):
                      "<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>",
                      "<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>", "<Hidden>true</Hidden>",
                      "<LogonTrigger>", '"%s" serve' % self.server_path(),
-                     "<WorkingDirectory>%s</WorkingDirectory>" % os.path.join(self.local, "herdr-remote")):
+                     "<WorkingDirectory>%s</WorkingDirectory>" % os.path.join(self.local, "sheltie")):
             self.assertIn(want, text)
         self.assertRegex(text, r"<Command>[^<]*pythonw?\.exe</Command>")
         self.assertNotRegex(text, r"@[A-Z]+@")
@@ -242,7 +242,7 @@ class InstallPs1Test(unittest.TestCase):
         c = self.calls()
         self.assertFalse(any(x.startswith("schtasks") for x in c), c)
         self.assertFalse(any(x.startswith("tailscale serve --bg") for x in c), c)
-        self.assertFalse(os.path.exists(os.path.join(self.local, "herdr-remote")))
+        self.assertFalse(os.path.exists(os.path.join(self.local, "sheltie")))
         self.assertFalse(os.path.exists(self.cfg_path()))
         self.assertIn("+ schtasks /Create", r.stdout)
         self.assertIn("+ ", r.stdout)
@@ -256,15 +256,15 @@ class InstallPs1Test(unittest.TestCase):
         self.assertIn("(토큰 인증)", r.stdout)
         self.assertNotIn("\ufffd", r.stdout)
         self.assertFalse(any(x.startswith("schtasks") for x in self.calls()), self.calls())
-        self.assertFalse(os.path.exists(os.path.join(self.local, "herdr-remote")))
+        self.assertFalse(os.path.exists(os.path.join(self.local, "sheltie")))
 
     def test_iex_error_message_is_korean(self):
-        r = self.run_iex(HERDR_REMOTE_PORT="abc")
-        self.assertIn("HERDR_REMOTE_PORT는 숫자여야 한다: abc", r.stderr)
+        r = self.run_iex(SHELTIE_PORT="abc")
+        self.assertIn("SHELTIE_PORT는 숫자여야 한다: abc", r.stderr)
 
     def test_bad_port_rejected(self):
         for bad in ("abc", "0", "70000", "80;rm", "123456789012345678901"):
-            r = self.run_install(HERDR_REMOTE_PORT=bad)
+            r = self.run_install(SHELTIE_PORT=bad)
             self.assertEqual(r.returncode, 2, bad)
 
     def test_unknown_option(self):
@@ -279,7 +279,7 @@ class InstallPs1Test(unittest.TestCase):
         self.assertEqual(self.calls(), [])
 
     def test_no_hc(self):
-        r = self.run_install(HERDR_REMOTE_HC="")
+        r = self.run_install(SHELTIE_HC="")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("herdr-core 없이 설치한다", r.stdout)
         self.assertEqual(read_json(self.cfg_path())["hc_path"], "")
@@ -306,7 +306,7 @@ class InstallPs1Test(unittest.TestCase):
         x = read_json(cx)
         cmd = x["hooks"]["PermissionRequest"][0]["hooks"][0]["command"]
         self.assertTrue(cmd.startswith("powershell.exe -NoProfile -Command "), cmd)
-        self.assertIn("herdr_remote.py' hook codex", cmd)
+        self.assertIn("sheltie.py' hook codex", cmd)
         self.assertTrue(os.path.exists(cl + ".sheltie-bak"))
         r = self.run_install("-Uninstall")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
@@ -331,7 +331,7 @@ class InstallPs1Test(unittest.TestCase):
         # py 런처는 있는데 파이썬이 없으면 출력이 비어도 죽지 않고 "python이 없다"로 끝나야 한다(7950 실측: null-valued 오류).
         with open(os.path.join(self.bin, "py.cmd"), "w", newline="") as f:
             f.write("@exit /b 1\r\n")
-        r = self.run_install(HERDR_REMOTE_PYTHON="")
+        r = self.run_install(SHELTIE_PYTHON="")
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
         self.assertIn("python이 없다", r.stderr)
         self.assertNotIn("null", r.stderr)
@@ -341,7 +341,7 @@ class InstallPs1Test(unittest.TestCase):
         os.makedirs(d)
         hc = os.path.join(d, "hc.exe")
         open(hc, "w").close()
-        r = self.run_install(HERDR_REMOTE_HC="")
+        r = self.run_install(SHELTIE_HC="")
         self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
         self.assertEqual(read_json(self.cfg_path())["hc_path"], hc)
 
@@ -352,12 +352,12 @@ class InstallPs1Test(unittest.TestCase):
         self.assertFalse(any(x.startswith("schtasks") for x in self.calls()))
 
     def test_no_tailscale(self):
-        r = self.run_install(HERDR_REMOTE_TAILSCALE=os.path.join(self.tmp, "nonexistent.exe"))
+        r = self.run_install(SHELTIE_TAILSCALE=os.path.join(self.tmp, "nonexistent.exe"))
         self.assertEqual(r.returncode, 1)
         self.assertIn("tailscale", r.stderr)
 
     def test_skip_tailscale(self):
-        r = self.run_install(HERDR_REMOTE_SKIP_TAILSCALE="1")
+        r = self.run_install(SHELTIE_SKIP_TAILSCALE="1")
         self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
         self.assertFalse(any(x.startswith("tailscale") for x in self.calls()))
         self.assertNotIn("PAIR-OK", r.stdout)
@@ -431,7 +431,7 @@ class InstallPs1Test(unittest.TestCase):
     def test_reinstall_kills_old_server_that_ignores_end(self):
         self.assertEqual(self.run_install().returncode, 0)
         old = read(self.pids).split()
-        r = self.run_install(SCHTASKS_END_NOKILL="1", HERDR_REMOTE_STOP_WAIT="1")
+        r = self.run_install(SCHTASKS_END_NOKILL="1", SHELTIE_STOP_WAIT="1")
         self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
         self.assertFalse(any(self.pid_alive(x) for x in old), old)
 
@@ -445,7 +445,7 @@ class InstallPs1Test(unittest.TestCase):
         s.bind(("127.0.0.1", int(self.port)))
         s.listen(50)
         try:
-            r = self.run_install(HERDR_REMOTE_STOP_WAIT="1")
+            r = self.run_install(SHELTIE_STOP_WAIT="1")
         finally:
             s.close()
         self.assertEqual(r.returncode, 9, r.stderr + r.stdout)
@@ -453,20 +453,20 @@ class InstallPs1Test(unittest.TestCase):
         self.assertFalse(any(x.startswith("schtasks /Run") for x in self.calls()))
 
     def test_http_source_rejected(self):
-        r = self.run_install(HERDR_REMOTE_SRC="http://example.invalid/herdr_remote.py")
+        r = self.run_install(SHELTIE_SRC="http://example.invalid/sheltie.py")
         self.assertEqual(r.returncode, 1)
         self.assertIn("https", r.stderr)
         self.assertFalse(any(x.startswith("schtasks") for x in self.calls()))
 
     def test_missing_source_aborts(self):
-        r = self.run_install(HERDR_REMOTE_SRC=os.path.join(self.tmp, "nope.py"))
+        r = self.run_install(SHELTIE_SRC=os.path.join(self.tmp, "nope.py"))
         self.assertEqual(r.returncode, 1)
         self.assertFalse(any(x.startswith("schtasks") for x in self.calls()))
 
     def test_empty_source_aborts(self):
         empty = os.path.join(self.tmp, "empty.py")
         open(empty, "w").close()
-        r = self.run_install(HERDR_REMOTE_SRC=empty)
+        r = self.run_install(SHELTIE_SRC=empty)
         self.assertEqual(r.returncode, 1)
         self.assertIn("비어", r.stderr)
         self.assertFalse(os.path.exists(self.server_path()))
@@ -475,7 +475,7 @@ class InstallPs1Test(unittest.TestCase):
         bad = os.path.join(self.tmp, "bad.py")
         with open(bad, "w") as f:
             f.write("def (\n")
-        r = self.run_install(HERDR_REMOTE_SRC=bad)
+        r = self.run_install(SHELTIE_SRC=bad)
         self.assertEqual(r.returncode, 1)
         self.assertIn("파이썬", r.stderr)
         self.assertFalse(os.path.exists(self.server_path()))
@@ -487,8 +487,8 @@ class InstallPs1Test(unittest.TestCase):
         r = self.run_install(*args, **extra)
         self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
         c = self.calls()
-        self.assertIn("schtasks /End /TN Sheltie herdr-remote", c)
-        self.assertIn("schtasks /Delete /TN Sheltie herdr-remote /F", c)
+        self.assertIn("schtasks /End /TN Sheltie", c)
+        self.assertIn("schtasks /Delete /TN Sheltie /F", c)
         self.assertIn("tailscale serve --https=%s off" % self.port, c)
         self.assertFalse(os.path.exists(self.server_path()))
         self.assertTrue(os.path.exists(self.cfg_path()), "설정과 토큰은 남긴다")
@@ -498,7 +498,188 @@ class InstallPs1Test(unittest.TestCase):
         self.check_uninstall("-Uninstall")
 
     def test_uninstall_by_env(self):
-        self.check_uninstall(HERDR_REMOTE_UNINSTALL="1")
+        self.check_uninstall(SHELTIE_UNINSTALL="1")
+
+
+OLD_TASK = "Sheltie herdr-remote"  # 이전 설치 이름: 옮기기 시험용
+
+
+@unittest.skipUnless(PS and os.name == "nt", "Windows PowerShell이 없다(Windows에서만 돈다)")
+class InstallPs1MigrateTest(InstallPs1Test):
+    """이전 설치(옛 경로)가 있는 가짜 프로필에서 설치·해제. 부모 테스트는 상속만 하므로 비운다."""
+
+    def setUp(self):
+        super().setUp()
+        self.old_data = os.path.join(self.local, "herdr-remote")
+        self.old_server = os.path.join(self.old_data, "herdr_remote.py")
+        self.old_cfg_dir = os.path.join(self.profile, ".config", "herdr-remote")
+        self.new_cfg_dir = os.path.join(self.profile, ".config", "sheltie")
+
+    def make_old_install(self, hooks=True):
+        os.makedirs(self.old_data)
+        os.makedirs(self.old_cfg_dir)
+        for n, text in (("herdr_remote.py", "# old\n"), ("windows-task.xml", "<Task/>"), ("herdr-remote.log", "old\n")):
+            with open(os.path.join(self.old_data, n), "w") as f:
+                f.write(text)
+        cfg = {"token": "tok-OLD-keep-this-token-000", "port": int(self.port), "hc_path": "x",
+               "apns_key_path": "~/.config/herdr-remote/AuthKey.p8",
+               "extra_abs": os.path.join(self.old_cfg_dir, "sub", "file")}
+        with open(os.path.join(self.old_cfg_dir, "config.json"), "w") as f:
+            json.dump(cfg, f)
+        with open(os.path.join(self.old_cfg_dir, "devices.json"), "w") as f:
+            json.dump([{"token": "dev1"}], f)
+        with open(os.path.join(self.old_cfg_dir, "AuthKey.p8"), "w") as f:
+            f.write("KEY")
+        if hooks:
+            cl, cx = self.hook_files()
+            os.makedirs(os.path.dirname(cl))
+            os.makedirs(os.path.dirname(cx))
+            old_cl = '& "%s" "%s" hook claude' % (sys.executable, self.old_server)
+            old_cx = "powershell.exe -NoProfile -Command \"& '%s' '%s' hook codex\"" % (sys.executable, self.old_server)
+            with open(cl, "w", encoding="utf-8") as f:
+                json.dump({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "mine"}]},
+                                              {"hooks": [{"type": "command", "command": old_cl, "shell": "powershell"}]}]}}, f)
+            with open(cx, "w", encoding="utf-8") as f:
+                json.dump({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": old_cx}]}]}}, f)
+
+    def snapshot(self):
+        out = {}
+        for base in (self.profile, self.local):
+            for root, dirs, files in os.walk(base):
+                if root == self.profile and "AppData" in dirs:
+                    dirs.remove("AppData")  # PowerShell이 스스로 만드는 캐시
+                for n in dirs + files:
+                    p = os.path.join(root, n)
+                    out[p] = read(p) if os.path.isfile(p) else None
+        return out
+
+    def test_install_moves_old_install(self):
+        self.make_old_install()
+        r = self.run_install()
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        c = self.calls()
+        i_end = c.index("schtasks /End /TN %s" % OLD_TASK)
+        i_del = c.index("schtasks /Delete /TN %s /F" % OLD_TASK)
+        # 이전 작업은 새 작업 등록 전에 멈추고, 지우는 건 새 서버가 뜬 뒤
+        self.assertTrue(i_end < self.idx("schtasks /Create") < self.idx("schtasks /Run /TN Sheltie") < i_del, c)
+        cfg = read_json(self.cfg_path())
+        self.assertEqual(cfg["token"], "tok-OLD-keep-this-token-000")
+        self.assertEqual(cfg["apns_key_path"], "~/.config/sheltie/AuthKey.p8")
+        self.assertEqual(os.path.normcase(cfg["extra_abs"]),
+                         os.path.normcase(os.path.join(self.new_cfg_dir, "sub", "file")))
+        self.assertEqual(read_json(os.path.join(self.new_cfg_dir, "devices.json")), [{"token": "dev1"}])
+        self.assertEqual(read(os.path.join(self.new_cfg_dir, "AuthKey.p8")), "KEY")
+        self.assertFalse(os.path.exists(self.old_cfg_dir))
+        self.assertFalse(os.path.exists(self.old_data))
+        cl, cx = self.hook_files()
+        for p in (cl, cx):
+            self.assertNotIn("herdr_remote.py", read(p), p)
+        stop = [h["command"] for g in read_json(cl)["hooks"]["Stop"] for h in g["hooks"]]
+        self.assertEqual(stop, ["mine", '& "%s" "%s" hook claude' % (sys.executable, self.server_path())])
+        self.assertEqual(len(read_json(cx)["hooks"]["Stop"]), 1)
+
+    def test_existing_new_config_is_not_overwritten(self):
+        self.make_old_install(hooks=False)
+        os.makedirs(self.new_cfg_dir)
+        with open(self.cfg_path(), "w") as f:
+            json.dump({"token": "tok-NEW-0000000000000000", "port": int(self.port)}, f)
+        r = self.run_install()
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertIn("옮기지 않고", r.stdout)
+        self.assertEqual(read_json(self.cfg_path())["token"], "tok-NEW-0000000000000000")
+        self.assertEqual(read_json(os.path.join(self.old_cfg_dir, "config.json"))["token"], "tok-OLD-keep-this-token-000")
+        self.assertFalse(os.path.exists(self.old_data))
+
+    def test_move_failure_keeps_everything(self):
+        self.make_old_install()
+        # 다른 프로세스의 현재 폴더면 Windows는 그 폴더의 이름 바꾸기를 막는다
+        holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"], cwd=self.old_cfg_dir)
+        try:
+            r = self.run_install()
+        finally:
+            holder.kill()
+            holder.wait()
+        self.assertEqual(r.returncode, 1, r.stderr + r.stdout)
+        self.assertIn("아무것도 지우지 않았다", r.stderr)
+        self.assertEqual(read_json(os.path.join(self.old_cfg_dir, "config.json"))["token"], "tok-OLD-keep-this-token-000")
+        self.assertTrue(os.path.exists(self.old_server))
+        self.assertFalse(os.path.exists(self.new_cfg_dir))
+        c = self.calls()
+        self.assertIn("schtasks /Run /TN %s" % OLD_TASK, c)
+        self.assertNotIn("schtasks /Delete /TN %s /F" % OLD_TASK, c)
+        self.assertFalse(any(x.startswith("schtasks /Create") for x in c), c)
+        self.assertIn("herdr_remote.py", read(self.hook_files()[0]))
+
+    def assert_old_untouched(self):
+        self.assertTrue(os.path.exists(self.old_server))
+        self.assertEqual(read_json(os.path.join(self.old_cfg_dir, "config.json"))["token"], "tok-OLD-keep-this-token-000")
+        self.assertFalse(os.path.exists(self.new_cfg_dir))
+
+    def test_download_failure_leaves_old_install(self):
+        self.make_old_install()
+        r = self.run_install(SHELTIE_SRC=os.path.join(self.tmp, "missing.py"))
+        self.assertEqual(r.returncode, 1, r.stderr + r.stdout)
+        self.assert_old_untouched()
+        self.assertFalse(any(x.startswith("schtasks") for x in self.calls()), self.calls())
+        self.assertIn("herdr_remote.py", read(self.hook_files()[0]))
+
+    def test_task_create_failure_keeps_old_files(self):
+        self.make_old_install()
+        r = self.run_install(SCHTASKS_CREATE_RC="1")
+        self.assertEqual(r.returncode, 5, r.stderr + r.stdout)
+        self.assertTrue(os.path.exists(self.old_server))
+        self.assertNotIn("schtasks /Delete /TN %s /F" % OLD_TASK, self.calls())
+        self.assertEqual(read_json(self.cfg_path())["token"], "tok-OLD-keep-this-token-000")
+
+    def test_no_hooks_keeps_old_server_file(self):
+        self.make_old_install()
+        r = self.run_install("-NoHooks")
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertTrue(os.path.exists(self.old_server))
+        self.assertFalse(os.path.exists(os.path.join(self.old_data, "windows-task.xml")))
+        self.assertIn("schtasks /Delete /TN %s /F" % OLD_TASK, self.calls())
+        self.assertIn(self.hook_files()[0], r.stderr)
+        self.assertIn(self.old_data, r.stderr)
+
+    def test_linked_old_config_stops_install(self):
+        self.make_old_install()
+        real = os.path.join(self.tmp, "dotfiles-cfg")
+        os.rename(self.old_cfg_dir, real)
+        subprocess.run(["cmd", "/c", "mklink", "/J", self.old_cfg_dir, real], check=True, capture_output=True)
+        r = self.run_install()
+        self.assertEqual(r.returncode, 1, r.stderr + r.stdout)
+        self.assertIn("링크", r.stderr)
+        self.assertFalse(os.path.exists(self.new_cfg_dir))
+        self.assertTrue(os.path.exists(self.old_server))
+        self.assertFalse(any(x.startswith("schtasks") for x in self.calls()), self.calls())
+
+    def test_uninstall_also_removes_old_task(self):
+        self.make_old_install()
+        r = self.run_install("-Uninstall")
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        c = self.calls()
+        self.assertIn("schtasks /End /TN %s" % OLD_TASK, c)
+        self.assertIn("schtasks /Delete /TN %s /F" % OLD_TASK, c)
+        self.assertFalse(os.path.exists(self.old_server))
+        self.assertTrue(os.path.exists(os.path.join(self.old_cfg_dir, "config.json")), "설정과 토큰은 남긴다")
+        self.assertIn(self.old_cfg_dir, r.stdout)
+        cl, cx = self.hook_files()
+        self.assertEqual(read_json(cl), {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "mine"}]}]}})
+        self.assertEqual(read_json(cx), {})
+
+    def test_dry_run_with_old_install_changes_nothing(self):
+        self.make_old_install()
+        before = self.snapshot()
+        r = self.run_install("-DryRun")
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertIn("+ schtasks /End /TN %s" % OLD_TASK, r.stdout)
+        self.assertIn("+ 이동 %s -> %s" % (self.old_cfg_dir, self.new_cfg_dir), r.stdout)
+        self.assertEqual(self.snapshot(), before)
+        self.assertFalse(any(x.startswith("schtasks") for x in self.calls()), self.calls())
+
+
+for _n in [n for n in dir(InstallPs1Test) if n.startswith("test_")]:
+    setattr(InstallPs1MigrateTest, _n, None)  # 상속된 기존 테스트는 InstallPs1Test에서 이미 돈다
 
 
 class InstallPs1StaticTest(unittest.TestCase):
@@ -536,12 +717,12 @@ class InstallPs1StaticTest(unittest.TestCase):
         self.assertEqual(msgs["uninstalled"], "해제 완료. 설정과 토큰은 남겼다: {0} (지우려면 직접 삭제)")
         self.assertEqual(msgs["src_empty"], "받은 서버 파일이 비어 있다: {0}")
         self.assertEqual(msgs["no_health"], '서버가 응답하지 않는다. 로그를 확인해라: Get-Content -Tail 30 "{0}"')
-        self.assertEqual(msgs["help1"], "herdr-remote 설치기(Windows). 사용: powershell -File install.ps1 [-DryRun] [-Uninstall] [-Help]")
+        self.assertEqual(msgs["help1"], "Sheltie 설치기(Windows). 사용: powershell -File install.ps1 [-DryRun] [-Uninstall] [-Help]")
         self.assertTrue(msgs["no_hc"].startswith("hc(herdr-core)가 없다."))
         self.assertIn("%LOCALAPPDATA%\\Programs\\herdr-core\\hc.exe", msgs["no_hc"])
 
     def test_dry_run_env_supported(self):
-        self.assertIn("HERDR_REMOTE_DRY_RUN", read(INSTALL))
+        self.assertIn("SHELTIE_DRY_RUN", read(INSTALL))
 
     def test_no_ps7_only_syntax(self):
         t = read(INSTALL)

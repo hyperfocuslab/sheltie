@@ -37,7 +37,7 @@
      │                                                                                              │         │
      │ 변경                                                                                         │         │
      │                                                                                              │         │
-     │ - 파일: /Users/dev/Documents/github/_scratch/herdr-remote/hrtest/hello.txt │                           │
+     │ - 파일: /Users/dev/Documents/github/_scratch/sheltie/hrtest/hello.txt      │                           │
      │ - 내용 hi\n → bye\n (Write로 덮어쓰기)                                                       │         │
      │                                                                                              │         │
      │ 검증                                                                                         │         │
@@ -59,7 +59,7 @@
      │                                                                                              │         │
      │ 변경                                                                                         │         │
      │                                                                                              │         │
-     │ - 파일: /Users/dev/Documents/github/_scratch/herdr-remote/hrtest/hello.txt │                           │
+     │ - 파일: /Users/dev/Documents/github/_scratch/sheltie/hrtest/hello.txt      │                           │
      │ - 내용 hi\n → bye\n (Write로 덮어쓰기)                                                       │         │
      │                                                                                              │         │
      │ 검증                                                                                         │         │
@@ -74,7 +74,7 @@
   ⎿  Plan saved to: ~/.claude/plans/hello-txt-bye-smooth-ullman.md · /plan to edit                            │
      hello.txt 내용을 hey로 변경                                                                              │
                                                                                                               │
-     - 파일: /Users/dev/Documents/github/_scratch/herdr-remote/hrtest/hello.txt                               │
+     - 파일: /Users/dev/Documents/github/_scratch/sheltie/hrtest/hello.txt                                    │
      - hi\n → hey\n로 덮어쓰기                                                                                │
      - 검증: cat hello.txt 출력이 hey                                                                         │
                                                                                                               │
