@@ -1,6 +1,6 @@
 # Sheltie server
 
-Server for the **Sheltie** iOS app. It runs on a Mac or a Windows PC. Sheltie lets you answer your coding agents from your iPhone: permission prompts, questions and plan approvals show up as notifications with Allow / Always allow / Deny buttons, so you can reply from the lock screen without opening the app.
+Server for the **Sheltie** app (iPhone; Android in closed testing). It runs on a Mac or a Windows PC. Sheltie lets you answer your coding agents from your phone: permission prompts, questions and plan approvals show up as notifications with Allow / Always allow / Deny buttons, so you can reply from the lock screen without opening the app.
 
 It works two ways:
 
@@ -9,14 +9,16 @@ It works two ways:
 
 **Get the iPhone app:** [Sheltie on the App Store](https://apps.apple.com/app/id6837271201)
 
+**Android:** closed testing on Google Play. [How to join](https://hyperfocuslab.app/en/sheltie/#android)
+
 Not affiliated with herdr or Anthropic.
 
 ## Requirements
 
-- The [Sheltie app](https://apps.apple.com/app/id6837271201) on your iPhone (iOS 18+)
+- The [Sheltie app](https://apps.apple.com/app/id6837271201) on your iPhone (iOS 18+), or the Android app from the [closed test](https://hyperfocuslab.app/en/sheltie/#android)
 - macOS with `python3` (3.9+), or Windows 10/11 (x64) with Python 3.9+ from [python.org](https://www.python.org/downloads/)
 - Claude Code or Codex. herdr-core (`hc`) is optional, see above
-- [Tailscale](https://tailscale.com) on the computer and the iPhone. The server listens on `127.0.0.1` and is exposed only inside your tailnet with `tailscale serve`. It never uses Funnel.
+- [Tailscale](https://tailscale.com) on the computer and the phone. The server listens on `127.0.0.1` and is exposed only inside your tailnet with `tailscale serve`. It never uses Funnel.
 
 ## Install
 
