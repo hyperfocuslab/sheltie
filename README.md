@@ -26,14 +26,14 @@ Not affiliated with herdr or Anthropic.
 curl -fsSL https://raw.githubusercontent.com/hyperfocuslab/sheltie/main/install.sh | sh
 ```
 
-The installer copies the server to `~/.local/share/herdr-remote/`, creates a token in `~/.config/herdr-remote/` (mode 0600), registers a launchd agent, runs `tailscale serve --bg --https=8790 http://127.0.0.1:8790`, checks `/api/health`, and prints a QR code. Scan it with the Sheltie app.
+The installer copies the server to `~/.local/share/sheltie/`, creates a token in `~/.config/sheltie/` (mode 0600), registers a launchd agent, runs `tailscale serve --bg --https=8790 http://127.0.0.1:8790`, checks `/api/health`, and prints a QR code. Scan it with the Sheltie app.
 
 Options: `--dry-run` prints what it would do. `--uninstall` removes the launchd agent, the `tailscale serve` entry and the Sheltie hooks, and keeps your config. `--no-hooks` skips the Claude Code and Codex hooks.
 
 Show the pairing QR again:
 
 ```sh
-python3 ~/.local/share/herdr-remote/herdr_remote.py pair
+python3 ~/.local/share/sheltie/sheltie.py pair
 ```
 
 ### Windows
@@ -44,14 +44,14 @@ Run this in PowerShell as your normal user. To use herdr-core, install it first 
 irm https://raw.githubusercontent.com/hyperfocuslab/sheltie/main/install.ps1 | iex
 ```
 
-The installer copies the server to `%LOCALAPPDATA%\herdr-remote\`, creates a token in `%USERPROFILE%\.config\herdr-remote\`, registers a Task Scheduler task (`Sheltie herdr-remote`, runs at logon without a console window), runs the same `tailscale serve` command, checks `/api/health`, and prints a QR code.
+The installer copies the server to `%LOCALAPPDATA%\sheltie\`, creates a token in `%USERPROFILE%\.config\sheltie\`, registers a Task Scheduler task (`Sheltie`, runs at logon without a console window), runs the same `tailscale serve` command, checks `/api/health`, and prints a QR code.
 
-To uninstall, set `$env:HERDR_REMOTE_UNINSTALL=1` before the same command. With a local copy, run `powershell -ExecutionPolicy Bypass -File install.ps1 -Uninstall` (or `-DryRun`).
+To uninstall, set `$env:SHELTIE_UNINSTALL=1` before the same command. With a local copy, run `powershell -ExecutionPolicy Bypass -File install.ps1 -Uninstall` (or `-DryRun`).
 
 Show the pairing QR again:
 
 ```powershell
-python "$env:LOCALAPPDATA\herdr-remote\herdr_remote.py" pair
+python "$env:LOCALAPPDATA\sheltie\sheltie.py" pair
 ```
 
 ## Hooks
