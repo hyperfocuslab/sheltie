@@ -18,7 +18,7 @@ ssh my-mac '/opt/homebrew/bin/tailscale serve --bg --https=8790 http://127.0.0.1
 
 상시 실행 설치(홈이 외장 볼륨이면 ~/Library/LaunchAgents는 bootstrap이 실패한다.
 /Library/LaunchAgents에 root 소유로 두고 사용자 gui 도메인에 올린다. sudo 비밀번호가 필요하다):
-ssh -t my-mac 'python3 ~/Documents/github/sheltie/server/sheltie.py init && sudo install -o root -g wheel -m 644 ~/Documents/github/sheltie/deploy/com.hyperfocuslab.sheltie.plist /Library/LaunchAgents/ && launchctl bootstrap gui/$(id -u) /Library/LaunchAgents/com.hyperfocuslab.sheltie.plist'
+ssh -t my-mac 'python3 ~/Documents/github/herdr-remote/server/sheltie.py init && sudo install -o root -g wheel -m 644 ~/Documents/github/herdr-remote/deploy/com.hyperfocuslab.sheltie.plist /Library/LaunchAgents/ && launchctl bootstrap gui/$(id -u) /Library/LaunchAgents/com.hyperfocuslab.sheltie.plist'
 재시작: launchctl kickstart -k gui/$(id -u)/com.hyperfocuslab.sheltie; tail ~/Library/Logs/sheltie.log
 해제: launchctl bootout gui/$(id -u)/com.hyperfocuslab.sheltie && sudo rm /Library/LaunchAgents/com.hyperfocuslab.sheltie.plist
 APNs 키: Apple Developer에서 받은 .p8을 ~/.config/sheltie/AuthKey.p8 (0600)에 둔다. 없으면 푸시만 꺼진다.

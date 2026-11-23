@@ -527,7 +527,7 @@ class ApnsTests(unittest.TestCase):
 
     @unittest.skipUnless(_openssl_bins(), "openssl 없음")
     def test_real_openssl_jwt_verifies(self):
-        base = os.path.expanduser("~/Documents/github/_scratch/sheltie")
+        base = os.path.expanduser("~/Documents/github/_scratch/herdr-remote")
         os.makedirs(base, exist_ok=True)
         tmp = tempfile.mkdtemp(dir=base)
         try:
@@ -1545,7 +1545,7 @@ class QrTests(unittest.TestCase):
 
     @unittest.skipUnless(_zbarimg(), "zbarimg 없음(brew install zbar)")
     def test_zbar_decodes(self):
-        base = os.path.expanduser("~/Documents/github/_scratch/sheltie")
+        base = os.path.expanduser("~/Documents/github/_scratch/herdr-remote")
         os.makedirs(base, exist_ok=True)
         tmp = tempfile.mkdtemp(dir=base)
         try:
