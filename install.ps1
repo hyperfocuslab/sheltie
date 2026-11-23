@@ -5,9 +5,11 @@
 #   SHELTIE_TAILSCALE (tailscale CLI path), SHELTIE_SKIP_TAILSCALE=1 (skip tailscale check/serve/pair; for tests),
 #   SHELTIE_HEALTH_TRIES (health check attempts, default 10), SHELTIE_STOP_WAIT (seconds to wait for the old
 #   server to free its port before killing it, default 15)
-#   -NoHc / SHELTIE_NO_HC=1: do not auto-install herdr-core when hc.exe is missing (the official installer
-#   https://releases.herdr.dev/core/install.ps1 runs otherwise; failure never stops this install).
-#   SHELTIE_HC_INSTALLER: override that installer (https URL or local path, http refused; for tests).
+#   -NoHc / SHELTIE_NO_HC=1: do not auto-install herdr-core when hc.exe is missing (otherwise the pinned
+#   herdr-core zip is downloaded, checked against the SHA256 below and installed into
+#   %LOCALAPPDATA%\Programs\herdr-core; failure never stops this install).
+#   SHELTIE_HC_URL / SHELTIE_HC_SHA256: override that zip source (https URL or local file, http refused) and its
+#   expected hash (for tests).
 #   Uninstall never removes herdr-core.
 #   Also creates %LOCALAPPDATA%\sheltie\bin\sheltie.cmd (run: sheltie run gemini) and adds that folder to the
 #   user PATH (HKCU\Environment, or the key in SHELTIE_ENV_KEY; for tests). Uninstall removes both.
@@ -19,8 +21,11 @@
   $ProgressPreference = 'SilentlyContinue'
   $global:HRCode = 0
 
+  # Pinned herdr-core version. If you change it, change server/sheltie.py HC_TESTED_VERSIONS too; measurements live in docs/plans/standalone-runner.md.
+  $HC_PIN_VERSION = '0.1.21'
+  $HC_SHA_WIN = 'a8984634c35b58ba82d0aec078d5a5e6004da01d5a25b3daf822ab5e31c7312b'
+  $HC_BASE_URL = "https://releases.herdr.dev/core/$HC_PIN_VERSION"
   # Default source of the server file. Change only this line if the repo is renamed.
-  $HC_INSTALLER_URL = 'https://releases.herdr.dev/core/install.ps1'
   $DEFAULT_SRC = 'https://raw.githubusercontent.com/hyperfocuslab/sheltie/main/server/sheltie.py'
   $TASK = 'Sheltie'
   $LOCAL = $env:LOCALAPPDATA
@@ -123,17 +128,23 @@
     help6 = 'ICAtTm9IYzogaGMoaGVyZHItY29yZSnqsIAg7JeG7Ja064+EIOyekOuPmSDshKTsuZjtlZjsp4Ag7JWK64qU64ukLiDtmZjqsr3rs4DsiJggU0hFTFRJRV9OT19IQz0xLCDshKTsuZgg7Iqk7YGs66a97Yq4IOy2nOyymCBTSEVMVElFX0hDX0lOU1RBTExFUihodHRwcyBVUkwg65iQ64qUIOuhnOy7rCDqsr3roZwp' # help line 6
     hc_skip = 'KGhlcmRyLWNvcmUg7J6Q64+ZIOyEpOy5mCDqsbTrhIjrnIAp' # hc auto-install skipped
     hc_fail = 'aGVyZHItY29yZSDsnpDrj5kg7ISk7LmY66W8IOuquyDtlojri6QoezB9KS4=' # hc auto-install failed
-    hc_http = '7ISk7LmYIOyKpO2BrOumve2KuOuKlCBodHRwc+uhnOunjCDrsJvripTri6Q6IHswfQ==' # hc installer https only
-    hc_dry = 'KyBoZXJkci1jb3JlIOyEpOy5mCh7MH0p' # dry-run hc install
-    hc_installing = 'aGVyZHItY29yZeulvCDshKTsuZjtlZzri6QoezB9KQ==' # hc installing
+    hc_http = 'aGVyZHItY29yZeuKlCBodHRwc+uhnOunjCDrsJvripTri6Q6IHswfQ==' # hc download https only
+    hc_dry = 'KyBoZXJkci1jb3JlIHswfSDshKTsuZgoezF9KQ==' # dry-run hc install
+    hc_installing = 'aGVyZHItY29yZSB7MH0g7J2EIOyEpOy5mO2VnOuLpCh7MX0p' # hc installing
     hc_dl = '67Cb7KeAIOuqu+2WiOuLpDogezB9' # hc installer download failed
     hc_nofile = '7YyM7J287J20IOyXhuuLpDogezB9' # hc installer file missing
-    hc_empty = '67Cb7J2AIOyKpO2BrOumve2KuOqwgCDruYTslrQg7J6I64uk' # hc installer empty
-    hc_rc = '7ISk7LmYIOyKpO2BrOumve2KuOqwgCDsi6TtjKjtlojri6Qo7KKF66OMIOy9lOuTnCB7MH0p' # hc installer exit code
+    hc_sum = '7LK07YGs7ISsIOu2iOydvOy5mDog67Cb7J2AIO2MjOydvOydtCDsmIjsg4Hqs7wg64uk66W064uk' # hc checksum mismatch
+    hc_noarch = 'KGhlcmRyLWNvcmUg7J6Q64+ZIOyEpOy5mCDqsbTrhIjrnIA6IOydtCBDUFXsmqkg67mM65Oc6rCAIOyXhuuLpCk=' # hc no build for this CPU
+    hc_nosum = '6rKA7Kad7ZWgIOyytO2BrOyErOydtCDsl4bri6Q=' # hc no checksum
+    hc_extract = '7JWV7LaV7J2EIO2SgOyngCDrqrvtlojri6Q=' # hc extract failed
+    hc_nocore = '67Cb7J2AIOustuydjOyXkCBoZXJkci1jb3Jl6rCAIOyXhuqxsOuCmCDrtojsmYTsoITtlZjri6Q=' # hc bundle incomplete
+    hc_norun = '67Cb7J2AIGhlcmRyLWNvcmXqsIAg7J20IOq4sOq4sOyXkOyEnCDsi6TtlonrkJjsp4Ag7JWK64qU64uk' # hc does not run
+    hc_copy = 'ezB9IOyXkCDshKTsuZjtlZjsp4Ag66q77ZaI64uk' # hc copy failed
     hc_nohc = '7ISk7LmYIOuSpOyXkOuPhCBoY+ulvCDssL7sp4Ag66q77ZaI64uk' # hc still missing
     cmd_foreign = 'ezB9IOqwgCDsnbTrr7gg7J6I6rOgIFNoZWx0aWXqsIAg66eM65OgIO2MjOydvOydtCDslYTri4jrnbwg6rG065Oc66as7KeAIOyViuyVmOuLpC4gc2hlbHRpZSDrqoXroLnsnYAg66eM65Ok7KeAIOyViuyVmOuLpC4=' # sheltie.cmd foreign
     cmd_dry = 'KyB7MH0g7J6R7ISxKHNoZWx0aWUgcnVuIDzsl5DsnbTsoITtirg+KQ==' # dry-run sheltie.cmd
     cmd_fail = 'c2hlbHRpZSDrqoXroLnsnYQg66eM65Ok7KeAIOuqu+2WiOuLpDogezB9' # sheltie.cmd failed
+    hc_path_added = '7IKs7Jqp7J6QIFBBVEjsl5AgezB9IOulvCDstpTqsIDtlojri6QuIOyDiCDthLDrr7jrhJDrtoDthLAgaGPqsIAg7J6h7Z6M64ukLg==' # hc folder added to PATH
     cmd_path_added = '7IKs7Jqp7J6QIFBBVEjsl5AgezB9IOulvCDstpTqsIDtlojri6QuIOyDiCDthLDrr7jrhJDsnYQg7Je07Ja07JW8IHNoZWx0aWUg66qF66C57J20IOyeoe2ejOuLpC4=' # PATH entry added
     cmd_path_dry = 'KyDsgqzsmqnsnpAgUEFUSOyXkCB7MH0g7LaU6rCA' # dry-run PATH add
     cmd_path_dry_rm = 'KyDsgqzsmqnsnpAgUEFUSOyXkOyEnCB7MH0g7KCc6rGw' # dry-run PATH remove
@@ -623,43 +634,78 @@ except Exception:
     if (Test-Path -LiteralPath $p -PathType Leaf) { return $p }
     $h = Get-Command hc -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($h) { return $h.Source }
+    $c = Join-Path $LOCAL 'Programs\herdr-core\herdr-core.exe'
+    if (Test-Path -LiteralPath $c -PathType Leaf) { return $c }
     return $null
   }
   function Install-Hc {
-    # Run the official herdr-core installer when hc.exe is missing. Never throws: returns the hc path or $null.
+    # Download the pinned herdr-core zip, check its SHA256 and install it. Never throws: returns the hc path or $null.
     if ($NOHC -or $env:SHELTIE_NO_HC -eq '1') { Say (T 'hc_skip'); return $null }
-    $src = $env:SHELTIE_HC_INSTALLER
-    if (-not $src) { $src = $HC_INSTALLER_URL }
+    $src = $env:SHELTIE_HC_URL
+    if (-not $src) {
+      $arch = $env:PROCESSOR_ARCHITEW6432
+      if (-not $arch) { $arch = $env:PROCESSOR_ARCHITECTURE }
+      if ($arch -ne 'AMD64') { Say (T 'hc_noarch'); return $null }
+      $src = "$HC_BASE_URL/herdr-core-windows-x86_64.zip"
+    }
+    $want = $env:SHELTIE_HC_SHA256
+    if (-not $want) { $want = $HC_SHA_WIN }
     if ($src -like 'http://*') { Say (T 'hc_fail' (T 'hc_http' $src)); return $null }
-    if ($DRY) { Say (T 'hc_dry' $src); return $null }
-    $tmp = Join-Path ([IO.Path]::GetTempPath()) ('sheltie-hc.' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.ps1')
+    if ($DRY) { Say (T 'hc_dry' $HC_PIN_VERSION $src); return $null }
+    if (-not $want) { Say (T 'hc_fail' (T 'hc_nosum')); return $null }
+    $tmp = Join-Path ([IO.Path]::GetTempPath()) ('sheltie-hc.' + [guid]::NewGuid().ToString('N').Substring(0, 8))
     try {
+      New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+      $zip = Join-Path $tmp 'hc.zip'
+      Say (T 'hc_installing' $HC_PIN_VERSION $src)
       if ($src -like 'https://*') {
         try {
           [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
         } catch {}
-        try { Invoke-WebRequest -UseBasicParsing -Uri $src -OutFile $tmp } catch { Say (T 'hc_fail' (T 'hc_dl' $src)); return $null }
+        try { Invoke-WebRequest -UseBasicParsing -Uri $src -OutFile $zip } catch { Say (T 'hc_fail' (T 'hc_dl' $src)); return $null }
       } else {
         if (-not (Test-Path -LiteralPath $src -PathType Leaf)) { Say (T 'hc_fail' (T 'hc_nofile' $src)); return $null }
-        Copy-Item -LiteralPath $src -Destination $tmp -Force
+        Copy-Item -LiteralPath $src -Destination $zip -Force
       }
-      if (-not (Test-Path -LiteralPath $tmp) -or (Get-Item -LiteralPath $tmp).Length -eq 0) { Say (T 'hc_fail' (T 'hc_empty')); return $null }
-      Say (T 'hc_installing' $src)
-      $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-      if (-not (Test-Path -LiteralPath $ps -PathType Leaf)) { $ps = 'powershell' }
-      & $ps -NoProfile -ExecutionPolicy Bypass -File $tmp | Out-Host
-      if ($LASTEXITCODE -ne 0) { Say (T 'hc_fail' (T 'hc_rc' $LASTEXITCODE)); return $null }
+      # .NET, not Get-FileHash: that one fails when PowerShell 7 starts 5.1.
+      $stream = [IO.File]::OpenRead($zip)
+      try { $got = -join ([Security.Cryptography.SHA256]::Create().ComputeHash($stream) | ForEach-Object { $_.ToString('x2') }) } finally { $stream.Close() }
+      if ($got -ne $want.Trim().ToLowerInvariant()) { Say (T 'hc_fail' (T 'hc_sum')); return $null }
+      # Windows' own tar opens zips; Git Bash's, often first on PATH, cannot.
+      $tar = Join-Path $env:SystemRoot 'System32\tar.exe'
+      $x = Join-Path $tmp 'x'
+      New-Item -ItemType Directory -Force -Path $x | Out-Null
+      if (-not (Test-Path -LiteralPath $tar -PathType Leaf)) { Say (T 'hc_fail' (T 'hc_extract')); return $null }
+      & $tar -xf $zip -C $x
+      if ($LASTEXITCODE -ne 0) { Say (T 'hc_fail' (T 'hc_extract')); return $null }
+      $new = Join-Path $x 'herdr-core.exe'
+      if (-not (Test-Path -LiteralPath $new -PathType Leaf) -or -not (Test-Path -LiteralPath (Join-Path $x 'conpty\conpty.dll') -PathType Leaf)) {
+        Say (T 'hc_fail' (T 'hc_nocore')); return $null
+      }
+      $runs = $false
+      try { & $new --version *> $null; $runs = ($LASTEXITCODE -eq 0) } catch { $runs = $false }
+      if (-not $runs) { Say (T 'hc_fail' (T 'hc_norun')); return $null }
+      $dir = Join-Path $LOCAL 'Programs\herdr-core'
+      $exe = Join-Path $dir 'herdr-core.exe'
+      try {
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        Copy-Item -LiteralPath $new -Destination $exe -Force
+        Copy-Item -LiteralPath (Join-Path $x 'conpty') -Destination $dir -Recurse -Force
+        $notices = Join-Path $x 'THIRD-PARTY-NOTICES'
+        if (Test-Path -LiteralPath $notices) { Copy-Item -LiteralPath $notices -Destination $dir -Recurse -Force }
+      } catch { Say (T 'hc_fail' (T 'hc_copy' $dir)); return $null }
+      $hcExe = Join-Path $dir 'hc.exe'
+      if (-not (Get-Command hc -CommandType Application -ErrorAction SilentlyContinue) -and -not (Test-Path -LiteralPath $hcExe)) {
+        try { New-Item -ItemType HardLink -Path $hcExe -Target $exe | Out-Null } catch { Say (T 'hc_fail' $_.Exception.Message) }
+      }
+      try { if (Add-UserPath $dir) { Say (T 'hc_path_added' $dir) } } catch { Say (T 'hc_fail' $_.Exception.Message) }
     } catch {
       Say (T 'hc_fail' $_.Exception.Message)
       return $null
     } finally {
-      Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+      Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
     }
     $h = Find-Hc
-    if (-not $h) {
-      $c = Join-Path $LOCAL 'Programs\herdr-core\herdr-core.exe'
-      if (Test-Path -LiteralPath $c -PathType Leaf) { $h = $c }
-    }
     if (-not $h) { Say (T 'hc_fail' (T 'hc_nohc')); return $null }
     return $h
   }

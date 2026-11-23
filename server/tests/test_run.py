@@ -229,5 +229,62 @@ else: print("{}")
         self.assertIn("rm t4", text)
 
 
+class HcVersionTest(unittest.TestCase):
+    def runner(self, out, rc=0):
+        return lambda argv, **kw: subprocess.CompletedProcess(argv, rc, out, "")
+
+    def setUp(self):
+        fd, self.hc = tempfile.mkstemp()
+        os.close(fd)
+
+    def test_parse(self):
+        self.assertEqual(sheltie.parse_hc_version("hc 0.1.21\n"), "0.1.21")
+        self.assertIsNone(sheltie.parse_hc_version("hc dev"))
+
+    def test_tested_version_no_warning(self):
+        with self.assertNoLogs(sheltie.log, "WARNING"):
+            r = sheltie.hc_version_check(self.hc, runner=self.runner("hc 0.1.21\n"))
+        self.assertEqual(r, {"hc_version": "0.1.21", "hc_tested": True})
+
+    def test_untested_version_warns_once_line(self):
+        with self.assertLogs(sheltie.log, "WARNING") as cm:
+            r = sheltie.hc_version_check(self.hc, runner=self.runner("hc 0.1.22\n"))
+        self.assertEqual(r, {"hc_version": "0.1.22", "hc_tested": False})
+        self.assertEqual(len(cm.output), 1)
+        self.assertIn("0.1.22", cm.output[0])
+
+    def test_missing_or_unreadable(self):
+        self.assertEqual(sheltie.hc_version_check(""), {"hc_version": None, "hc_tested": None})
+        with self.assertLogs(sheltie.log, "WARNING"):
+            r = sheltie.hc_version_check(self.hc, runner=self.runner("", rc=1))
+        self.assertEqual(r, {"hc_version": None, "hc_tested": None})
+
+    def test_installers_pin_tested_version(self):
+        root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
+        import re
+        for name in ("install.sh", "install.ps1"):
+            with open(os.path.join(root, name), encoding="utf-8") as f:
+                m = re.search(r"HC_PIN_VERSION\s*=\s*['\"]([0-9.]+)['\"]", f.read())
+            self.assertIsNotNone(m, name)
+            self.assertIn(m.group(1), sheltie.HC_TESTED_VERSIONS, name)
+
+    def test_health_has_hc_fields(self):
+        import threading
+        import urllib.request
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from test_sheltie import make_app
+        app, _, _ = make_app(tempfile.mkdtemp())
+        app.hc_version = {"hc_version": "0.1.22", "hc_tested": False}
+        srv = sheltie.make_server(app, "127.0.0.1", 0)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        req = urllib.request.Request("http://127.0.0.1:%d/api/health" % srv.server_address[1],
+                                     headers={"Authorization": "Bearer " + app.cfg["token"]})
+        with urllib.request.urlopen(req) as r:
+            body = json.load(r)
+        self.assertEqual((body["hc_version"], body["hc_tested"]), ("0.1.22", False))
+
+
 if __name__ == "__main__":
     unittest.main()

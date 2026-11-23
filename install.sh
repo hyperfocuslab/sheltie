@@ -1,8 +1,9 @@
 #!/bin/sh
 # Sheltie 설치기(macOS). 사용: sh install.sh [--dry-run] [--uninstall] [--no-hooks] [--no-hc]
 #   --no-hooks: Claude Code·Codex·Qwen Code 훅과 OpenCode 플러그인 등록(해제)을 건너뜀. hc(herdr-core)가 없어도 설치는 계속한다(공식 훅으로만 동작).
-#   --no-hc: hc(herdr-core)가 없어도 공식 설치 스크립트로 자동 설치하지 않는다(SHELTIE_NO_HC=1과 같다). 자동 설치가 실패해도 설치는 계속한다.
-#   환경변수 SHELTIE_HC_INSTALLER: herdr-core 설치 스크립트 출처 덮어쓰기(https URL 또는 로컬 경로, 시험용). 해제는 herdr-core를 지우지 않는다.
+#   --no-hc: hc(herdr-core)가 없어도 자동 설치하지 않는다(SHELTIE_NO_HC=1과 같다). 없으면 고정 버전(HC_PIN_VERSION) 파일을 받아
+#   이 파일에 박힌 SHA256으로 검증한 뒤 ~/.local/bin에 설치한다. 실패해도 설치는 계속한다. 해제는 herdr-core를 지우지 않는다.
+#   시험용 환경변수 SHELTIE_HC_URL(받을 파일: https URL 또는 로컬 경로, http 거부), SHELTIE_HC_SHA256(기대 해시 덮어쓰기)
 #   `sheltie` 명령: ~/.local/bin/sheltie 를 만든다(예: sheltie run gemini). 표시 없는 같은 이름 파일은 건드리지 않는다.
 #   환경변수: SHELTIE_SRC(서버 파일 https URL 또는 로컬 경로. 기본: 옆의 server/ 파일, 없으면 GitHub raw), SHELTIE_HC(hc 경로),
 #   SHELTIE_PORT(기본 8790), SHELTIE_TAILSCALE(tailscale CLI 경로),
@@ -11,8 +12,12 @@
 #   이전 설치가 있으면 서비스를 내리고 설정 폴더를 새 위치로 옮긴다.
 set -eu
 
+# herdr-core 고정 버전. 바꾸면 server/sheltie.py HC_TESTED_VERSIONS도 같이, 실측 근거를 docs/plans/standalone-runner.md에 적는다.
+HC_PIN_VERSION="0.1.21"
+HC_SHA_MACOS_AARCH64="1ab38dd9270f63a8f794d6d60e8702eb0d1c85a72bda85d735e5eea43f05ffed"
+HC_SHA_MACOS_X86_64="e377e1d342cddce0346da5b2f3c281b9701e4731c00024c7c5028265e77a217f"
+HC_BASE_URL="https://releases.herdr.dev/core/$HC_PIN_VERSION"
 # 서버 파일 기본 출처. 저장소 이름이 바뀌면 이 한 줄만 고친다.
-HC_INSTALLER_URL="https://releases.herdr.dev/core/install.sh"
 DEFAULT_SRC="https://raw.githubusercontent.com/hyperfocuslab/sheltie/main/server/sheltie.py"
 LABEL="com.hyperfocuslab.sheltie"
 DATA_DIR="$HOME/.local/share/sheltie"
@@ -50,7 +55,7 @@ for a in "$@"; do
     --uninstall) MODE=uninstall ;;
     --no-hooks) NOHOOKS=1 ;;
     --no-hc) NOHC=1 ;;
-    -h|--help) sed -n '2,11p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
     *) echo "알 수 없는 옵션: $a (--dry-run, --uninstall, --no-hooks, --no-hc)" >&2; exit 2 ;;
   esac
 done
@@ -585,30 +590,70 @@ find_hc() {
     HC="$HOME/.local/bin/hc"
   elif p=$(command -v hc 2>/dev/null) && [ -x "$p" ]; then
     HC=$p
+  elif [ -x "$HOME/.local/bin/herdr-core" ]; then
+    HC="$HOME/.local/bin/herdr-core"
   fi
   return 0
 }
 find_hc
 
-# hc가 없으면 herdr-core 공식 설치 스크립트를 받아 돌린다. 실패해도 설치는 계속한다(훅은 hc 없이 된다).
+# hc가 없으면 고정 버전 herdr-core를 받아 SHA256을 확인하고 직접 깐다. 실패해도 설치는 계속한다(훅은 hc 없이 된다). 코어는 띄우지 않는다.
 hc_fail() { say "herdr-core 자동 설치를 못 했다($1)."; }
+hc_sha256() { shasum -a 256 "$1" 2>/dev/null | cut -d' ' -f1; }
+# 임시 폴더 $1 안에서 받기 -> 해시 확인 -> 풀기 -> 설치. 실패는 hc_fail로 알리고 1로 돌아온다.
+hc_fetch_install() {
+  _hd=$1; _hsrc=$2; _hwant=$3
+  case "$_hsrc" in
+    https://*) curl --proto '=https' --tlsv1.2 -fsSL -o "$_hd/hc.tar.gz" "$_hsrc" || { hc_fail "받지 못했다: $_hsrc"; return 1; } ;;
+    *) if [ -f "$_hsrc" ]; then cp "$_hsrc" "$_hd/hc.tar.gz" || { hc_fail "파일을 못 읽었다: $_hsrc"; return 1; }; else hc_fail "파일이 없다: $_hsrc"; return 1; fi ;;
+  esac
+  _hgot=$(hc_sha256 "$_hd/hc.tar.gz")
+  if [ -z "$_hgot" ] || [ "$_hgot" != "$_hwant" ]; then hc_fail "체크섬 불일치: 받은 파일이 예상과 다르다"; return 1; fi
+  mkdir "$_hd/x" && tar -xzf "$_hd/hc.tar.gz" -C "$_hd/x" || { hc_fail "압축을 풀지 못했다"; return 1; }
+  _hbin="$HOME/.local/bin"
+  _hbundled="$_hd/x/Herdr Core.app/Contents/MacOS/herdr-core"
+  _hcore="$_hd/x/herdr-core"
+  if [ -x "$_hbundled" ] && [ "$(id -u)" != 0 ]; then
+    /usr/bin/codesign --verify --strict -R '=identifier "dev.herdr.core" and anchor apple generic and certificate leaf[subject.OU] = "2W9652Q7QR"' "$_hd/x/Herdr Core.app" || { hc_fail "Herdr 서명 확인 실패"; return 1; }
+    "$_hbundled" --version >/dev/null 2>&1 || { hc_fail "받은 herdr-core가 이 기기에서 실행되지 않는다"; return 1; }
+    mkdir -p "$_hbin" || { hc_fail "$_hbin 을 만들지 못했다"; return 1; }
+    "$_hbundled" --hc-install-bundle "$_hbundled" "$_hbin/herdr-core" || { hc_fail "Herdr Core.app 설치 실패"; return 1; }
+  else
+    [ -f "$_hcore" ] || { hc_fail "받은 묶음에 herdr-core가 없다"; return 1; }
+    chmod 755 "$_hcore"
+    "$_hcore" --version >/dev/null 2>&1 || { hc_fail "받은 herdr-core가 이 기기에서 실행되지 않는다"; return 1; }
+    mkdir -p "$_hbin" || { hc_fail "$_hbin 을 만들지 못했다"; return 1; }
+    cp "$_hcore" "$_hbin/herdr-core.new" && chmod 755 "$_hbin/herdr-core.new" && mv -f "$_hbin/herdr-core.new" "$_hbin/herdr-core" \
+      || { rm -f "$_hbin/herdr-core.new"; hc_fail "$_hbin/herdr-core 를 쓰지 못했다"; return 1; }
+  fi
+  if ! command -v hc >/dev/null 2>&1 && [ ! -e "$_hbin/hc" ] && [ ! -L "$_hbin/hc" ]; then
+    ln -s herdr-core "$_hbin/hc" || hc_fail "hc 링크를 못 만들었다"
+  fi
+  return 0
+}
 install_hc() {
   if [ "$NOHC" = 1 ] || [ "${SHELTIE_NO_HC:-}" = 1 ]; then say "(herdr-core 자동 설치 건너뜀)"; return 0; fi
   [ -z "${SHELTIE_HC:-}" ] || return 0
-  _hsrc=${SHELTIE_HC_INSTALLER:-$HC_INSTALLER_URL}
-  case "$_hsrc" in
-    http://*) hc_fail "설치 스크립트는 https로만 받는다: $_hsrc"; return 0 ;;
+  case "$(uname -m)" in
+    arm64|aarch64) _htarget=macos-aarch64; _hpin=$HC_SHA_MACOS_AARCH64 ;;
+    x86_64) _htarget=macos-x86_64; _hpin=$HC_SHA_MACOS_X86_64 ;;
+    *) _htarget=""; _hpin="" ;;
   esac
-  if [ "$DRY" = 1 ]; then say "+ herdr-core 설치($_hsrc)"; return 0; fi
-  _htmp=$(mktemp "${TMPDIR:-/tmp}/sheltie-hc.XXXXXX") || { hc_fail "임시 파일을 못 만들었다"; return 0; }
+  _hsrc=${SHELTIE_HC_URL:-}
+  if [ -z "$_hsrc" ]; then
+    if [ -z "$_htarget" ]; then say "(herdr-core 자동 설치 건너뜀: 이 CPU용 빌드가 없다)"; return 0; fi
+    _hsrc="$HC_BASE_URL/herdr-core-$_htarget.tar.gz"
+  fi
+  _hwant=${SHELTIE_HC_SHA256:-$_hpin}
   case "$_hsrc" in
-    https://*) curl --proto '=https' --tlsv1.2 -fsSL -o "$_htmp" "$_hsrc" || { rm -f "$_htmp"; hc_fail "받지 못했다: $_hsrc"; return 0; } ;;
-    *) if [ -f "$_hsrc" ]; then cp "$_hsrc" "$_htmp"; else rm -f "$_htmp"; hc_fail "파일이 없다: $_hsrc"; return 0; fi ;;
+    http://*) hc_fail "herdr-core는 https로만 받는다: $_hsrc"; return 0 ;;
   esac
-  if [ ! -s "$_htmp" ]; then rm -f "$_htmp"; hc_fail "받은 스크립트가 비어 있다"; return 0; fi
-  say "herdr-core를 설치한다($_hsrc)"
-  if ! sh "$_htmp"; then rm -f "$_htmp"; hc_fail "설치 스크립트가 실패했다"; return 0; fi
-  rm -f "$_htmp"
+  if [ "$DRY" = 1 ]; then say "+ herdr-core $HC_PIN_VERSION 설치($_hsrc)"; return 0; fi
+  [ -n "$_hwant" ] || { hc_fail "검증할 체크섬이 없다"; return 0; }
+  _hdir=$(mktemp -d "${TMPDIR:-/tmp}/sheltie-hc.XXXXXX") || { hc_fail "임시 폴더를 못 만들었다"; return 0; }
+  say "herdr-core $HC_PIN_VERSION 을 설치한다($_hsrc)"
+  hc_fetch_install "$_hdir" "$_hsrc" "$_hwant" || { rm -rf "$_hdir"; return 0; }
+  rm -rf "$_hdir"
   find_hc
   [ -n "$HC" ] || hc_fail "설치 뒤에도 hc를 찾지 못했다"
   return 0

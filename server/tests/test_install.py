@@ -328,101 +328,184 @@ class InstallTest(unittest.TestCase):
         self.assertTrue(any("https://example.invalid/sheltie.py" in x for x in self.calls()))
 
 
-    # ---- herdr-core 자동 설치
-    def hc_installer(self, body):
-        p = os.path.join(self.tmp, "hc_installer.sh")
-        with open(p, "w") as f:
-            f.write("#!/bin/sh\n" + body + "\n")
-        return p
+    # ---- herdr-core 자동 설치(고정 버전 받기 + SHA256 검증)
+    def hc_tarball(self, version_out="hc 0.1.21", name="hc.tar.gz"):
+        """안에 herdr-core 셸 스크립트가 든 가짜 tar.gz. (경로, sha256)를 돌려준다."""
+        import hashlib
+        import io
+        import tarfile
+        body = ('#!/bin/sh\nif [ "$1" = --version ]; then echo "%s"; exit 0; fi\n'
+                'echo core-ran >> "$FAKE_LOG"\n' % version_out).encode()
+        p = os.path.join(self.tmp, name)
+        with tarfile.open(p, "w:gz") as t:
+            ti = tarfile.TarInfo("herdr-core")
+            ti.size = len(body)
+            ti.mode = 0o755
+            t.addfile(ti, io.BytesIO(body))
+        with open(p, "rb") as f:
+            return p, hashlib.sha256(f.read()).hexdigest()
 
-    FAKE_HC_BODY = ('echo "hc-installer-ran" >> "$FAKE_LOG"; mkdir -p "$HOME/.local/bin"; '
-                    'printf "#!/bin/sh\\necho {}\\n" > "$HOME/.local/bin/hc"; chmod 755 "$HOME/.local/bin/hc"')
+    def local_bin(self, name=""):
+        return os.path.join(self.home, ".local/bin", name)
 
-    def test_hc_auto_install_from_local_installer(self):
+    def test_hc_auto_install_from_local_tarball(self):
         os.remove(os.path.join(self.bin, "hc"))
-        inst = self.hc_installer(self.FAKE_HC_BODY)
-        r = self.run_install(SHELTIE_HC_INSTALLER=inst)
+        tar, sha = self.hc_tarball()
+        r = self.run_install(SHELTIE_HC_URL=tar, SHELTIE_HC_SHA256=sha)
         self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
-        self.assertIn("hc-installer-ran", self.calls())
-        hc = os.path.join(self.home, ".local/bin/hc")
+        core = self.local_bin("herdr-core")
+        self.assertEqual(stat.S_IMODE(os.stat(core).st_mode), 0o755)
+        self.assertTrue(os.path.islink(self.local_bin("hc")))
+        self.assertEqual(os.readlink(self.local_bin("hc")), "herdr-core")
+        self.assertNotIn("core-ran", self.calls())  # --version 확인 말고는 코어를 띄우지 않는다
         cfg = read_json(os.path.join(self.home, ".config/sheltie/config.json"))
-        self.assertEqual(cfg["hc_path"], hc)
-        self.assertIn(os.path.dirname(hc), read(self.plist()))
+        self.assertEqual(cfg["hc_path"], self.local_bin("hc"))
+        self.assertIn(os.path.dirname(self.local_bin("hc")), read(self.plist()))
         self.assertNotIn("herdr-core 없이", r.stdout)
+        self.assertNotIn("herdr-core.new", os.listdir(self.local_bin()))
 
-    def test_hc_installer_failure_continues(self):
+    def test_hc_checksum_mismatch_installs_nothing_and_continues(self):
         os.remove(os.path.join(self.bin, "hc"))
-        inst = self.hc_installer("exit 1")
-        r = self.run_install(SHELTIE_HC_INSTALLER=inst)
+        tar, sha = self.hc_tarball()
+        r = self.run_install(SHELTIE_HC_URL=tar, SHELTIE_HC_SHA256="0" * 64)
         self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertIn("체크섬", r.stdout)
         self.assertIn("자동 설치를 못 했다", r.stdout)
         self.assertIn("herdr-core 없이 설치한다", r.stdout)
+        self.assertFalse(os.path.exists(self.local_bin("herdr-core")))
+        self.assertFalse(os.path.lexists(self.local_bin("hc")))
         cfg = read_json(os.path.join(self.home, ".config/sheltie/config.json"))
         self.assertEqual(cfg["hc_path"], "")
         self.assertTrue(os.path.exists(self.plist()))
 
-    def test_hc_installer_that_leaves_no_hc_continues(self):
+    def test_hc_download_missing_local_file_continues(self):
         os.remove(os.path.join(self.bin, "hc"))
-        inst = self.hc_installer("echo hc-installer-ran >> \"$FAKE_LOG\"")
-        r = self.run_install(SHELTIE_HC_INSTALLER=inst)
+        r = self.run_install(SHELTIE_HC_URL=os.path.join(self.tmp, "nope.tar.gz"), SHELTIE_HC_SHA256="0" * 64)
         self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
-        self.assertIn("설치 뒤에도 hc를 찾지 못했다", r.stdout)
+        self.assertIn("파일이 없다", r.stdout)
         self.assertIn("herdr-core 없이 설치한다", r.stdout)
 
-    def test_no_hc_option_and_env_skip_installer(self):
+    def test_hc_binary_that_does_not_run_is_not_installed(self):
         os.remove(os.path.join(self.bin, "hc"))
-        inst = self.hc_installer(self.FAKE_HC_BODY)
-        for args, extra in (((), {"SHELTIE_NO_HC": "1"}), (("--no-hc",), {})):
-            r = self.run_install(*args, SHELTIE_HC_INSTALLER=inst, **extra)
-            self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
-            self.assertNotIn("hc-installer-ran", self.calls())
-            self.assertFalse(os.path.exists(os.path.join(self.home, ".local/bin/hc")))
-            self.assertIn("herdr-core 없이 설치한다", r.stdout)
-
-    def test_hc_default_source_uses_official_url(self):
-        os.remove(os.path.join(self.bin, "hc"))
-        r = self.run_install()  # 가짜 curl은 빈 파일 -> 자동 설치 실패 -> 계속
+        tar, sha = self.hc_tarball(version_out="x")
+        # --version이 실패하는 herdr-core
+        import hashlib
+        import io
+        import tarfile
+        body = b"#!/bin/sh\nexit 1\n"
+        with tarfile.open(tar, "w:gz") as t:
+            ti = tarfile.TarInfo("herdr-core")
+            ti.size = len(body)
+            ti.mode = 0o755
+            t.addfile(ti, io.BytesIO(body))
+        sha = hashlib.sha256(open(tar, "rb").read()).hexdigest()
+        r = self.run_install(SHELTIE_HC_URL=tar, SHELTIE_HC_SHA256=sha)
         self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
-        curl = [x for x in self.calls() if x.startswith("curl")]
-        self.assertTrue(any("https://releases.herdr.dev/core/install.sh" in x and "--proto =https" in x for x in curl), curl)
-        self.assertIn("비어 있다", r.stdout)
+        self.assertIn("실행되지 않는다", r.stdout)
+        self.assertFalse(os.path.exists(self.local_bin("herdr-core")))
+
+    def test_hc_default_source_is_pinned_url_and_failure_continues(self):
+        os.remove(os.path.join(self.bin, "hc"))
+        self.fake("curl", 'case "$*" in *herdr*) exit 22;; esac; exit 0')
+        r = self.run_install()
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        arch = subprocess.run(["uname", "-m"], capture_output=True, text=True).stdout.strip()
+        target = {"arm64": "macos-aarch64", "aarch64": "macos-aarch64", "x86_64": "macos-x86_64"}[arch]
+        url = "https://releases.herdr.dev/core/0.1.21/herdr-core-%s.tar.gz" % target
+        curl = [x for x in self.calls() if x.startswith("curl") and "herdr" in x]
+        self.assertTrue(any(url in x and "--proto =https" in x and "--tlsv1.2" in x for x in curl), curl)
+        self.assertNotIn("install.sh", " ".join(curl))
+        self.assertIn("받지 못했다", r.stdout)
+        self.assertIn("herdr-core 없이 설치한다", r.stdout)
+        self.assertTrue(os.path.exists(self.plist()))
+
+    def test_hc_pinned_checksums_in_installer(self):
+        t = read(INSTALL)
+        for h in ("1ab38dd9270f63a8f794d6d60e8702eb0d1c85a72bda85d735e5eea43f05ffed",
+                  "e377e1d342cddce0346da5b2f3c281b9701e4731c00024c7c5028265e77a217f"):
+            self.assertIn(h, t)
+        self.assertIn('HC_PIN_VERSION="0.1.21"', t)
+
+    def test_hc_unsupported_cpu_skips_download(self):
+        os.remove(os.path.join(self.bin, "hc"))
+        self.fake("uname", 'if [ "$1" = -m ]; then echo riscv64; else echo Darwin; fi')
+        self.fake("curl", 'case "$*" in *herdr*) exit 22;; esac; exit 0')
+        r = self.run_install()
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertFalse(any(x.startswith("curl") and "herdr" in x for x in self.calls()))
+        self.assertIn("herdr-core 없이 설치한다", r.stdout)
 
     def test_hc_http_source_rejected_install_continues(self):
         os.remove(os.path.join(self.bin, "hc"))
-        r = self.run_install(SHELTIE_HC_INSTALLER="http://example.invalid/install.sh")
+        r = self.run_install(SHELTIE_HC_URL="http://example.invalid/hc.tar.gz", SHELTIE_HC_SHA256="0" * 64)
         self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
         self.assertIn("https로만", r.stdout)
         self.assertFalse(any(x.startswith("curl") and "example.invalid" in x for x in self.calls()))
 
-    def test_hc_dry_run_runs_nothing(self):
+    def test_no_hc_option_and_env_skip_download(self):
         os.remove(os.path.join(self.bin, "hc"))
-        inst = self.hc_installer(self.FAKE_HC_BODY)
-        r = self.run_install("--dry-run", SHELTIE_HC_INSTALLER=inst)
+        tar, sha = self.hc_tarball()
+        for args, extra in (((), {"SHELTIE_NO_HC": "1"}), (("--no-hc",), {})):
+            r = self.run_install(*args, SHELTIE_HC_URL=tar, SHELTIE_HC_SHA256=sha, **extra)
+            self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+            self.assertFalse(os.path.exists(self.local_bin("herdr-core")))
+            self.assertIn("herdr-core 없이 설치한다", r.stdout)
+
+    def test_hc_dry_run_downloads_nothing(self):
+        os.remove(os.path.join(self.bin, "hc"))
+        self.fake("curl", 'case "$*" in *herdr*) exit 22;; esac; exit 0')
+        r = self.run_install("--dry-run")
         self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
-        self.assertIn("+ herdr-core 설치(%s)" % inst, r.stdout)
-        self.assertNotIn("hc-installer-ran", self.calls())
+        self.assertRegex(r.stdout, r"\+ herdr-core 0\.1\.21 설치\(https://releases\.herdr\.dev/core/0\.1\.21/herdr-core-macos-(aarch64|x86_64)\.tar\.gz\)")
+        self.assertFalse(any(x.startswith("curl") for x in self.calls()))
         self.assertFalse(os.path.exists(os.path.join(self.home, ".local")))
 
-    def test_hc_present_does_not_run_installer(self):
-        inst = self.hc_installer(self.FAKE_HC_BODY)
-        r = self.run_install(SHELTIE_HC_INSTALLER=inst)
+    def test_hc_dry_run_shows_override_url(self):
+        os.remove(os.path.join(self.bin, "hc"))
+        tar, sha = self.hc_tarball()
+        r = self.run_install("--dry-run", SHELTIE_HC_URL=tar, SHELTIE_HC_SHA256=sha)
+        self.assertIn("+ herdr-core 0.1.21 설치(%s)" % tar, r.stdout)
+        self.assertFalse(os.path.exists(self.local_bin()))
+
+    def test_hc_present_does_not_download(self):
+        tar, sha = self.hc_tarball()
+        r = self.run_install(SHELTIE_HC_URL=tar, SHELTIE_HC_SHA256=sha)  # PATH에 가짜 hc가 있다
         self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
-        self.assertNotIn("hc-installer-ran", self.calls())
+        self.assertFalse(os.path.exists(self.local_bin("herdr-core")))
+        cfg = read_json(os.path.join(self.home, ".config/sheltie/config.json"))
+        self.assertEqual(cfg["hc_path"], os.path.join(self.bin, "hc"))
+
+    def test_existing_herdr_core_is_kept_and_used(self):
+        os.remove(os.path.join(self.bin, "hc"))
+        os.makedirs(self.local_bin())
+        core = self.local_bin("herdr-core")
+        with open(core, "w") as f:
+            f.write("#!/bin/sh\necho mine\n")
+        os.chmod(core, 0o755)
+        tar, sha = self.hc_tarball()
+        r = self.run_install(SHELTIE_HC_URL=tar, SHELTIE_HC_SHA256=sha)
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertEqual(read(core), "#!/bin/sh\necho mine\n")
+        self.assertFalse(os.path.lexists(self.local_bin("hc")))
+        cfg = read_json(os.path.join(self.home, ".config/sheltie/config.json"))
+        self.assertEqual(cfg["hc_path"], core)
+        self.assertNotIn("herdr-core 없이", r.stdout)
 
     def test_hc_not_installed_when_tailscale_check_fails(self):
         os.remove(os.path.join(self.bin, "hc"))
-        inst = self.hc_installer(self.FAKE_HC_BODY)
-        r = self.run_install(SHELTIE_HC_INSTALLER=inst, TS_STATE="NeedsLogin")
+        tar, sha = self.hc_tarball()
+        r = self.run_install(SHELTIE_HC_URL=tar, SHELTIE_HC_SHA256=sha, TS_STATE="NeedsLogin")
         self.assertNotEqual(r.returncode, 0)
-        self.assertNotIn("hc-installer-ran", self.calls())
+        self.assertFalse(os.path.exists(self.local_bin("herdr-core")))
 
     def test_uninstall_keeps_herdr_core(self):
         os.remove(os.path.join(self.bin, "hc"))
-        self.run_install(SHELTIE_HC_INSTALLER=self.hc_installer(self.FAKE_HC_BODY))
-        hc = os.path.join(self.home, ".local/bin/hc")
-        self.assertTrue(os.path.exists(hc))
+        tar, sha = self.hc_tarball()
+        self.run_install(SHELTIE_HC_URL=tar, SHELTIE_HC_SHA256=sha)
+        core = self.local_bin("herdr-core")
+        self.assertTrue(os.path.exists(core))
         self.assertEqual(self.run_install("--uninstall").returncode, 0)
-        self.assertTrue(os.path.exists(hc))
+        self.assertTrue(os.path.exists(core))
 
     # ---- sheltie 명령
     def cmd_path(self):

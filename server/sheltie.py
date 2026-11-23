@@ -9516,6 +9516,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 tid = urllib.parse.unquote(mt.group(1)) if mt.groups() else None
                 if name == "health":
                     res = {"ok": True, "name": machine_name(), "started": round(PROCESS_STARTED, 3)}
+                    res.update(getattr(app, "hc_version", None) or {})
                     if app.cfg.get("push_relay_url"):
                         res["push_relay_url"] = app.cfg["push_relay_url"]
                     if app.cfg.get("fcm_relay_url"):
@@ -9636,6 +9637,37 @@ def build_app(cfg):
     return App(cfg, Hc(cfg["hc_path"]), devices, pusher, push_log=push_log)
 
 
+# hc 버전: 설치기는 이 버전만 받는다(install.sh·install.ps1의 HC_PIN_VERSION과 같아야 한다, 테스트가 비교).
+# 이미 깔린 hc는 덮어쓰지 않으므로 서버가 시작할 때 버전을 보고 범위 밖이면 경고만 한다.
+HC_TESTED_VERSIONS = ("0.1.21",)
+
+
+def parse_hc_version(text):
+    m = re.search(r"\b(\d+\.\d+\.\d+)\b", text or "")
+    return m.group(1) if m else None
+
+
+def hc_version_check(path, runner=None, logger=None):
+    """{"hc_version": "0.1.21"|None, "hc_tested": True|False|None}. hc가 없거나 버전을 못 읽으면 None."""
+    logger = logger or log
+    if not path or not os.path.isfile(path):
+        return {"hc_version": None, "hc_tested": None}
+    try:
+        p = (runner or subprocess.run)([path, "--version"], capture_output=True, text=True, timeout=HC_TIMEOUT,
+                                       shell=False, **subprocess_kwargs(text=True))
+        ver = parse_hc_version(p.stdout) if p.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError):
+        ver = None
+    if not ver:
+        logger.warning("hc 버전을 읽지 못했다: %s", path)
+        return {"hc_version": None, "hc_tested": None}
+    tested = ver in HC_TESTED_VERSIONS
+    if not tested:
+        logger.warning("hc %s는 시험한 버전(%s)이 아니다. 화면 판정·답 키가 다르게 동작할 수 있다",
+                       ver, ", ".join(HC_TESTED_VERSIONS))
+    return {"hc_version": ver, "hc_tested": tested}
+
+
 def cmd_serve():
     try:
         cfg = load_config()
@@ -9654,6 +9686,7 @@ def cmd_serve():
         print(e, file=sys.stderr)
         return 2
     app = build_app(cfg)
+    app.hc_version = hc_version_check(cfg.get("hc_path"))
     app.pusher.available()
     srv = make_server_retry(app, cfg["bind"], cfg["port"])
     log.info("시작 %s:%d (푸시: %s)", cfg["bind"], cfg["port"], "중계" if cfg.get("push_relay_url") else "직접")
