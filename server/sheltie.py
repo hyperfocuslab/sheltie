@@ -9779,11 +9779,190 @@ def cmd_hook(args, stdin=None, stdout=None, env=None, timeout=HOOK_CLIENT_TIMEOU
     return 0
 
 
+# ---------------------------------------------------------------- run (herdr 없이 평소 터미널에서)
+# `sheltie run <agent> [args]`: hc(herdr-core) 터미널에 에이전트를 띄우고 이 터미널을 거기에 붙인다(ctrl+\ 분리).
+# 서버는 평소처럼 hc를 보므로 9종 파서·답 키·대화 보기·메시지 보내기가 그대로 된다.
+# `hc run` CLI는 부른 셸의 환경변수를 넘기지 않아(0.1.21 실측: 코어 환경으로 뜬다) API(`hc connect`, terminal.run의
+# env·size)로 띄운다. 환경은 argv가 아니라 stdin으로 가므로 ps·hc get에 비밀이 안 보인다.
+
+HC_INSTALL_HINT = ("설치: curl -fsSL https://releases.herdr.dev/core/install.sh | sh"
+                   if not IS_WINDOWS else
+                   '설치: powershell -c "irm https://releases.herdr.dev/core/install.ps1 | iex"')
+RUN_USAGE = "사용법: sheltie run [--name 이름] <에이전트> [에이전트 인자…]   (분리: ctrl+\\, 다시 붙기: hc attach <이름>)"
+# 터미널 정체를 알리는 변수: hc가 자기 값(xterm-256color 등)을 쓰게 넘기지 않는다. HC_*는 코어가 새로 준다.
+RUN_ENV_DROP = {"TERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION", "TERM_SESSION_ID", "TERMINFO", "COLORTERM",
+                "LC_TERMINAL", "LC_TERMINAL_VERSION", "WT_SESSION", "WT_PROFILE_ID", "VTE_VERSION", "TMUX", "TMUX_PANE",
+                "STY", "WINDOWID", "COLUMNS", "LINES", "PWD", "OLDPWD", "SHLVL", "_", "SESSIONNAME", "PROMPT"}
+RUN_ENV_DROP_PREFIX = ("HC_", "ITERM_", "KITTY_", "GHOSTTY_", "WEZTERM_", "ALACRITTY_", "KONSOLE_")
+RUN_NAME_MAX = 32
+RUN_CONNECT_TIMEOUT = 20
+
+
+def run_env(env):
+    out = {}
+    for k, v in env.items():
+        ku = k.upper()
+        if ku in RUN_ENV_DROP or ku.startswith(RUN_ENV_DROP_PREFIX):
+            continue
+        out[k] = v
+    return out
+
+
+def run_name(program, cwd, taken, win=None):
+    """<프로그램>-<폴더> 이름(hc 규칙: 1-32자 a-z 0-9 - _ ., 글자·숫자로 시작, t7 같은 주소 모양 금지), 살아 있는 이름과 안 겹치게."""
+    win = IS_WINDOWS if win is None else win
+    pmod = ntpath if win else os.path
+    base = pmod.basename(program).lower()
+    for ext in (".exe", ".cmd", ".bat", ".ps1"):
+        if win and base.endswith(ext):
+            base = base[:-len(ext)]
+    folder = pmod.basename(pmod.normpath(cwd)) if cwd else ""
+
+    def clean(s):
+        s = re.sub(r"[^a-z0-9_.-]+", "-", s.lower())
+        return re.sub(r"-{2,}", "-", s).strip("-._")
+
+    p, f = clean(base), clean(folder)
+    name = "-".join(x for x in (p, f) if x)[:RUN_NAME_MAX - 3].rstrip("-._") or "run"
+    if re.fullmatch(r"t[0-9]+[a-z0-9]*", name):
+        name += "-run"
+    cand, n = name, 2
+    while cand in taken and n < 100:
+        cand = "%s-%d" % (name, n)
+        n += 1
+    return cand
+
+
+def run_hc_path(cfg, env, default=None):
+    """쓸 hc: 설정의 hc_path → 기본 위치 → PATH. 실행할 수 없으면 None."""
+    default = os.path.expanduser(default_hc_path()) if default is None else default
+    for p in ((cfg or {}).get("hc_path") or "", default):
+        if p and os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    for name in (("hc.exe", "herdr-core.exe") if IS_WINDOWS else ("hc",)):
+        p = find_executable(name, [d for d in env.get("PATH", env.get("Path", "")).split(os.pathsep) if d])
+        if p:
+            return p
+    return None
+
+
+def _run_attach(argv):
+    """이 터미널을 hc 터미널에 붙인다. 붙은 동안 ctrl+c는 에이전트 몫이라 이 프로세스는 SIGINT를 무시한다."""
+    import signal
+    old = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        return subprocess.call(argv)
+    finally:
+        signal.signal(signal.SIGINT, old)
+
+
+def cmd_run(args, runner=None, attach=None, env=None, cwd=None, hc_path="config", err=None, term_size=None):
+    runner = runner or subprocess.run
+    attach = attach or _run_attach
+    env = dict(os.environ) if env is None else env
+    err = err or sys.stderr
+    args = list(args)
+    name = None
+    if args[:1] == ["--name"]:
+        if len(args) < 2:
+            print(RUN_USAGE, file=err)
+            return 2
+        name, args = args[1], args[2:]
+    if not args or args[0] in ("-h", "--help"):
+        print(RUN_USAGE, file=err)
+        return 2 if not args else 0
+    if hc_path == "config":
+        try:
+            cfg = load_config()
+        except (OSError, ValueError):
+            cfg = {}
+        hc_path = run_hc_path(cfg, env)
+    if not hc_path or not os.path.isfile(hc_path) or not os.access(hc_path, os.X_OK):
+        print("hc(herdr-core)가 없다. sheltie run은 herdr-core 터미널 위에서 에이전트를 띄운다.", file=err)
+        print("Sheltie 설치기를 다시 돌리면 같이 설치된다. " + HC_INSTALL_HINT, file=err)
+        return 1
+    cwd = cwd or os.getcwd()
+    prog = args[0]
+    if os.sep in prog or (os.altsep and os.altsep in prog):
+        exe = os.path.abspath(os.path.join(cwd, prog))
+        exe = exe if os.path.isfile(exe) and os.access(exe, os.X_OK) else None
+    else:  # 코어는 자기 PATH로 찾으므로 여기서 이 셸의 PATH로 절대 경로를 정한다(Windows는 .exe를 .cmd보다 먼저)
+        exe = find_executable(prog, [d for d in env.get("PATH", env.get("Path", "")).split(os.pathsep) if d])
+    if not exe:
+        print("명령을 못 찾았다: %s" % prog, file=err)
+        return 127
+
+    def hc(*a, **kw):
+        return runner([hc_path] + list(a), capture_output=True, text=True, shell=False,
+                      timeout=kw.pop("timeout", HC_TIMEOUT), **kw, **subprocess_kwargs(text=True))
+
+    if not name:
+        taken = set()
+        try:
+            for t in (json.loads(hc("ls", "--json").stdout or "{}").get("terminals") or []):
+                if isinstance(t, dict) and t.get("name"):
+                    taken.add(t["name"])
+        except (ValueError, OSError, subprocess.SubprocessError):
+            pass
+        name = run_name(prog, cwd, taken)
+    if term_size is None:
+        try:
+            sz = os.get_terminal_size()
+            term_size = (sz.columns, sz.lines)
+        except OSError:
+            term_size = None
+    params = {"argv": [exe] + args[1:], "cwd": cwd, "env": run_env(env), "name": name, "no_parent": True}
+    if term_size and term_size[0] > 0 and term_size[1] > 0:
+        params["size"] = {"cols": int(term_size[0]), "rows": int(term_size[1])}
+    req = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "terminal.run", "params": params}) + "\n"
+    try:
+        p = hc("connect", input=req, timeout=RUN_CONNECT_TIMEOUT)
+        resp = None
+        for line in (p.stdout or "").splitlines():
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(d, dict) and d.get("id") == 1:
+                resp = d
+                break
+    except (OSError, subprocess.SubprocessError) as e:
+        print("hc를 부르지 못했다: %s" % e, file=err)
+        return 1
+    if not resp or not isinstance(resp.get("result"), dict):
+        e = (resp or {}).get("error") or {}
+        msg = e.get("message") if isinstance(e, dict) else None
+        print("터미널을 만들지 못했다: %s" % (msg or (p.stderr or "").strip()[:300] or "hc 응답 없음"), file=err)
+        return 1
+    addr = resp["result"].get("address") or name
+    attach([hc_path, "attach", addr])
+    try:
+        info = json.loads(hc("get", addr, "--json").stdout or "{}")
+    except (ValueError, OSError, subprocess.SubprocessError):
+        info = {}
+    if info.get("state") == "live":
+        print("분리했다. 에이전트는 계속 돈다. 다시 붙기: hc attach %s   끄기: hc kill %s" % (name, name), file=err)
+        return 0
+    if info.get("state") != "finished":
+        return 1
+    try:
+        hc("rm", addr)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    code = info.get("exit_code")
+    if isinstance(code, int):
+        return code & 0xFF if not IS_WINDOWS else code
+    sig = info.get("signal")
+    return 128 + sig if isinstance(sig, int) else 1
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     cmd = argv[0] if argv else "serve"
     if cmd == "hook":  # 에이전트가 부른다: 로그 설정(파일 열기) 없이 빠르게
         return cmd_hook(argv[1:])
+    if cmd == "run":  # 사용자 터미널: 서버 로그 파일을 열지 않는다
+        return cmd_run(argv[1:])
     setup_logging()
     if cmd == "init":
         init_config()
@@ -9794,7 +9973,8 @@ def main(argv=None):
         return cmd_test_push()
     if cmd == "pair":
         return cmd_pair()
-    print("사용법: sheltie.py [init|serve|test-push|pair|hook <claude|codex|qwen|opencode>]", file=sys.stderr)
+    print("사용법: sheltie.py [init|serve|test-push|pair|hook <claude|codex|qwen|opencode>|run <에이전트> [인자…]]",
+          file=sys.stderr)
     return 2
 
 

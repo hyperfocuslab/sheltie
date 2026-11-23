@@ -328,6 +328,169 @@ class InstallTest(unittest.TestCase):
         self.assertTrue(any("https://example.invalid/sheltie.py" in x for x in self.calls()))
 
 
+    # ---- herdr-core 자동 설치
+    def hc_installer(self, body):
+        p = os.path.join(self.tmp, "hc_installer.sh")
+        with open(p, "w") as f:
+            f.write("#!/bin/sh\n" + body + "\n")
+        return p
+
+    FAKE_HC_BODY = ('echo "hc-installer-ran" >> "$FAKE_LOG"; mkdir -p "$HOME/.local/bin"; '
+                    'printf "#!/bin/sh\\necho {}\\n" > "$HOME/.local/bin/hc"; chmod 755 "$HOME/.local/bin/hc"')
+
+    def test_hc_auto_install_from_local_installer(self):
+        os.remove(os.path.join(self.bin, "hc"))
+        inst = self.hc_installer(self.FAKE_HC_BODY)
+        r = self.run_install(SHELTIE_HC_INSTALLER=inst)
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertIn("hc-installer-ran", self.calls())
+        hc = os.path.join(self.home, ".local/bin/hc")
+        cfg = read_json(os.path.join(self.home, ".config/sheltie/config.json"))
+        self.assertEqual(cfg["hc_path"], hc)
+        self.assertIn(os.path.dirname(hc), read(self.plist()))
+        self.assertNotIn("herdr-core 없이", r.stdout)
+
+    def test_hc_installer_failure_continues(self):
+        os.remove(os.path.join(self.bin, "hc"))
+        inst = self.hc_installer("exit 1")
+        r = self.run_install(SHELTIE_HC_INSTALLER=inst)
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertIn("자동 설치를 못 했다", r.stdout)
+        self.assertIn("herdr-core 없이 설치한다", r.stdout)
+        cfg = read_json(os.path.join(self.home, ".config/sheltie/config.json"))
+        self.assertEqual(cfg["hc_path"], "")
+        self.assertTrue(os.path.exists(self.plist()))
+
+    def test_hc_installer_that_leaves_no_hc_continues(self):
+        os.remove(os.path.join(self.bin, "hc"))
+        inst = self.hc_installer("echo hc-installer-ran >> \"$FAKE_LOG\"")
+        r = self.run_install(SHELTIE_HC_INSTALLER=inst)
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertIn("설치 뒤에도 hc를 찾지 못했다", r.stdout)
+        self.assertIn("herdr-core 없이 설치한다", r.stdout)
+
+    def test_no_hc_option_and_env_skip_installer(self):
+        os.remove(os.path.join(self.bin, "hc"))
+        inst = self.hc_installer(self.FAKE_HC_BODY)
+        for args, extra in (((), {"SHELTIE_NO_HC": "1"}), (("--no-hc",), {})):
+            r = self.run_install(*args, SHELTIE_HC_INSTALLER=inst, **extra)
+            self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+            self.assertNotIn("hc-installer-ran", self.calls())
+            self.assertFalse(os.path.exists(os.path.join(self.home, ".local/bin/hc")))
+            self.assertIn("herdr-core 없이 설치한다", r.stdout)
+
+    def test_hc_default_source_uses_official_url(self):
+        os.remove(os.path.join(self.bin, "hc"))
+        r = self.run_install()  # 가짜 curl은 빈 파일 -> 자동 설치 실패 -> 계속
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        curl = [x for x in self.calls() if x.startswith("curl")]
+        self.assertTrue(any("https://releases.herdr.dev/core/install.sh" in x and "--proto =https" in x for x in curl), curl)
+        self.assertIn("비어 있다", r.stdout)
+
+    def test_hc_http_source_rejected_install_continues(self):
+        os.remove(os.path.join(self.bin, "hc"))
+        r = self.run_install(SHELTIE_HC_INSTALLER="http://example.invalid/install.sh")
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertIn("https로만", r.stdout)
+        self.assertFalse(any(x.startswith("curl") and "example.invalid" in x for x in self.calls()))
+
+    def test_hc_dry_run_runs_nothing(self):
+        os.remove(os.path.join(self.bin, "hc"))
+        inst = self.hc_installer(self.FAKE_HC_BODY)
+        r = self.run_install("--dry-run", SHELTIE_HC_INSTALLER=inst)
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertIn("+ herdr-core 설치(%s)" % inst, r.stdout)
+        self.assertNotIn("hc-installer-ran", self.calls())
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".local")))
+
+    def test_hc_present_does_not_run_installer(self):
+        inst = self.hc_installer(self.FAKE_HC_BODY)
+        r = self.run_install(SHELTIE_HC_INSTALLER=inst)
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertNotIn("hc-installer-ran", self.calls())
+
+    def test_hc_not_installed_when_tailscale_check_fails(self):
+        os.remove(os.path.join(self.bin, "hc"))
+        inst = self.hc_installer(self.FAKE_HC_BODY)
+        r = self.run_install(SHELTIE_HC_INSTALLER=inst, TS_STATE="NeedsLogin")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertNotIn("hc-installer-ran", self.calls())
+
+    def test_uninstall_keeps_herdr_core(self):
+        os.remove(os.path.join(self.bin, "hc"))
+        self.run_install(SHELTIE_HC_INSTALLER=self.hc_installer(self.FAKE_HC_BODY))
+        hc = os.path.join(self.home, ".local/bin/hc")
+        self.assertTrue(os.path.exists(hc))
+        self.assertEqual(self.run_install("--uninstall").returncode, 0)
+        self.assertTrue(os.path.exists(hc))
+
+    # ---- sheltie 명령
+    def cmd_path(self):
+        return os.path.join(self.home, ".local/bin/sheltie")
+
+    def test_sheltie_command_created_and_passes_args(self):
+        # 서버 대역이 받은 인자를 기록하게 바꾼다.
+        with open(self.stub, "a") as f:
+            f.write('\nif cmd == "run":\n    open(os.environ["ARGV_OUT"], "w").write(json.dumps(sys.argv[1:]))\n')
+        r = self.run_install()
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        p = self.cmd_path()
+        self.assertEqual(stat.S_IMODE(os.stat(p).st_mode), 0o755)
+        lines = read(p).splitlines()
+        self.assertEqual(lines[0], "#!/bin/sh")
+        self.assertTrue(lines[1].startswith("# sheltie-command:"))
+        out = os.path.join(self.tmp, "argv.json")
+        w = subprocess.run([p, "run", "gemini", "--flag", "a b"], env={"HOME": self.home, "ARGV_OUT": out},
+                           capture_output=True, text=True, timeout=30)
+        self.assertEqual(w.returncode, 0, w.stderr)
+        self.assertEqual(read_json(out), ["run", "gemini", "--flag", "a b"])
+        self.assertIn("PATH에 없다", r.stdout)
+
+    def test_sheltie_command_quotes_apostrophe_in_path(self):
+        home = os.path.join(self.tmp, "it's home")
+        os.makedirs(home)
+        self.home = home
+        r = self.run_install()
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        w = subprocess.run([self.cmd_path(), "init"], env={"HOME": self.home}, capture_output=True, text=True)
+        self.assertEqual(w.returncode, 0, w.stderr)
+
+    def test_sheltie_command_no_path_hint_when_on_path(self):
+        r = self.run_install(PATH=os.path.join(self.home, ".local/bin") + ":" + self.bin + ":/usr/bin:/bin")
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertNotIn("PATH에 없다", r.stdout)
+
+    def test_sheltie_command_foreign_file_untouched(self):
+        os.makedirs(os.path.dirname(self.cmd_path()))
+        with open(self.cmd_path(), "w") as f:
+            f.write("#!/bin/sh\necho mine\n")
+        r = self.run_install()
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertEqual(read(self.cmd_path()), "#!/bin/sh\necho mine\n")
+        self.assertIn("건드리지 않았다", r.stdout)
+        self.assertEqual(self.run_install("--uninstall").returncode, 0)
+        self.assertTrue(os.path.exists(self.cmd_path()))
+
+    def test_sheltie_command_reinstall_overwrites_ours(self):
+        self.run_install()
+        with open(self.cmd_path(), "w") as f:
+            f.write("#!/bin/sh\n# sheltie-command: x\nexec old\n")
+        self.assertEqual(self.run_install().returncode, 0)
+        self.assertNotIn("exec old", read(self.cmd_path()))
+        self.assertIn("sheltie.py", read(self.cmd_path()))
+
+    def test_sheltie_command_removed_on_uninstall(self):
+        self.run_install()
+        self.assertTrue(os.path.exists(self.cmd_path()))
+        self.assertEqual(self.run_install("--uninstall").returncode, 0)
+        self.assertFalse(os.path.exists(self.cmd_path()))
+
+    def test_sheltie_command_dry_run_writes_nothing(self):
+        r = self.run_install("--dry-run")
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertFalse(os.path.exists(self.cmd_path()))
+
+
 HOOK_EVENTS_CLAUDE = {"PermissionRequest", "PreToolUse", "SessionStart", "SessionEnd", "UserPromptSubmit", "Stop"}
 HOOK_EVENTS_CODEX = {"PermissionRequest", "SessionStart", "SessionEnd", "UserPromptSubmit", "Stop"}
 HOOK_EVENTS_QWEN = HOOK_EVENTS_CODEX

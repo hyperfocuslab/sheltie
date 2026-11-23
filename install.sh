@@ -1,6 +1,9 @@
 #!/bin/sh
-# Sheltie 설치기(macOS). 사용: sh install.sh [--dry-run] [--uninstall] [--no-hooks]
+# Sheltie 설치기(macOS). 사용: sh install.sh [--dry-run] [--uninstall] [--no-hooks] [--no-hc]
 #   --no-hooks: Claude Code·Codex·Qwen Code 훅과 OpenCode 플러그인 등록(해제)을 건너뜀. hc(herdr-core)가 없어도 설치는 계속한다(공식 훅으로만 동작).
+#   --no-hc: hc(herdr-core)가 없어도 공식 설치 스크립트로 자동 설치하지 않는다(SHELTIE_NO_HC=1과 같다). 자동 설치가 실패해도 설치는 계속한다.
+#   환경변수 SHELTIE_HC_INSTALLER: herdr-core 설치 스크립트 출처 덮어쓰기(https URL 또는 로컬 경로, 시험용). 해제는 herdr-core를 지우지 않는다.
+#   `sheltie` 명령: ~/.local/bin/sheltie 를 만든다(예: sheltie run gemini). 표시 없는 같은 이름 파일은 건드리지 않는다.
 #   환경변수: SHELTIE_SRC(서버 파일 https URL 또는 로컬 경로. 기본: 옆의 server/ 파일, 없으면 GitHub raw), SHELTIE_HC(hc 경로),
 #   SHELTIE_PORT(기본 8790), SHELTIE_TAILSCALE(tailscale CLI 경로),
 #   SHELTIE_SKIP_TAILSCALE=1(tailscale 점검·serve·pair 건너뜀, 시험용),
@@ -9,6 +12,7 @@
 set -eu
 
 # 서버 파일 기본 출처. 저장소 이름이 바뀌면 이 한 줄만 고친다.
+HC_INSTALLER_URL="https://releases.herdr.dev/core/install.sh"
 DEFAULT_SRC="https://raw.githubusercontent.com/hyperfocuslab/sheltie/main/server/sheltie.py"
 LABEL="com.hyperfocuslab.sheltie"
 DATA_DIR="$HOME/.local/share/sheltie"
@@ -34,6 +38,10 @@ UID_N=$(id -u)
 DRY=0
 MODE=install
 NOHOOKS=0
+NOHC=0
+CMD_DIR="$HOME/.local/bin"
+CMD_PATH="$CMD_DIR/sheltie"
+CMD_MARK="# sheltie-command:"
 unset SHELTIE_CONFIG || true
 
 for a in "$@"; do
@@ -41,8 +49,9 @@ for a in "$@"; do
     --dry-run) DRY=1 ;;
     --uninstall) MODE=uninstall ;;
     --no-hooks) NOHOOKS=1 ;;
-    -h|--help) sed -n '2,8p' "$0"; exit 0 ;;
-    *) echo "알 수 없는 옵션: $a (--dry-run, --uninstall, --no-hooks)" >&2; exit 2 ;;
+    --no-hc) NOHC=1 ;;
+    -h|--help) sed -n '2,11p' "$0"; exit 0 ;;
+    *) echo "알 수 없는 옵션: $a (--dry-run, --uninstall, --no-hooks, --no-hc)" >&2; exit 2 ;;
   esac
 done
 
@@ -549,6 +558,7 @@ if [ "$MODE" = uninstall ]; then
   if [ "${SHELTIE_SKIP_TAILSCALE:-}" != 1 ] && TS=$(find_tailscale); then
     run "$TS" serve "--https=$PORT" off || say "tailscale serve 해제 실패(이미 없을 수 있다)"
   fi
+  if [ -f "$CMD_PATH" ] && grep -F "$CMD_MARK" "$CMD_PATH" >/dev/null 2>&1; then run rm -f "$CMD_PATH"; fi
   [ ! -e "$SYS_PLIST" ] || say "/Library/LaunchAgents에도 설치돼 있다. 지우려면: sudo rm $SYS_PLIST"
   if [ "$NOHOOKS" != 1 ]; then
     if UPY=$(command -v python3 2>/dev/null) && [ -n "$UPY" ]; then hooks_apply uninstall "$UPY"
@@ -567,15 +577,45 @@ PYTHON=$(command -v python3 2>/dev/null || true)
 "$PYTHON" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' \
   || die 1 "python3가 3.9보다 낮다($PYTHON). 'xcode-select --install' 또는 'brew install python'으로 새 버전을 설치해라."
 
-HC=
-if [ -n "${SHELTIE_HC:-}" ]; then
-  [ -x "$SHELTIE_HC" ] && HC=$SHELTIE_HC
-elif [ -x "$HOME/.local/bin/hc" ]; then
-  HC="$HOME/.local/bin/hc"
-elif p=$(command -v hc 2>/dev/null) && [ -x "$p" ]; then
-  HC=$p
-fi
-[ -n "$HC" ] || say "herdr-core 없이 설치한다: 공식 훅으로만 동작, herdr 터미널 기능은 꺼짐 (hc를 쓰려면 SHELTIE_HC=<경로>)"
+find_hc() {
+  HC=
+  if [ -n "${SHELTIE_HC:-}" ]; then
+    [ -x "$SHELTIE_HC" ] && HC=$SHELTIE_HC
+  elif [ -x "$HOME/.local/bin/hc" ]; then
+    HC="$HOME/.local/bin/hc"
+  elif p=$(command -v hc 2>/dev/null) && [ -x "$p" ]; then
+    HC=$p
+  fi
+  return 0
+}
+find_hc
+
+# hc가 없으면 herdr-core 공식 설치 스크립트를 받아 돌린다. 실패해도 설치는 계속한다(훅은 hc 없이 된다).
+hc_fail() { say "herdr-core 자동 설치를 못 했다($1)."; }
+install_hc() {
+  if [ "$NOHC" = 1 ] || [ "${SHELTIE_NO_HC:-}" = 1 ]; then say "(herdr-core 자동 설치 건너뜀)"; return 0; fi
+  [ -z "${SHELTIE_HC:-}" ] || return 0
+  _hsrc=${SHELTIE_HC_INSTALLER:-$HC_INSTALLER_URL}
+  case "$_hsrc" in
+    http://*) hc_fail "설치 스크립트는 https로만 받는다: $_hsrc"; return 0 ;;
+  esac
+  if [ "$DRY" = 1 ]; then say "+ herdr-core 설치($_hsrc)"; return 0; fi
+  _htmp=$(mktemp "${TMPDIR:-/tmp}/sheltie-hc.XXXXXX") || { hc_fail "임시 파일을 못 만들었다"; return 0; }
+  case "$_hsrc" in
+    https://*) curl --proto '=https' --tlsv1.2 -fsSL -o "$_htmp" "$_hsrc" || { rm -f "$_htmp"; hc_fail "받지 못했다: $_hsrc"; return 0; } ;;
+    *) if [ -f "$_hsrc" ]; then cp "$_hsrc" "$_htmp"; else rm -f "$_htmp"; hc_fail "파일이 없다: $_hsrc"; return 0; fi ;;
+  esac
+  if [ ! -s "$_htmp" ]; then rm -f "$_htmp"; hc_fail "받은 스크립트가 비어 있다"; return 0; fi
+  say "herdr-core를 설치한다($_hsrc)"
+  if ! sh "$_htmp"; then rm -f "$_htmp"; hc_fail "설치 스크립트가 실패했다"; return 0; fi
+  rm -f "$_htmp"
+  find_hc
+  [ -n "$HC" ] || hc_fail "설치 뒤에도 hc를 찾지 못했다"
+  return 0
+}
+
+HC_TRY=0
+[ -n "$HC" ] || HC_TRY=1
 
 TS=
 if [ "${SHELTIE_SKIP_TAILSCALE:-}" != 1 ]; then
@@ -586,6 +626,10 @@ if [ "${SHELTIE_SKIP_TAILSCALE:-}" != 1 ]; then
 fi
 
 old_check_link
+
+# tailscale 점검을 통과한 뒤에만 hc를 깐다(점검에서 죽을 설치에 hc만 남기지 않는다).
+if [ "$HC_TRY" = 1 ]; then install_hc; fi
+[ -n "$HC" ] || say "herdr-core 없이 설치한다: 공식 훅으로만 동작, herdr 터미널 기능은 꺼짐 (hc를 쓰려면 SHELTIE_HC=<경로>)"
 
 # ---- 2. 서버 파일
 SRC=${SHELTIE_SRC:-}
@@ -645,6 +689,30 @@ fi
 
 # ---- 2b. Claude Code·Codex·Qwen Code 훅, OpenCode 플러그인
 if [ "$NOHOOKS" = 1 ]; then say "(--no-hooks: 훅 등록 건너뜀)"; else hooks_apply install "$PYTHON"; fi
+
+# ---- 2c. sheltie 명령(~/.local/bin/sheltie)
+sq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+install_command() {
+  if [ -e "$CMD_PATH" ] || [ -L "$CMD_PATH" ]; then
+    if ! { [ -f "$CMD_PATH" ] && grep -F "$CMD_MARK" "$CMD_PATH" >/dev/null 2>&1; }; then
+      say "$CMD_PATH 가 이미 있고 Sheltie가 만든 파일이 아니라 건드리지 않았다. sheltie 명령은 만들지 않았다."
+      return 0
+    fi
+  fi
+  if [ "$DRY" = 1 ]; then say "+ $CMD_PATH 작성(sheltie run <에이전트>)"; return 0; fi
+  mkdir -p "$CMD_DIR" || { say "$CMD_DIR 를 만들지 못해 sheltie 명령은 건너뛴다."; return 0; }
+  _ctmp=$(mktemp "$CMD_DIR/.sheltie.XXXXXX") || { say "sheltie 명령 파일을 만들지 못했다."; return 0; }
+  {
+    printf '#!/bin/sh\n%s Sheltie 설치기가 만들고 해제 때 지운다\n' "$CMD_MARK"
+    printf 'exec %s %s "$@"\n' "$(sq "$PYTHON")" "$(sq "$SERVER")"
+  } > "$_ctmp" && chmod 0755 "$_ctmp" && mv -f "$_ctmp" "$CMD_PATH" \
+    || { rm -f "$_ctmp"; say "sheltie 명령을 만들지 못했다."; return 0; }
+  case ":$PATH:" in
+    *":$CMD_DIR:"*) ;;
+    *) say "$CMD_DIR 가 PATH에 없다. 터미널에서 sheltie 명령을 쓰려면 한 번 실행해라: echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.zshrc" ;;
+  esac
+}
+install_command
 
 # ---- 3. LaunchAgent
 SVC_PATH=""; [ -z "$HC" ] || SVC_PATH="$(dirname "$HC"):"

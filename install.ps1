@@ -1,10 +1,16 @@
-# Sheltie installer (Windows). Usage: powershell -File install.ps1 [-DryRun] [-Uninstall] [-NoHooks] [-Help]
+# Sheltie installer (Windows). Usage: powershell -File install.ps1 [-DryRun] [-Uninstall] [-NoHooks] [-NoHc] [-Help]
 #   Via irm | iex no arguments can be passed: use SHELTIE_UNINSTALL=1 / SHELTIE_DRY_RUN=1 instead.
 #   Env: SHELTIE_SRC (server file https URL or local path; default: server\ next to this file, else GitHub raw),
 #   SHELTIE_HC (hc.exe path), SHELTIE_PORT (default 8790), SHELTIE_PYTHON (python.exe path),
 #   SHELTIE_TAILSCALE (tailscale CLI path), SHELTIE_SKIP_TAILSCALE=1 (skip tailscale check/serve/pair; for tests),
 #   SHELTIE_HEALTH_TRIES (health check attempts, default 10), SHELTIE_STOP_WAIT (seconds to wait for the old
 #   server to free its port before killing it, default 15)
+#   -NoHc / SHELTIE_NO_HC=1: do not auto-install herdr-core when hc.exe is missing (the official installer
+#   https://releases.herdr.dev/core/install.ps1 runs otherwise; failure never stops this install).
+#   SHELTIE_HC_INSTALLER: override that installer (https URL or local path, http refused; for tests).
+#   Uninstall never removes herdr-core.
+#   Also creates %LOCALAPPDATA%\sheltie\bin\sheltie.cmd (run: sheltie run gemini) and adds that folder to the
+#   user PATH (HKCU\Environment, or the key in SHELTIE_ENV_KEY; for tests). Uninstall removes both.
 # The server starts at logon via Task Scheduler ("Sheltie") in the desktop session, non-elevated.
 # This file must stay pure ASCII with no BOM: irm | iex chokes on a BOM, and PS 5.1 -File reads BOM-less files as cp949.
 # User-facing Korean text lives in $MSG below as Base64 of UTF-8 bytes.
@@ -14,6 +20,7 @@
   $global:HRCode = 0
 
   # Default source of the server file. Change only this line if the repo is renamed.
+  $HC_INSTALLER_URL = 'https://releases.herdr.dev/core/install.ps1'
   $DEFAULT_SRC = 'https://raw.githubusercontent.com/hyperfocuslab/sheltie/main/server/sheltie.py'
   $TASK = 'Sheltie'
   $LOCAL = $env:LOCALAPPDATA
@@ -33,6 +40,12 @@
   $DRY = $false
   $MODE = 'install'
   $NOHOOKS = $false
+  $NOHC = $false
+  $CMD_DIR = Join-Path $DATA 'bin'
+  $CMD_PATH = Join-Path $CMD_DIR 'sheltie.cmd'
+  $CMD_MARK = 'rem sheltie-command'
+  $ENVKEY = $env:SHELTIE_ENV_KEY
+  if (-not $ENVKEY) { $ENVKEY = 'HKCU:\Environment' }
   Remove-Item Env:SHELTIE_CONFIG -ErrorAction SilentlyContinue
 
   # ---- user-facing messages: Base64 of UTF-8 text, {0} {1} are -f placeholders. Keep keys in sync with T calls.
@@ -107,6 +120,23 @@
     mig_moved = '7ISk7KCV7J2EIOyYruqyvOuLpDogezB9IC0+IHsxfQ==' # config moved
     mig_link = 'ezB9IOqwgCDrp4Htgazri6QuIOunge2BrCDrjIDsg4Eg7Y+0642U66W8IHsxfSDroZwg7Jiu6riw6rGw64KYIHsxfSDrp4Htgazrpbwg7IOI66GcIOunjOuToCDrkqQg64uk7IucIOyLpO2Wie2VtOudvC4=' # old config is a link
     mig_hooks_left = '6rK96rOgOiDtm4XsnbQg7JWE7KeBIOydtOyghCDshJzrsoQg7YyM7J287J2EIOu2gOuluOuLpCh7MH0pLiB7MX0g7J2AIOyngOyasOyngCDslYrslZjri6QuIO2bheqzvCDtlajqu5ggaW5zdGFsbC5wczHsnYQg64uk7IucIOyLpO2Wie2VmOqxsOuCmCDqt7gg7YyM7J287JeQ7IScICd7Mn0nIGhvb2sg7ZWt66qp7J2EIOyngOybjOudvC4=' # old hooks left
+    help6 = 'ICAtTm9IYzogaGMoaGVyZHItY29yZSnqsIAg7JeG7Ja064+EIOyekOuPmSDshKTsuZjtlZjsp4Ag7JWK64qU64ukLiDtmZjqsr3rs4DsiJggU0hFTFRJRV9OT19IQz0xLCDshKTsuZgg7Iqk7YGs66a97Yq4IOy2nOyymCBTSEVMVElFX0hDX0lOU1RBTExFUihodHRwcyBVUkwg65iQ64qUIOuhnOy7rCDqsr3roZwp' # help line 6
+    hc_skip = 'KGhlcmRyLWNvcmUg7J6Q64+ZIOyEpOy5mCDqsbTrhIjrnIAp' # hc auto-install skipped
+    hc_fail = 'aGVyZHItY29yZSDsnpDrj5kg7ISk7LmY66W8IOuquyDtlojri6QoezB9KS4=' # hc auto-install failed
+    hc_http = '7ISk7LmYIOyKpO2BrOumve2KuOuKlCBodHRwc+uhnOunjCDrsJvripTri6Q6IHswfQ==' # hc installer https only
+    hc_dry = 'KyBoZXJkci1jb3JlIOyEpOy5mCh7MH0p' # dry-run hc install
+    hc_installing = 'aGVyZHItY29yZeulvCDshKTsuZjtlZzri6QoezB9KQ==' # hc installing
+    hc_dl = '67Cb7KeAIOuqu+2WiOuLpDogezB9' # hc installer download failed
+    hc_nofile = '7YyM7J287J20IOyXhuuLpDogezB9' # hc installer file missing
+    hc_empty = '67Cb7J2AIOyKpO2BrOumve2KuOqwgCDruYTslrQg7J6I64uk' # hc installer empty
+    hc_rc = '7ISk7LmYIOyKpO2BrOumve2KuOqwgCDsi6TtjKjtlojri6Qo7KKF66OMIOy9lOuTnCB7MH0p' # hc installer exit code
+    hc_nohc = '7ISk7LmYIOuSpOyXkOuPhCBoY+ulvCDssL7sp4Ag66q77ZaI64uk' # hc still missing
+    cmd_foreign = 'ezB9IOqwgCDsnbTrr7gg7J6I6rOgIFNoZWx0aWXqsIAg66eM65OgIO2MjOydvOydtCDslYTri4jrnbwg6rG065Oc66as7KeAIOyViuyVmOuLpC4gc2hlbHRpZSDrqoXroLnsnYAg66eM65Ok7KeAIOyViuyVmOuLpC4=' # sheltie.cmd foreign
+    cmd_dry = 'KyB7MH0g7J6R7ISxKHNoZWx0aWUgcnVuIDzsl5DsnbTsoITtirg+KQ==' # dry-run sheltie.cmd
+    cmd_fail = 'c2hlbHRpZSDrqoXroLnsnYQg66eM65Ok7KeAIOuqu+2WiOuLpDogezB9' # sheltie.cmd failed
+    cmd_path_added = '7IKs7Jqp7J6QIFBBVEjsl5AgezB9IOulvCDstpTqsIDtlojri6QuIOyDiCDthLDrr7jrhJDsnYQg7Je07Ja07JW8IHNoZWx0aWUg66qF66C57J20IOyeoe2ejOuLpC4=' # PATH entry added
+    cmd_path_dry = 'KyDsgqzsmqnsnpAgUEFUSOyXkCB7MH0g7LaU6rCA' # dry-run PATH add
+    cmd_path_dry_rm = 'KyDsgqzsmqnsnpAgUEFUSOyXkOyEnCB7MH0g7KCc6rGw' # dry-run PATH remove
   }
   # messages end
   function T([string]$Key) {
@@ -493,7 +523,7 @@ except Exception:
 # ---- hooks_merge.py end
 '@
 
-  $HELP_TEXT = @((T 'help1'), (T 'help2'), (T 'help3'), (T 'help4'), (T 'help5'))
+  $HELP_TEXT = @((T 'help1'), (T 'help2'), (T 'help3'), (T 'help4'), (T 'help5'), (T 'help6'))
 
   function Say([string]$Msg) { Write-Host $Msg }
   function Die([int]$Code, [string]$Msg) {
@@ -594,6 +624,129 @@ except Exception:
     $h = Get-Command hc -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($h) { return $h.Source }
     return $null
+  }
+  function Install-Hc {
+    # Run the official herdr-core installer when hc.exe is missing. Never throws: returns the hc path or $null.
+    if ($NOHC -or $env:SHELTIE_NO_HC -eq '1') { Say (T 'hc_skip'); return $null }
+    $src = $env:SHELTIE_HC_INSTALLER
+    if (-not $src) { $src = $HC_INSTALLER_URL }
+    if ($src -like 'http://*') { Say (T 'hc_fail' (T 'hc_http' $src)); return $null }
+    if ($DRY) { Say (T 'hc_dry' $src); return $null }
+    $tmp = Join-Path ([IO.Path]::GetTempPath()) ('sheltie-hc.' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.ps1')
+    try {
+      if ($src -like 'https://*') {
+        try {
+          [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        } catch {}
+        try { Invoke-WebRequest -UseBasicParsing -Uri $src -OutFile $tmp } catch { Say (T 'hc_fail' (T 'hc_dl' $src)); return $null }
+      } else {
+        if (-not (Test-Path -LiteralPath $src -PathType Leaf)) { Say (T 'hc_fail' (T 'hc_nofile' $src)); return $null }
+        Copy-Item -LiteralPath $src -Destination $tmp -Force
+      }
+      if (-not (Test-Path -LiteralPath $tmp) -or (Get-Item -LiteralPath $tmp).Length -eq 0) { Say (T 'hc_fail' (T 'hc_empty')); return $null }
+      Say (T 'hc_installing' $src)
+      $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+      if (-not (Test-Path -LiteralPath $ps -PathType Leaf)) { $ps = 'powershell' }
+      & $ps -NoProfile -ExecutionPolicy Bypass -File $tmp | Out-Host
+      if ($LASTEXITCODE -ne 0) { Say (T 'hc_fail' (T 'hc_rc' $LASTEXITCODE)); return $null }
+    } catch {
+      Say (T 'hc_fail' $_.Exception.Message)
+      return $null
+    } finally {
+      Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    }
+    $h = Find-Hc
+    if (-not $h) {
+      $c = Join-Path $LOCAL 'Programs\herdr-core\herdr-core.exe'
+      if (Test-Path -LiteralPath $c -PathType Leaf) { $h = $c }
+    }
+    if (-not $h) { Say (T 'hc_fail' (T 'hc_nohc')); return $null }
+    return $h
+  }
+  # ---- sheltie command: %LOCALAPPDATA%\sheltie\bin\sheltie.cmd on the user PATH
+  function Norm-PathEntry([string]$E) {
+    return [Environment]::ExpandEnvironmentVariables($E.Trim()).TrimEnd('\').ToLowerInvariant()
+  }
+  function Get-UserPathRaw {
+    # Returns @{ Value; Kind } with variables left unexpanded; Value is $null when there is no Path value yet.
+    $r = @{ Value = $null; Kind = 'ExpandString' }
+    $k = $null
+    try { $k = Get-Item -LiteralPath $ENVKEY -ErrorAction Stop } catch { return $r }
+    $names = @($k.GetValueNames())
+    if ($names -contains 'Path') {
+      $r.Value = [string]$k.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+      $r.Kind = [string]$k.GetValueKind('Path')
+    }
+    return $r
+  }
+  function Set-UserPathRaw([string]$Value, [string]$Kind) {
+    if (-not (Test-Path -LiteralPath $ENVKEY)) { New-Item -Path $ENVKEY -Force | Out-Null }
+    if ($Kind -ne 'String') { $Kind = 'ExpandString' }
+    New-ItemProperty -LiteralPath $ENVKEY -Name 'Path' -Value $Value -PropertyType $Kind -Force | Out-Null
+    if (-not $env:SHELTIE_ENV_KEY) {
+      # Tell running programs (Explorer) the environment changed so new terminals pick it up.
+      try {
+        Add-Type -Namespace Sheltie -Name Win -MemberDefinition '[System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true, CharSet = System.Runtime.InteropServices.CharSet.Auto)] public static extern System.IntPtr SendMessageTimeout(System.IntPtr hWnd, uint Msg, System.UIntPtr wParam, string lParam, uint fuFlags, uint uTimeout, out System.UIntPtr lpdwResult);'
+        $res = [UIntPtr]::Zero
+        [void][Sheltie.Win]::SendMessageTimeout([IntPtr]0xffff, 0x1A, [UIntPtr]::Zero, 'Environment', 2, 3000, [ref]$res)
+      } catch {}
+    }
+  }
+  function Add-UserPath([string]$Dir) {
+    $cur = Get-UserPathRaw
+    $want = Norm-PathEntry $Dir
+    $parts = @()
+    if ($cur.Value) { $parts = @($cur.Value.Split(';') | Where-Object { $_.Trim() -ne '' }) }
+    foreach ($e in $parts) { if ((Norm-PathEntry $e) -eq $want) { return $false } }
+    Set-UserPathRaw (($parts + $Dir) -join ';') $cur.Kind
+    return $true
+  }
+  function Remove-UserPath([string]$Dir) {
+    $cur = Get-UserPathRaw
+    if (-not $cur.Value) { return $false }
+    $want = Norm-PathEntry $Dir
+    $parts = @($cur.Value.Split(';') | Where-Object { $_.Trim() -ne '' })
+    $keep = @($parts | Where-Object { (Norm-PathEntry $_) -ne $want })
+    if ($keep.Count -eq $parts.Count) { return $false }
+    Set-UserPathRaw ($keep -join ';') $cur.Kind
+    return $true
+  }
+  function Test-OurCmd {
+    if (-not (Test-Path -LiteralPath $CMD_PATH -PathType Leaf)) { return $false }
+    try { return ([IO.File]::ReadAllText($CMD_PATH).Contains($CMD_MARK)) } catch { return $false }
+  }
+  function Install-Command {
+    if ((Test-Path -LiteralPath $CMD_PATH) -and -not (Test-OurCmd)) { Say (T 'cmd_foreign' $CMD_PATH); return }
+    if ($DRY) { Say (T 'cmd_dry' $CMD_PATH); Say (T 'cmd_path_dry' $CMD_DIR); return }
+    try {
+      New-Item -ItemType Directory -Force -Path $CMD_DIR | Out-Null
+      $body = "@echo off`r`n${CMD_MARK}: created by the Sheltie installer, removed on uninstall`r`n`"$PY`" `"$SERVER`" %*`r`nexit /b %ERRORLEVEL%`r`n"
+      $enc = [Text.Encoding]::GetEncoding([Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage)
+      $tmpc = "$CMD_PATH.tmp"
+      [IO.File]::WriteAllText($tmpc, $body, $enc)
+      Move-Item -LiteralPath $tmpc -Destination $CMD_PATH -Force
+      if (Add-UserPath $CMD_DIR) { Say (T 'cmd_path_added' $CMD_DIR) }
+    } catch {
+      Say (T 'cmd_fail' $_.Exception.Message)
+    }
+  }
+  function Uninstall-Command {
+    # Remove only our own sheltie.cmd; drop the PATH entry and folder only when nothing else lives there.
+    $ours = Test-OurCmd
+    $foreign = (Test-Path -LiteralPath $CMD_PATH) -and -not $ours
+    if ($ours) {
+      if ($DRY) { Say (T 'dry_delete' $CMD_PATH '') } else { Remove-Item -LiteralPath $CMD_PATH -Force -ErrorAction SilentlyContinue }
+    }
+    $left = @()
+    if (Test-Path -LiteralPath $CMD_DIR -PathType Container) {
+      $left = @(Get-ChildItem -LiteralPath $CMD_DIR -Force -ErrorAction SilentlyContinue | Where-Object { $_.FullName -ne $CMD_PATH })
+    }
+    if ($foreign -or $left.Count -gt 0) { return }
+    if ($DRY) { Say (T 'cmd_path_dry_rm' $CMD_DIR); return }
+    try {
+      [void](Remove-UserPath $CMD_DIR)
+      Remove-Item -LiteralPath $CMD_DIR -Force -ErrorAction SilentlyContinue
+    } catch {}
   }
   function Funnel-On {
     # True if Funnel (public internet) is on for this port. False if it cannot be determined.
@@ -763,6 +916,7 @@ if n != c:
         '^--?(dry-?run)$' { $DRY = $true }
         '^--?uninstall$' { $MODE = 'uninstall' }
         '^--?no-?hooks$' { $NOHOOKS = $true }
+        '^--?no-?hc$' { $NOHC = $true }
         '^(--?help|-h|-\?)$' { foreach ($l in $HELP_TEXT) { Say $l }; return }
         default { Die 2 (T 'unknown_opt' $a) }
       }
@@ -799,6 +953,7 @@ if n != c:
       }
       if ($DRY) { Say (T 'dry_delete' $SERVER $TASK_COPY) }
       else { Remove-Item -LiteralPath $SERVER, $TASK_COPY -Force -ErrorAction SilentlyContinue }
+      Uninstall-Command
       if (-not $NOHOOKS) {
         $upy = Find-Python
         if ($upy) { Apply-Hooks 'uninstall' $upy } else { Say (T 'hk_nopy') }
@@ -822,7 +977,7 @@ if n != c:
     if (-not (Test-Path -LiteralPath $PYW -PathType Leaf)) { $PYW = $PY }
 
     $HC = Find-Hc
-    if (-not $HC) { Say (T 'no_hc_warn'); $HC = '' }
+    $HC_TRY = (-not $HC) -and (-not $env:SHELTIE_HC)
 
     $TS = $null
     if ($env:SHELTIE_SKIP_TAILSCALE -ne '1') {
@@ -837,6 +992,10 @@ if n != c:
     }
 
     Old-CheckLink
+
+    # Only after the checks above pass: do not leave hc installed by an install that dies at the tailscale check.
+    if ($HC_TRY) { $HC = Install-Hc }
+    if (-not $HC) { Say (T 'no_hc_warn'); $HC = '' }
 
     # ---- 2. server file
     $SRC = $env:SHELTIE_SRC
@@ -902,6 +1061,9 @@ if n != c:
 
     # ---- 2b. Claude Code / Codex hooks (python.exe, not pythonw: the hook needs stdout)
     if ($NOHOOKS) { Say (T 'hk_off') } else { Apply-Hooks 'install' $PY }
+
+    # ---- 2c. sheltie command
+    Install-Command
 
     # ---- 3. Task Scheduler
     $tpl = $TASK_XML_BUILTIN.Replace('@XML_COMMENT@', (T 'xml_comment')).Replace('@XML_DESC@', (T 'xml_desc'))

@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import uuid
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 INSTALL = os.path.join(ROOT, "install.ps1")
@@ -26,6 +27,9 @@ elif cmd == "pair":
     if os.environ.get("PAIR_FAIL"):
         sys.exit(2)
     print("PAIR-OK")
+elif cmd == "run":
+    open(os.environ["ARGV_OUT"], "w").write(json.dumps(sys.argv[1:]))
+    sys.exit(int(os.environ.get("RUN_RC", "0")))
 elif cmd == "serve":
     from http.server import BaseHTTPRequestHandler, HTTPServer
     cfg = json.load(open(p))
@@ -143,8 +147,45 @@ class InstallPs1Test(unittest.TestCase):
         self.ts_serve_file = os.path.join(self.tmp, "ts_serve.txt")
         self.ts_serve_json = os.path.join(self.tmp, "ts_serve.json")
         self.port = str(free_port())
+        # 실제 HKCU\Environment를 건드리지 않게 임시 키를 쓴다. 사용자 PATH처럼 변수가 안 펴진 ExpandString으로 시작.
+        self.subkey = "Software\\SheltieTest\\" + uuid.uuid4().hex[:12]
+        self.set_user_path(r"%USERPROFILE%\bin;C:\existing", "expand")
+        # 기본 herdr-core 설치 스크립트는 실패하는 가짜(진짜 네트워크로 새지 않게)
+        self.hc_fail = os.path.join(self.tmp, "hc_fail.ps1")
+        with open(self.hc_fail, "w") as f:
+            f.write("exit 1\n")
+        self.hc_ok = os.path.join(self.tmp, "hc_ok.ps1")
+        with open(self.hc_ok, "w") as f:
+            f.write("Add-Content -LiteralPath $env:FAKE_LOG 'hc-installer-ran'\n"
+                    "$d = Join-Path $env:LOCALAPPDATA 'Programs\\herdr-core'\n"
+                    "New-Item -ItemType Directory -Force -Path $d | Out-Null\n"
+                    "Set-Content -LiteralPath (Join-Path $d 'hc.exe') -Value 'x'\n")
+
+    def set_user_path(self, value, kind):
+        import winreg
+        k = winreg.CreateKey(winreg.HKEY_CURRENT_USER, self.subkey)
+        winreg.SetValueEx(k, "Path", 0, winreg.REG_EXPAND_SZ if kind == "expand" else winreg.REG_SZ, value)
+        winreg.CloseKey(k)
+
+    def user_path(self):
+        import winreg
+        k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, self.subkey)
+        try:
+            v, t = winreg.QueryValueEx(k, "Path")
+        finally:
+            winreg.CloseKey(k)
+        return v, ("expand" if t == winreg.REG_EXPAND_SZ else "string" if t == winreg.REG_SZ else t)
+
+    def cmd_path(self):
+        return os.path.join(self.local, "sheltie", "bin", "sheltie.cmd")
 
     def tearDown(self):
+        import winreg
+        try:
+            winreg.DeleteKey(winreg.HKEY_CURRENT_USER, self.subkey)
+            winreg.DeleteKey(winreg.HKEY_CURRENT_USER, "Software\\SheltieTest")  # 비었을 때만 지워진다
+        except OSError:
+            pass
         if os.path.exists(self.pids):
             for line in read(self.pids).split():
                 subprocess.run(["taskkill", "/F", "/PID", line], capture_output=True)
@@ -163,8 +204,11 @@ class InstallPs1Test(unittest.TestCase):
             "FAKE_PY": sys.executable, "TS_SERVE_FILE": self.ts_serve_file, "TS_SERVE_JSON": self.ts_serve_json,
             "SHELTIE_SRC": self.stub, "SHELTIE_PYTHON": sys.executable, "SHELTIE_HC": self.hc,
             "SHELTIE_PORT": self.port, "SHELTIE_HEALTH_TRIES": "3",
+            "SHELTIE_ENV_KEY": "HKCU:\\" + self.subkey, "SHELTIE_HC_INSTALLER": self.hc_fail,
         })
         env.update(extra)
+        for k in [k for k, v in env.items() if v is None]:
+            del env[k]
         return env
 
     def run_install(self, *args, **extra):
@@ -506,6 +550,146 @@ class InstallPs1Test(unittest.TestCase):
         self.assertFalse(os.path.exists(self.server_path()))
         self.assertFalse(any(x.startswith("schtasks") for x in self.calls()))
 
+    # ---- herdr-core 자동 설치
+    def test_hc_auto_install_from_local_installer(self):
+        r = self.run_install(SHELTIE_HC="", SHELTIE_HC_INSTALLER=self.hc_ok)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("hc-installer-ran", self.calls())
+        hc = os.path.join(self.local, "Programs", "herdr-core", "hc.exe")
+        self.assertEqual(read_json(self.cfg_path())["hc_path"], hc)
+        self.assertNotIn("herdr-core 없이", r.stdout)
+
+    def test_hc_installer_failure_continues(self):
+        r = self.run_install(SHELTIE_HC="")  # 기본 가짜 설치 스크립트는 exit 1
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("자동 설치를 못 했다", r.stdout)
+        self.assertIn("herdr-core 없이 설치한다", r.stdout)
+        self.assertEqual(read_json(self.cfg_path())["hc_path"], "")
+        self.assertTrue(any(x.startswith("schtasks /Create") for x in self.calls()))
+
+    def test_hc_installer_leaving_no_hc_continues(self):
+        empty = os.path.join(self.tmp, "hc_nothing.ps1")
+        with open(empty, "w") as f:
+            f.write("Add-Content -LiteralPath $env:FAKE_LOG 'hc-installer-ran'\n")
+        r = self.run_install(SHELTIE_HC="", SHELTIE_HC_INSTALLER=empty)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("설치 뒤에도 hc를 찾지 못했다", r.stdout)
+        self.assertIn("herdr-core 없이 설치한다", r.stdout)
+
+    def test_hc_installer_found_herdr_core_exe_only(self):
+        only = os.path.join(self.tmp, "hc_core_only.ps1")
+        with open(only, "w") as f:
+            f.write("$d = Join-Path $env:LOCALAPPDATA 'Programs\\herdr-core'\n"
+                    "New-Item -ItemType Directory -Force -Path $d | Out-Null\n"
+                    "Set-Content -LiteralPath (Join-Path $d 'herdr-core.exe') -Value 'x'\n")
+        r = self.run_install(SHELTIE_HC="", SHELTIE_HC_INSTALLER=only)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(read_json(self.cfg_path())["hc_path"],
+                         os.path.join(self.local, "Programs", "herdr-core", "herdr-core.exe"))
+
+    def test_no_hc_switch_and_env_skip_installer(self):
+        for args, extra in (((), {"SHELTIE_NO_HC": "1"}), (("-NoHc",), {})):
+            r = self.run_install(*args, SHELTIE_HC="", SHELTIE_HC_INSTALLER=self.hc_ok, **extra)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertNotIn("hc-installer-ran", self.calls())
+            self.assertIn("herdr-core 없이 설치한다", r.stdout)
+
+    def test_hc_default_source_is_official_url_in_dry_run(self):
+        r = self.run_install("-DryRun", SHELTIE_HC="", SHELTIE_HC_INSTALLER=None)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("+ herdr-core 설치(https://releases.herdr.dev/core/install.ps1)", r.stdout)
+
+    def test_hc_http_source_rejected_install_continues(self):
+        r = self.run_install(SHELTIE_HC="", SHELTIE_HC_INSTALLER="http://example.invalid/install.ps1")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("https로만", r.stdout)
+        self.assertIn("herdr-core 없이 설치한다", r.stdout)
+
+    def test_hc_dry_run_runs_nothing(self):
+        r = self.run_install("-DryRun", SHELTIE_HC="", SHELTIE_HC_INSTALLER=self.hc_ok)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("+ herdr-core 설치(%s)" % self.hc_ok, r.stdout)
+        self.assertNotIn("hc-installer-ran", self.calls())
+
+    def test_hc_present_does_not_run_installer(self):
+        r = self.run_install(SHELTIE_HC_INSTALLER=self.hc_ok)  # SHELTIE_HC=self.hc가 기본
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("hc-installer-ran", self.calls())
+
+    def test_hc_not_installed_when_tailscale_check_fails(self):
+        r = self.run_install(SHELTIE_HC="", SHELTIE_HC_INSTALLER=self.hc_ok, TS_STATE="NeedsLogin")
+        self.assertEqual(r.returncode, 1)
+        self.assertNotIn("hc-installer-ran", self.calls())
+
+    def test_uninstall_keeps_herdr_core(self):
+        self.assertEqual(self.run_install(SHELTIE_HC="", SHELTIE_HC_INSTALLER=self.hc_ok).returncode, 0)
+        hc = os.path.join(self.local, "Programs", "herdr-core", "hc.exe")
+        self.assertEqual(self.run_install("-Uninstall").returncode, 0)
+        self.assertTrue(os.path.exists(hc))
+
+    # ---- sheltie 명령
+    def test_sheltie_cmd_created_runs_and_passes_args_and_exit_code(self):
+        r = self.run_install()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        text = read(self.cmd_path())
+        lines = text.splitlines()
+        self.assertEqual(lines[0], "@echo off")
+        self.assertTrue(lines[1].startswith("rem sheltie-command"))
+        self.assertIn('"%s" "%s" %%*' % (sys.executable, self.server_path()), text)
+        out = os.path.join(self.tmp, "argv.json")
+        env = self.env(ARGV_OUT=out, RUN_RC="7")
+        w = subprocess.run(["cmd", "/c", self.cmd_path(), "run", "gemini", "--flag"], env=env, capture_output=True, timeout=60)
+        self.assertEqual(w.returncode, 7, w.stderr)
+        self.assertEqual(read_json(out), ["run", "gemini", "--flag"])
+
+    def test_sheltie_cmd_path_added_keeping_kind_and_unexpanded(self):
+        bindir = os.path.join(self.local, "sheltie", "bin")
+        r = self.run_install()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.user_path(), (r"%USERPROFILE%\bin;C:\existing;" + bindir, "expand"))
+        self.assertEqual(self.run_install().returncode, 0)  # 두 번째는 중복 없이
+        self.assertEqual(self.user_path()[0].count(bindir), 1)
+
+    def test_sheltie_cmd_path_keeps_plain_string_kind(self):
+        self.set_user_path(r"C:\one", "string")
+        self.assertEqual(self.run_install().returncode, 0)
+        v, kind = self.user_path()
+        self.assertEqual(kind, "string")
+        self.assertTrue(v.startswith(r"C:\one;"))
+
+    def test_sheltie_cmd_removed_on_uninstall_with_path_entry(self):
+        self.assertEqual(self.run_install().returncode, 0)
+        self.assertEqual(self.run_install("-Uninstall").returncode, 0)
+        self.assertFalse(os.path.exists(self.cmd_path()))
+        self.assertEqual(self.user_path(), (r"%USERPROFILE%\bin;C:\existing", "expand"))
+
+    def test_sheltie_cmd_foreign_file_untouched(self):
+        os.makedirs(os.path.dirname(self.cmd_path()))
+        with open(self.cmd_path(), "wb") as f:
+            f.write(b"@echo mine\r\n")
+        r = self.run_install()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        with open(self.cmd_path(), "rb") as f:
+            self.assertEqual(f.read(), b"@echo mine\r\n")
+        self.assertIn("건드리지 않았다", r.stdout)
+        self.assertEqual(self.user_path()[0], r"%USERPROFILE%\bin;C:\existing")
+        self.assertEqual(self.run_install("-Uninstall").returncode, 0)
+        self.assertTrue(os.path.exists(self.cmd_path()))
+
+    def test_sheltie_cmd_reinstall_overwrites_ours(self):
+        self.assertEqual(self.run_install().returncode, 0)
+        with open(self.cmd_path(), "w") as f:
+            f.write("@echo off\r\nrem sheltie-command: x\r\nold\r\n")
+        self.assertEqual(self.run_install().returncode, 0)
+        self.assertNotIn("old", read(self.cmd_path()))
+
+    def test_sheltie_cmd_dry_run_writes_nothing(self):
+        r = self.run_install("-DryRun")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("sheltie.cmd", r.stdout)
+        self.assertFalse(os.path.exists(self.cmd_path()))
+        self.assertEqual(self.user_path()[0], r"%USERPROFILE%\bin;C:\existing")
+
     def check_uninstall(self, *args, **extra):
         self.assertEqual(self.run_install().returncode, 0)
         open(self.log, "w").close()
@@ -745,6 +929,13 @@ class InstallPs1StaticTest(unittest.TestCase):
         self.assertEqual(msgs["help1"], "Sheltie 설치기(Windows). 사용: powershell -File install.ps1 [-DryRun] [-Uninstall] [-Help]")
         self.assertTrue(msgs["no_hc"].startswith("hc(herdr-core)가 없다."))
         self.assertIn("%LOCALAPPDATA%\\Programs\\herdr-core\\hc.exe", msgs["no_hc"])
+
+    def test_hc_installer_and_command_options_documented(self):
+        t = read(INSTALL)
+        for want in ("-NoHc", "SHELTIE_NO_HC", "SHELTIE_HC_INSTALLER", "https://releases.herdr.dev/core/install.ps1",
+                     "SHELTIE_ENV_KEY", "DoNotExpandEnvironmentNames", "rem sheltie-command"):
+            self.assertIn(want, t, want)
+        self.assertIn("-NoHc", messages()["help6"])
 
     def test_dry_run_env_supported(self):
         self.assertIn("SHELTIE_DRY_RUN", read(INSTALL))
