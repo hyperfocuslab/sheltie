@@ -467,6 +467,103 @@ class InstallTest(unittest.TestCase):
         self.assertIn("+ herdr-core 0.1.21 설치(%s)" % tar, r.stdout)
         self.assertFalse(os.path.exists(self.local_bin()))
 
+    # ---- 원래 주소가 실패하면 미러(같은 파일, 같은 해시)
+    # 가짜 curl: 원래 주소는 HC_PRIMARY(fail=받기 실패, bad=다른 내용)대로, 미러는 HC_MIRROR_TAR가 있으면 그 파일을 준다.
+    FAKE_CURL_HC = ('out=; url=; while [ $# -gt 0 ]; do case "$1" in -o) out=$2; shift;; *) url=$1;; esac; shift; done\n'
+                    'case "$url" in\n'
+                    '  https://releases.herdr.dev/core/*) if [ "${HC_PRIMARY:-fail}" = bad ]; then echo junk > "$out"; exit 0; fi; exit 22;;\n'
+                    '  https://github.com/hyperfocuslab/sheltie/releases/download/hc-0.1.21/*)\n'
+                    '    if [ -n "${HC_MIRROR_TAR:-}" ]; then cat "$HC_MIRROR_TAR" > "$out"; exit 0; fi; exit 22;;\n'
+                    'esac\nexit 0')
+
+    def hc_target(self):
+        arch = subprocess.run(["uname", "-m"], capture_output=True, text=True).stdout.strip()
+        return {"arm64": "macos-aarch64", "aarch64": "macos-aarch64", "x86_64": "macos-x86_64"}[arch]
+
+    def hc_urls(self):
+        name = "herdr-core-%s.tar.gz" % self.hc_target()
+        return ("https://releases.herdr.dev/core/0.1.21/" + name,
+                "https://github.com/hyperfocuslab/sheltie/releases/download/hc-0.1.21/" + name)
+
+    def hc_curl_urls(self):
+        return [x.split()[-1] for x in self.calls() if x.startswith("curl") and x.split()[-1].endswith(".tar.gz")]
+
+    def assert_hc_installed(self, r):
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertTrue(os.path.exists(self.local_bin("herdr-core")))
+        cfg = read_json(os.path.join(self.home, ".config/sheltie/config.json"))
+        self.assertEqual(cfg["hc_path"], self.local_bin("hc"))
+        self.assertNotIn("herdr-core 없이", r.stdout)
+        self.assertNotIn("자동 설치를 못 했다", r.stdout)
+
+    def test_hc_primary_download_fails_mirror_installs(self):
+        os.remove(os.path.join(self.bin, "hc"))
+        tar, sha = self.hc_tarball()
+        self.fake("curl", self.FAKE_CURL_HC)
+        r = self.run_install(SHELTIE_HC_SHA256=sha, HC_MIRROR_TAR=tar)
+        self.assert_hc_installed(r)
+        primary, mirror = self.hc_urls()
+        self.assertEqual(self.hc_curl_urls(), [primary, mirror])
+        self.assertIn("미러에서 받는다(%s)" % mirror, r.stdout)
+        self.assertTrue(all("--proto =https" in x and "--tlsv1.2" in x
+                            for x in self.calls() if x.startswith("curl") and "herdr-core-" in x))
+
+    def test_hc_primary_checksum_mismatch_mirror_installs(self):
+        os.remove(os.path.join(self.bin, "hc"))
+        tar, sha = self.hc_tarball()
+        self.fake("curl", self.FAKE_CURL_HC)
+        r = self.run_install(SHELTIE_HC_SHA256=sha, HC_MIRROR_TAR=tar, HC_PRIMARY="bad")
+        self.assert_hc_installed(r)
+        self.assertEqual(self.hc_curl_urls(), list(self.hc_urls()))
+        self.assertIn("체크섬", r.stdout)
+
+    def test_hc_mirror_with_wrong_checksum_is_rejected(self):
+        os.remove(os.path.join(self.bin, "hc"))
+        tar, sha = self.hc_tarball()
+        self.fake("curl", self.FAKE_CURL_HC)
+        r = self.run_install(SHELTIE_HC_SHA256="0" * 64, HC_MIRROR_TAR=tar)
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertEqual(self.hc_curl_urls(), list(self.hc_urls()))
+        self.assertIn("체크섬", r.stdout)
+        self.assertIn("herdr-core 없이 설치한다", r.stdout)
+        self.assertFalse(os.path.exists(self.local_bin("herdr-core")))
+
+    def test_hc_primary_and_mirror_fail_install_continues(self):
+        os.remove(os.path.join(self.bin, "hc"))
+        self.fake("curl", self.FAKE_CURL_HC)
+        r = self.run_install()
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        primary, mirror = self.hc_urls()
+        self.assertEqual(self.hc_curl_urls(), [primary, mirror])
+        self.assertIn("받지 못했다: %s" % mirror, r.stdout)
+        self.assertIn("자동 설치를 못 했다", r.stdout)
+        self.assertIn("herdr-core 없이 설치한다", r.stdout)
+        self.assertFalse(os.path.exists(self.local_bin("herdr-core")))
+        cfg = read_json(os.path.join(self.home, ".config/sheltie/config.json"))
+        self.assertEqual(cfg["hc_path"], "")
+        self.assertTrue(os.path.exists(self.plist()))
+
+    def test_hc_override_url_has_no_mirror_fallback(self):
+        os.remove(os.path.join(self.bin, "hc"))
+        tar, sha = self.hc_tarball()
+        self.fake("curl", self.FAKE_CURL_HC)
+        r = self.run_install(SHELTIE_HC_URL="https://releases.herdr.dev/core/0.1.21/x.tar.gz",
+                             SHELTIE_HC_SHA256=sha, HC_MIRROR_TAR=tar)
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertEqual(self.hc_curl_urls(), ["https://releases.herdr.dev/core/0.1.21/x.tar.gz"])
+        self.assertNotIn("미러", r.stdout)
+        self.assertIn("herdr-core 없이 설치한다", r.stdout)
+        self.assertFalse(os.path.exists(self.local_bin("herdr-core")))
+
+    def test_hc_dry_run_shows_mirror(self):
+        os.remove(os.path.join(self.bin, "hc"))
+        r = self.run_install("--dry-run")
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertIn("+   실패하면 미러에서 받기(%s)" % self.hc_urls()[1], r.stdout)
+        tar, sha = self.hc_tarball()
+        r = self.run_install("--dry-run", SHELTIE_HC_URL=tar, SHELTIE_HC_SHA256=sha)
+        self.assertNotIn("미러", r.stdout)
+
     def test_hc_present_does_not_download(self):
         tar, sha = self.hc_tarball()
         r = self.run_install(SHELTIE_HC_URL=tar, SHELTIE_HC_SHA256=sha)  # PATH에 가짜 hc가 있다

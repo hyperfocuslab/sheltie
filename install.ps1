@@ -8,8 +8,10 @@
 #   -NoHc / SHELTIE_NO_HC=1: do not auto-install herdr-core when hc.exe is missing (otherwise the pinned
 #   herdr-core zip is downloaded, checked against the SHA256 below and installed into
 #   %LOCALAPPDATA%\Programs\herdr-core; failure never stops this install).
-#   SHELTIE_HC_URL / SHELTIE_HC_SHA256: override that zip source (https URL or local file, http refused) and its
-#   expected hash (for tests).
+#   If the original URL (HC_BASE_URL) fails to download or the hash differs, the same file is fetched from our
+#   mirror (HC_MIRROR_URL) and checked against the same hash.
+#   SHELTIE_HC_URL / SHELTIE_HC_SHA256: override that zip source (https URL or local file, http refused; no mirror
+#   fallback) and its expected hash (for tests).
 #   Uninstall never removes herdr-core.
 #   Also creates %LOCALAPPDATA%\sheltie\bin\sheltie.cmd (run: sheltie run gemini) and adds that folder to the
 #   user PATH (HKCU\Environment, or the key in SHELTIE_ENV_KEY; for tests). Uninstall removes both.
@@ -25,6 +27,8 @@
   $HC_PIN_VERSION = '0.1.21'
   $HC_SHA_WIN = 'a8984634c35b58ba82d0aec078d5a5e6004da01d5a25b3daf822ab5e31c7312b'
   $HC_BASE_URL = "https://releases.herdr.dev/core/$HC_PIN_VERSION"
+  # Mirror used when the original URL fails (same file names and hashes). Must equal HC_MIRROR_URL in install.sh (tested).
+  $HC_MIRROR_URL = "https://github.com/hyperfocuslab/sheltie/releases/download/hc-$HC_PIN_VERSION"
   # Default source of the server file. Change only this line if the repo is renamed.
   $DEFAULT_SRC = 'https://raw.githubusercontent.com/hyperfocuslab/sheltie/main/server/sheltie.py'
   $TASK = 'Sheltie'
@@ -140,6 +144,8 @@
     hc_nocore = '67Cb7J2AIOustuydjOyXkCBoZXJkci1jb3Jl6rCAIOyXhuqxsOuCmCDrtojsmYTsoITtlZjri6Q=' # hc bundle incomplete
     hc_norun = '67Cb7J2AIGhlcmRyLWNvcmXqsIAg7J20IOq4sOq4sOyXkOyEnCDsi6TtlonrkJjsp4Ag7JWK64qU64uk' # hc does not run
     hc_copy = 'ezB9IOyXkCDshKTsuZjtlZjsp4Ag66q77ZaI64uk' # hc copy failed
+    hc_mirror = 'aGVyZHItY29yZeulvCDsm5Drnpgg7KO87IaM7JeQ7IScIOuquyDrsJvslZjri6QoezB9KS4g66+465+s7JeQ7IScIOuwm+uKlOuLpCh7MX0p' # hc primary failed, trying mirror
+    hc_dry_mirror = 'KyAgIOyLpO2MqO2VmOuptCDrr7jrn6zsl5DshJwg67Cb6riwKHswfSk=' # dry-run hc mirror
     hc_nohc = '7ISk7LmYIOuSpOyXkOuPhCBoY+ulvCDssL7sp4Ag66q77ZaI64uk' # hc still missing
     cmd_foreign = 'ezB9IOqwgCDsnbTrr7gg7J6I6rOgIFNoZWx0aWXqsIAg66eM65OgIO2MjOydvOydtCDslYTri4jrnbwg6rG065Oc66as7KeAIOyViuyVmOuLpC4gc2hlbHRpZSDrqoXroLnsnYAg66eM65Ok7KeAIOyViuyVmOuLpC4=' # sheltie.cmd foreign
     cmd_dry = 'KyB7MH0g7J6R7ISxKHNoZWx0aWUgcnVuIDzsl5DsnbTsoITtirg+KQ==' # dry-run sheltie.cmd
@@ -642,35 +648,53 @@ except Exception:
     # Download the pinned herdr-core zip, check its SHA256 and install it. Never throws: returns the hc path or $null.
     if ($NOHC -or $env:SHELTIE_NO_HC -eq '1') { Say (T 'hc_skip'); return $null }
     $src = $env:SHELTIE_HC_URL
+    $mirror = $null
     if (-not $src) {
       $arch = $env:PROCESSOR_ARCHITEW6432
       if (-not $arch) { $arch = $env:PROCESSOR_ARCHITECTURE }
       if ($arch -ne 'AMD64') { Say (T 'hc_noarch'); return $null }
       $src = "$HC_BASE_URL/herdr-core-windows-x86_64.zip"
+      $mirror = "$HC_MIRROR_URL/herdr-core-windows-x86_64.zip"
     }
     $want = $env:SHELTIE_HC_SHA256
     if (-not $want) { $want = $HC_SHA_WIN }
     if ($src -like 'http://*') { Say (T 'hc_fail' (T 'hc_http' $src)); return $null }
-    if ($DRY) { Say (T 'hc_dry' $HC_PIN_VERSION $src); return $null }
+    if ($DRY) {
+      Say (T 'hc_dry' $HC_PIN_VERSION $src)
+      if ($mirror) { Say (T 'hc_dry_mirror' $mirror) }
+      return $null
+    }
     if (-not $want) { Say (T 'hc_fail' (T 'hc_nosum')); return $null }
     $tmp = Join-Path ([IO.Path]::GetTempPath()) ('sheltie-hc.' + [guid]::NewGuid().ToString('N').Substring(0, 8))
     try {
       New-Item -ItemType Directory -Force -Path $tmp | Out-Null
       $zip = Join-Path $tmp 'hc.zip'
       Say (T 'hc_installing' $HC_PIN_VERSION $src)
-      if ($src -like 'https://*') {
-        try {
-          [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-        } catch {}
-        try { Invoke-WebRequest -UseBasicParsing -Uri $src -OutFile $zip } catch { Say (T 'hc_fail' (T 'hc_dl' $src)); return $null }
-      } else {
-        if (-not (Test-Path -LiteralPath $src -PathType Leaf)) { Say (T 'hc_fail' (T 'hc_nofile' $src)); return $null }
-        Copy-Item -LiteralPath $src -Destination $zip -Force
+      # Download $from into $zip and check its hash. Returns $null on success, else the failure reason.
+      $fetch = {
+        param([string]$from)
+        Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
+        if ($from -like 'https://*') {
+          try {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+          } catch {}
+          try { Invoke-WebRequest -UseBasicParsing -Uri $from -OutFile $zip } catch { return (T 'hc_dl' $from) }
+        } else {
+          if (-not (Test-Path -LiteralPath $from -PathType Leaf)) { return (T 'hc_nofile' $from) }
+          Copy-Item -LiteralPath $from -Destination $zip -Force
+        }
+        # .NET, not Get-FileHash: that one fails when PowerShell 7 starts 5.1.
+        $stream = [IO.File]::OpenRead($zip)
+        try { $got = -join ([Security.Cryptography.SHA256]::Create().ComputeHash($stream) | ForEach-Object { $_.ToString('x2') }) } finally { $stream.Close() }
+        if ($got -ne $want.Trim().ToLowerInvariant()) { return (T 'hc_sum') }
+        return $null
       }
-      # .NET, not Get-FileHash: that one fails when PowerShell 7 starts 5.1.
-      $stream = [IO.File]::OpenRead($zip)
-      try { $got = -join ([Security.Cryptography.SHA256]::Create().ComputeHash($stream) | ForEach-Object { $_.ToString('x2') }) } finally { $stream.Close() }
-      if ($got -ne $want.Trim().ToLowerInvariant()) { Say (T 'hc_fail' (T 'hc_sum')); return $null }
+      $why = & $fetch $src
+      if ($why -and $mirror) {
+        Say (T 'hc_mirror' $why $mirror)
+        $why = & $fetch $mirror
+      }
+      if ($why) { Say (T 'hc_fail' $why); return $null }
       # Windows' own tar opens zips; Git Bash's, often first on PATH, cannot.
       $tar = Join-Path $env:SystemRoot 'System32\tar.exe'
       $x = Join-Path $tmp 'x'

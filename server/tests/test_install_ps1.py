@@ -603,6 +603,23 @@ class InstallPs1Test(unittest.TestCase):
         self.assertIn("+ herdr-core 0.1.21 설치(https://releases.herdr.dev/core/0.1.21/herdr-core-windows-x86_64.zip)",
                       r.stdout)
 
+    def test_hc_dry_run_shows_mirror_only_for_pinned_source(self):
+        # 실제 받기(Invoke-WebRequest)는 시험에서 가짜로 못 바꿔 네트워크로 나가지 않게 미러 경로는 dry-run으로만 본다.
+        r = self.run_install("-DryRun", SHELTIE_HC="", SHELTIE_HC_URL=None, SHELTIE_HC_SHA256=None,
+                             PROCESSOR_ARCHITEW6432="AMD64")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("+   실패하면 미러에서 받기(https://github.com/hyperfocuslab/sheltie/releases/download/hc-0.1.21/"
+                      "herdr-core-windows-x86_64.zip)", r.stdout)
+        r = self.run_install("-DryRun", SHELTIE_HC="")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("미러", r.stdout)
+
+    def test_hc_override_local_file_failure_has_no_mirror(self):
+        r = self.run_install(SHELTIE_HC="", SHELTIE_HC_SHA256="0" * 64)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("체크섬", r.stdout)
+        self.assertNotIn("미러", r.stdout)
+
     def test_hc_dry_run_downloads_nothing(self):
         r = self.run_install("-DryRun", SHELTIE_HC="")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
@@ -947,6 +964,20 @@ class InstallPs1StaticTest(unittest.TestCase):
                      "SHELTIE_ENV_KEY", "DoNotExpandEnvironmentNames", "rem sheltie-command"):
             self.assertIn(want, t, want)
         self.assertIn("-NoHc", messages()["help6"])
+
+    def test_hc_mirror_url_same_in_both_installers(self):
+        urls = {}
+        for name in ("install.sh", "install.ps1"):
+            m = re.search(r'HC_MIRROR_URL\s*=\s*"([^"]+)"', read(os.path.join(ROOT, name)))
+            self.assertIsNotNone(m, name)
+            urls[name] = m.group(1)
+        self.assertEqual(urls["install.sh"], urls["install.ps1"])
+        self.assertEqual(urls["install.sh"], "https://github.com/hyperfocuslab/sheltie/releases/download/hc-$HC_PIN_VERSION")
+
+    def test_hc_mirror_messages(self):
+        msgs = messages()
+        self.assertEqual(msgs["hc_mirror"], "herdr-core를 원래 주소에서 못 받았다({0}). 미러에서 받는다({1})")
+        self.assertEqual(msgs["hc_dry_mirror"], "+   실패하면 미러에서 받기({0})")
 
     def test_dry_run_env_supported(self):
         self.assertIn("SHELTIE_DRY_RUN", read(INSTALL))
