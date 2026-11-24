@@ -9,6 +9,7 @@ import json
 import os
 import select
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -59,6 +60,19 @@ class HcContractTest(unittest.TestCase):
             subprocess.run([BIN, "server", "stop"], env=cls.env, capture_output=True, timeout=30)
         except (OSError, subprocess.SubprocessError):
             pass
+        # launchd 아래에서 돌면 코어가 `--hc-launchd`로 따로 떠서 server stop으로 안 내려간다(맥미니 감시 실측).
+        # 이 테스트가 준 바이너리 경로나 임시 폴더를 명령줄에 가진 프로세스만 PID로 끈다.
+        try:
+            ps = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True, timeout=10).stdout
+        except (OSError, subprocess.SubprocessError):
+            ps = ""
+        for line in ps.splitlines():
+            pid, _, cmd = line.strip().partition(" ")
+            if pid.isdigit() and int(pid) != os.getpid() and (cmd.startswith(BIN + " ") or cls.tmp in cmd):
+                try:
+                    os.kill(int(pid), signal.SIGKILL)
+                except OSError:
+                    pass
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
     # --- 도우미
