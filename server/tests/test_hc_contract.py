@@ -41,6 +41,9 @@ class HcContractTest(unittest.TestCase):
             "XDG_CONFIG_HOME": os.path.join(cls.tmp, "config"),
             "HC_SESSION": "contract",
             "HC_SOCKET": os.path.join(cls.tmp, "s.sock"),
+            # 맥 hc는 SSH_CONNECTION이 없으면 코어를 일회성 launchd 작업으로 띄운다. launchd 예약 작업(맥미니 감시) 안에서는
+            # 그 경로가 멈춰서, ssh 때처럼 바로 띄우게 한다(herdr-core src/platform/macos_launchd.rs ssh()).
+            "SSH_CONNECTION": env.get("SSH_CONNECTION") or "127.0.0.1 0 127.0.0.1 0",
         })
         cls.env = env
         cls.work = os.path.join(cls.tmp, "work")
