@@ -1704,3 +1704,18 @@ for _n in [n for n in dir(InstallTest) if n.startswith("test_")]:
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ShellVarBeforeHangulTest(unittest.TestCase):
+    """UTF-8 로캘의 sh는 `$NEWV로`처럼 변수 바로 뒤 한글을 변수 이름으로 읽는다(자동 업데이트 재현 2026-11-25). `${NEWV}로`로 쓴다."""
+
+    def test_no_bare_var_followed_by_hangul(self):
+        bad = []
+        for rel in ("install.sh", "ops/release-server.sh", "ops/hc-watch.sh"):
+            with open(os.path.join(ROOT, rel), encoding="utf-8") as f:
+                for n, line in enumerate(f, 1):
+                    if line.lstrip().startswith("#"):
+                        continue
+                    if re.search(r"\$[A-Za-z_][A-Za-z0-9_]*[가-힣]", line):
+                        bad.append("%s:%d" % (rel, n))
+        self.assertEqual(bad, [])
