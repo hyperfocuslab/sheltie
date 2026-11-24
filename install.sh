@@ -1,12 +1,17 @@
 #!/bin/sh
-# Sheltie 설치기(macOS). 사용: sh install.sh [--dry-run] [--uninstall] [--no-hooks] [--no-hc]
+# Sheltie 설치기(macOS). 사용: sh install.sh [--dry-run] [--uninstall] [--no-hooks] [--no-hc] [--no-auto-update] [--update]
+#   --no-auto-update: 서버 자동 업데이트를 끈다(설정 auto_update: false). 한 번 끄면 다시 설치해도 그대로다(설정에서 지우면 켜진다).
+#   --update: 서버 자동 업데이트가 부른다(사람이 쓰지 않는다). SHELTIE_SRC의 새 서버로 바꾸고, 설정·토큰·기기는 그대로 두고,
+#   tailscale·QR·hc 설치를 건너뛰고, 훅을 다시 등록하고, 서비스를 다시 시작한다. SHELTIE_UPDATE_WAIT초(기본 120) 안에
+#   새 버전이 /api/health에 답하지 않으면 sheltie.py.prev로 되돌린다. 결과는 설정 폴더 update_status.json에 남긴다.
+#   SHELTIE_LABEL(launchd 레이블, 기본 com.hyperfocuslab.sheltie): 시험용. 실제 서비스와 겹치지 않게 다른 이름으로 돌린다.
 #   --no-hooks: Claude Code·Codex·Qwen Code 훅과 OpenCode 플러그인 등록(해제)을 건너뜀. hc(herdr-core)가 없어도 설치는 계속한다(공식 훅으로만 동작).
 #   --no-hc: hc(herdr-core)가 없어도 자동 설치하지 않는다(SHELTIE_NO_HC=1과 같다). 없으면 고정 버전(HC_PIN_VERSION) 파일을 받아
 #   이 파일에 박힌 SHA256으로 검증한 뒤 ~/.local/bin에 설치한다. 실패해도 설치는 계속한다. 해제는 herdr-core를 지우지 않는다.
 #   원래 주소(HC_BASE_URL)에서 못 받거나 해시가 다르면 우리 미러(HC_MIRROR_URL)에서 같은 파일을 같은 해시로 받는다.
 #   시험용 환경변수 SHELTIE_HC_URL(받을 파일: https URL 또는 로컬 경로, http 거부. 주면 미러로 넘어가지 않는다), SHELTIE_HC_SHA256(기대 해시 덮어쓰기)
 #   `sheltie` 명령: ~/.local/bin/sheltie 를 만든다(예: sheltie run gemini). 표시 없는 같은 이름 파일은 건드리지 않는다.
-#   환경변수: SHELTIE_SRC(서버 파일 https URL 또는 로컬 경로. 기본: 옆의 server/ 파일, 없으면 GitHub raw), SHELTIE_HC(hc 경로),
+#   환경변수: SHELTIE_SRC(서버 파일 https URL 또는 로컬 경로. 기본: 옆의 server/ 파일, 없으면 최신 서버 릴리스), SHELTIE_HC(hc 경로),
 #   SHELTIE_PORT(기본 8790), SHELTIE_TAILSCALE(tailscale CLI 경로),
 #   SHELTIE_SKIP_TAILSCALE=1(tailscale 점검·serve·pair 건너뜀, 시험용),
 #   SHELTIE_SYS_AGENTS_DIR(시스템 LaunchAgents 폴더, 기본 /Library/LaunchAgents, 시험용)
@@ -20,9 +25,13 @@ HC_SHA_MACOS_X86_64="e377e1d342cddce0346da5b2f3c281b9701e4731c00024c7c5028265e77
 HC_BASE_URL="https://releases.herdr.dev/core/$HC_PIN_VERSION"
 # 원래 주소가 실패할 때 쓰는 미러(파일 이름·해시가 같다). install.ps1의 HC_MIRROR_URL과 같아야 한다(테스트가 비교).
 HC_MIRROR_URL="https://github.com/hyperfocuslab/sheltie/releases/download/hc-$HC_PIN_VERSION"
-# 서버 파일 기본 출처. 저장소 이름이 바뀌면 이 한 줄만 고친다.
-DEFAULT_SRC="https://raw.githubusercontent.com/hyperfocuslab/sheltie/main/server/sheltie.py"
-LABEL="com.hyperfocuslab.sheltie"
+# 서버 파일 기본 출처: 최신 서버 릴리스(ops/release-server.sh)의 자산. main이 아니라 릴리스된 코드만 깔린다.
+# 같은 곳의 manifest.json 해시와 맞아야 설치한다. 저장소 이름이 바뀌면 이 한 줄만 고친다.
+DEFAULT_SRC="https://github.com/hyperfocuslab/sheltie/releases/latest/download/sheltie.py"
+LABEL="${SHELTIE_LABEL:-com.hyperfocuslab.sheltie}"
+case "$LABEL" in *[!A-Za-z0-9.-]*|"") printf '%s\n' "SHELTIE_LABEL은 영문·숫자·점·하이픈만: $LABEL" >&2; exit 2 ;; esac
+# 서버 자동 업데이트(--update) 결과 파일(설정 폴더). server/sheltie.py UPDATE_STATUS_FILE과 같다(테스트가 비교).
+UPDATE_STATUS_NAME="update_status.json"
 DATA_DIR="$HOME/.local/share/sheltie"
 SERVER="$DATA_DIR/sheltie.py"
 PLIST_DIR="$HOME/Library/LaunchAgents"
@@ -47,6 +56,8 @@ DRY=0
 MODE=install
 NOHOOKS=0
 NOHC=0
+NOAUTO=0
+PYTHON=""
 CMD_DIR="$HOME/.local/bin"
 CMD_PATH="$CMD_DIR/sheltie"
 CMD_MARK="# sheltie-command:"
@@ -58,8 +69,10 @@ for a in "$@"; do
     --uninstall) MODE=uninstall ;;
     --no-hooks) NOHOOKS=1 ;;
     --no-hc) NOHC=1 ;;
-    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
-    *) echo "알 수 없는 옵션: $a (--dry-run, --uninstall, --no-hooks, --no-hc)" >&2; exit 2 ;;
+    --no-auto-update) NOAUTO=1 ;;
+    --update) MODE=update ;;
+    -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
+    *) echo "알 수 없는 옵션: $a (--dry-run, --uninstall, --no-hooks, --no-hc, --no-auto-update)" >&2; exit 2 ;;
   esac
 done
 
@@ -92,8 +105,9 @@ find_tailscale() {
 
 config_port() { # 설정 파일의 port(새 설정이 없으면 이전 설치의 설정). 없으면 8790
   _c=$CONFIG; [ -f "$_c" ] || _c="$OLD_CONFIG_DIR/config.json"
-  if [ -f "$_c" ] && command -v python3 >/dev/null 2>&1; then
-    python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1])).get("port",8790)))' "$_c" 2>/dev/null && return 0
+  _cp=${PYTHON:-python3}  # 업데이트 때는 서비스의 파이썬
+  if [ -f "$_c" ] && command -v "$_cp" >/dev/null 2>&1; then
+    "$_cp" -c 'import json,sys; print(int(json.load(open(sys.argv[1])).get("port",8790)))' "$_c" 2>/dev/null && return 0
   fi
   echo 8790
 }
@@ -558,6 +572,79 @@ hooks_apply() {
   done
 }
 
+# sheltie 명령(~/.local/bin/sheltie)
+sq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+install_command() {
+  if [ -e "$CMD_PATH" ] || [ -L "$CMD_PATH" ]; then
+    if ! { [ -f "$CMD_PATH" ] && grep -F "$CMD_MARK" "$CMD_PATH" >/dev/null 2>&1; }; then
+      say "$CMD_PATH 가 이미 있고 Sheltie가 만든 파일이 아니라 건드리지 않았다. sheltie 명령은 만들지 않았다."
+      return 0
+    fi
+  fi
+  if [ "$DRY" = 1 ]; then say "+ $CMD_PATH 작성(sheltie run <에이전트>)"; return 0; fi
+  mkdir -p "$CMD_DIR" || { say "$CMD_DIR 를 만들지 못해 sheltie 명령은 건너뛴다."; return 0; }
+  _ctmp=$(mktemp "$CMD_DIR/.sheltie.XXXXXX") || { say "sheltie 명령 파일을 만들지 못했다."; return 0; }
+  {
+    printf '#!/bin/sh\n%s Sheltie 설치기가 만들고 해제 때 지운다\n' "$CMD_MARK"
+    printf 'exec %s %s "$@"\n' "$(sq "$PYTHON")" "$(sq "$SERVER")"
+  } > "$_ctmp" && chmod 0755 "$_ctmp" && mv -f "$_ctmp" "$CMD_PATH" \
+    || { rm -f "$_ctmp"; say "sheltie 명령을 만들지 못했다."; return 0; }
+  case ":$PATH:" in
+    *":$CMD_DIR:"*) ;;
+    *) say "$CMD_DIR 가 PATH에 없다. 터미널에서 sheltie 명령을 쓰려면 한 번 실행해라: echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.zshrc" ;;
+  esac
+}
+# LaunchAgent plist. deploy/user-launchagent.plist.in과 같아야 한다(테스트가 비교). 템플릿 파일이 옆에 없으면(curl | sh) 이 사본.
+PLIST_BUILTIN='<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- install.sh가 @…@ 자리를 채워 ~/Library/LaunchAgents에 둔다. install.sh 안의 내장 사본과 같아야 한다(테스트가 비교). -->
+<plist version="1.0"><dict>
+  <key>Label</key><string>@LABEL@</string>
+  <key>ProgramArguments</key><array><string>@PYTHON@</string><string>@SERVER@</string><string>serve</string></array>
+  <key>EnvironmentVariables</key><dict>
+    <key>HOME</key><string>@HOME@</string>
+    <key>PATH</key><string>@PATH@</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>@LOG@</string>
+  <key>StandardErrorPath</key><string>@LOG@</string>
+</dict></plist>'
+# write_plist <out>: $TEMPLATE(없으면 내장 사본)의 @…@ 자리를 채운다. PATH에는 hc 폴더와 python 폴더를 앞에 둔다.
+# 시험용 레이블(SHELTIE_LABEL)이면 서버가 띄우는 업데이트 설치기도 그 레이블을 쓰게 환경변수로 넘긴다.
+write_plist() {
+  _svc=""; [ -z "${HC:-}" ] || _svc="$(dirname "$HC"):"
+  _svc="$_svc$(dirname "$PYTHON"):/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+  HR_TEMPLATE=${TEMPLATE:-} HR_BUILTIN=$PLIST_BUILTIN HR_OUT=$1 HR_LABEL=$LABEL HR_PYTHON=$PYTHON \
+  HR_SERVER=$SERVER HR_PATH=$_svc HR_LOG=$LOG HR_HOME=$HOME HR_TEST_LABEL=${SHELTIE_LABEL:-} "$PYTHON" -c '
+import os
+from xml.sax.saxutils import escape
+t = open(os.environ["HR_TEMPLATE"]).read() if os.environ["HR_TEMPLATE"] else os.environ["HR_BUILTIN"] + "\n"
+for k in ("LABEL", "PYTHON", "SERVER", "PATH", "LOG", "HOME"):
+    t = t.replace("@%s@" % k, escape(os.environ["HR_" + k]))
+if os.environ["HR_TEST_LABEL"]:
+    t = t.replace("<key>PATH</key>", "<key>SHELTIE_LABEL</key><string>%s</string>\n    <key>PATH</key>" % escape(os.environ["HR_TEST_LABEL"]), 1)
+open(os.environ["HR_OUT"], "w").write(t)
+'
+}
+
+# launchd: bootout은 비동기라 바로 bootstrap하면 "5: Input/output error"로 실패할 수 있다. 내려간 걸 확인하고 올린다.
+launchd_loaded() { launchctl print "gui/$UID_N/$LABEL" >/dev/null 2>&1; }
+launchd_down() { # bootout하고 서비스가 사라질 때까지(최대 10초) 기다린다
+  launchctl bootout "gui/$UID_N/$LABEL" 2>/dev/null || true
+  _lw=0
+  while launchd_loaded && [ "$_lw" -lt 10 ]; do sleep 1; _lw=$((_lw + 1)); done
+}
+launchd_up() { # <plist>: bootstrap. 실패하면 1초 간격으로 모두 3번
+  _lt=0
+  while :; do
+    launchctl bootstrap "gui/$UID_N" "$1" && return 0
+    _lt=$((_lt + 1)); [ "$_lt" -lt 3 ] || return 1
+    sleep 1
+  done
+}
+
 if [ "$MODE" = uninstall ]; then
   [ -n "$PORT" ] || PORT=$(config_port)
   run launchctl bootout "gui/$UID_N/$LABEL" 2>/dev/null || say "(실행 중인 서비스가 없다)"
@@ -580,10 +667,187 @@ fi
 # ---- 1. 점검
 [ "$(uname -s)" = Darwin ] || die 1 "macOS에서만 설치할 수 있다."
 
-PYTHON=$(command -v python3 2>/dev/null || true)
+# 서비스 plist의 파이썬(ProgramArguments 첫 칸). 업데이트는 지금 서비스가 쓰는 파이썬을 그대로 쓴다.
+service_python() {
+  _sp=$PLIST; [ ! -f "$SYS_PLIST" ] || _sp=$SYS_PLIST
+  [ -f "$_sp" ] || return 0
+  _py=$(/usr/libexec/PlistBuddy -c "Print :ProgramArguments:0" "$_sp" 2>/dev/null) \
+    || _py=$(sed -n 's|.*<key>ProgramArguments</key><array><string>\([^<]*\)</string>.*|\1|p' "$_sp" | head -n 1)
+  [ -n "$_py" ] && [ -x "$_py" ] && printf '%s' "$_py"
+  return 0
+}
+PYTHON=""
+[ "$MODE" != update ] || PYTHON=$(service_python)
+[ -n "$PYTHON" ] || PYTHON=$(command -v python3 2>/dev/null || true)
 [ -n "$PYTHON" ] || die 1 "python3가 없다. 터미널에서 'xcode-select --install'로 개발자 도구를 설치한 뒤 다시 실행해라."
 "$PYTHON" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' \
   || die 1 "python3가 3.9보다 낮다($PYTHON). 'xcode-select --install' 또는 'brew install python'으로 새 버전을 설치해라."
+
+# ---- 서버 자동 업데이트(--update). 서버가 받은 새 서버 파일(SHELTIE_SRC)로 바꾸고 다시 시작한다.
+# 설정·토큰·기기 파일은 읽기만 한다. tailscale·hc 설치·QR은 건너뛴다. 새 버전이 정해진 시간 안에 답하지 않으면 되돌린다.
+# update_status <result> <version> <from> <reason> <transient 0|1>: 서버가 다음 시작 때 읽는 결과 파일.
+# transient=1(응답 시간 초과·쓰기 실패 등)이면 서버가 다음 확인 때 다시 해 보고 3번째에야 그 버전을 버린다.
+update_status() {
+  HR_OUT="$CONFIG_DIR/$UPDATE_STATUS_NAME" HR_RESULT=$1 HR_VER=$2 HR_FROM=$3 HR_REASON=$4 HR_TRANSIENT=${5:-0} "$PYTHON" -c '
+import json, os, time
+p = os.environ["HR_OUT"]
+tmp = p + ".tmp"
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as f:
+    json.dump({"result": os.environ["HR_RESULT"], "version": os.environ["HR_VER"], "from": os.environ["HR_FROM"],
+               "reason": os.environ["HR_REASON"], "transient": os.environ["HR_TRANSIENT"] == "1",
+               "time": int(time.time())}, f)
+os.replace(tmp, p)
+' || say "경고: 업데이트 결과를 남기지 못했다: $CONFIG_DIR/$UPDATE_STATUS_NAME" >&2
+}
+update_fail() { # <이유> [permanent]: 서버를 건드리기 전 실패. permanent(릴리스가 잘못됨)가 아니면 일시적 실패다
+  say "업데이트 중단: $1" >&2
+  _tr=1; [ "${2:-}" != permanent ] || _tr=0
+  [ ! -d "$CONFIG_DIR" ] || update_status failed "${NEWV:-}" "${OLDV:-}" "$1" "$_tr"
+  exit 1
+}
+server_version_of() { # 서버 파일의 SERVER_VERSION 줄(server/sheltie.py SERVER_VERSION_LINE_RE와 같은 모양)
+  "$PYTHON" -c '
+import re, sys
+m = re.search(r"^SERVER_VERSION = \"([^\"\n]*)\"[ \t]*$", open(sys.argv[1], encoding="utf-8-sig").read(), re.M)
+print(m.group(1) if m else "")
+' "$1" 2>/dev/null || true
+}
+config_value() { # <키>: 설정 값(없으면 빈 문자열, false는 "false")
+  "$PYTHON" -c '
+import json, sys
+v = json.load(open(sys.argv[1])).get(sys.argv[2])
+print("false" if v is False else ("" if v is None else v))
+' "$CONFIG" "$1" 2>/dev/null || true
+}
+# wait_version <버전> <초>: 그 버전을 말하고 이 단계 뒤(T0)에 뜬 서버가 /api/health에 답하면 0
+wait_version() {
+  _deadline=$(( $(date +%s) + $2 ))
+  while :; do
+    if printf 'header = "Authorization: Bearer %s"\nurl = "http://127.0.0.1:%s/api/health"\n' "$TOKEN" "$PORT" \
+       | curl -fsS -m 3 -K - 2>/dev/null | HR_WANT=$1 HR_T0=$T0 "$PYTHON" -c '
+import json, os, sys
+d = json.load(sys.stdin)
+ok = (not os.environ["HR_WANT"] or d.get("server_version") == os.environ["HR_WANT"]) \
+    and float(d.get("started") or 0) >= float(os.environ["HR_T0"])
+sys.exit(0 if ok else 1)
+' 2>/dev/null; then return 0; fi
+    [ "$(date +%s)" -lt "$_deadline" ] || return 1
+    sleep 1
+  done
+}
+# update_restart <kick|reload> [이전 plist]: 서비스 다시 시작. plist가 바뀌었으면(reload) bootout → 내려갈 때까지 기다림 →
+# bootstrap(다시 시도). 새 plist가 끝내 안 올라가면 bootout이 안 끝난 경우 kickstart, 아니면 이전 plist를 되돌려 놓고 올린다.
+# 이 설치기는 서버가 새 세션으로 띄워서 서버 job이 내려가도 살아남는다.
+update_restart() {
+  if [ "$SYS_INSTALLED" = 1 ]; then
+    launchctl kickstart -k "gui/$UID_N/$LABEL"
+    return
+  fi
+  if [ "$1" = reload ]; then
+    launchd_down
+    launchd_up "$PLIST" && return 0
+    if launchd_loaded; then launchctl kickstart -k "gui/$UID_N/$LABEL"; return; fi
+    if [ -n "${2:-}" ] && [ -f "$2" ]; then
+      say "경고: 새 plist로 서비스를 올리지 못해 이전 plist로 올린다." >&2
+      mv -f "$2" "$PLIST" && cp "$PLIST" "$PLIST_COPY"
+      launchd_up "$PLIST"
+      return
+    fi
+    return 1
+  fi
+  launchctl kickstart -k "gui/$UID_N/$LABEL" 2>/dev/null || launchd_up "$PLIST"
+}
+update_main() {
+  T0=$(date +%s)
+  NEWV=""; OLDV=""
+  [ -f "$CONFIG" ] || update_fail "설정이 없다: $CONFIG"
+  [ -f "$SERVER" ] || update_fail "설치된 서버 파일이 없다: $SERVER"
+  SRC=${SHELTIE_SRC:-}
+  [ -n "$SRC" ] && [ -f "$SRC" ] || update_fail "새 서버 파일이 없다: ${SRC:-(SHELTIE_SRC 없음)}"
+  "$PYTHON" -c 'import sys; compile(open(sys.argv[1], encoding="utf-8-sig").read(), sys.argv[1], "exec")' "$SRC" \
+    || update_fail "새 서버 파일이 올바른 파이썬이 아니다: $SRC" permanent
+  NEWV=$(server_version_of "$SRC")
+  [ -n "$NEWV" ] || update_fail "새 서버 파일에 SERVER_VERSION이 없다: $SRC" permanent
+  OLDV=$(server_version_of "$SERVER")
+  # 버전은 올라가기만 한다(서버도 확인하지만 설치기도 거꾸로 가지 않는다).
+  HR_NEW=$NEWV HR_OLD=$OLDV "$PYTHON" -c '
+import os, re, sys
+rx = re.compile(r"^(0|[1-9][0-9]{0,4})\.(0|[1-9][0-9]{0,4})\.(0|[1-9][0-9]{0,4})$")
+n, o = rx.match(os.environ["HR_NEW"]), rx.match(os.environ["HR_OLD"])
+sys.exit(0 if n and (not os.environ["HR_OLD"] or (o and tuple(map(int, n.groups())) > tuple(map(int, o.groups()))))
+         else 1)
+' || update_fail "버전이 올라가지 않는다(${OLDV:-?} -> $NEWV)" permanent
+  PORT=$(config_port)
+  TOKEN=$("$PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1]))["token"])' "$CONFIG" 2>/dev/null) \
+    || update_fail "설정에서 토큰을 읽지 못했다: $CONFIG"
+  HC=$(config_value hc_path)
+  WAIT=${SHELTIE_UPDATE_WAIT:-120}
+  case "$WAIT" in ""|*[!0-9]*) WAIT=120 ;; esac
+  SYS_INSTALLED=0
+  [ ! -e "$SYS_PLIST" ] || SYS_INSTALLED=1
+  say "Sheltie 서버 업데이트: ${OLDV:-?} -> $NEWV"
+  if [ "$DRY" = 1 ]; then
+    say "+ $SERVER -> $SERVER.prev, $SRC -> $SERVER, 훅 다시 등록, 서비스 다시 시작, ${WAIT}초 안에 $NEWV 확인(아니면 되돌림)"
+    exit 0
+  fi
+  # 교체: 지금 서버는 .prev로 남기고, 새 파일은 같은 폴더 임시 파일에서 rename(반쯤 쓴 파일로 뜨지 않게)
+  cp -p "$SERVER" "$SERVER.prev" || update_fail "지금 서버를 보관하지 못했다: $SERVER.prev"
+  _utmp=$(mktemp "$DATA_DIR/sheltie.XXXXXX") || update_fail "임시 파일을 만들지 못했다: $DATA_DIR"
+  if ! { cp "$SRC" "$_utmp" && chmod 0755 "$_utmp" && mv -f "$_utmp" "$SERVER"; }; then
+    rm -f "$_utmp"
+    update_fail "새 서버 파일을 두지 못했다: $SERVER"
+  fi
+  # 여기부터는 서버 파일이 바뀌었다. 어떤 명령이 실패해도(쓰기·디스크 오류) 중간에 끝나지 않고
+  # 재시작·확인·되돌리기·결과 기록까지 간다.
+  set +e
+  if [ "$NOHOOKS" = 1 ] || [ "$(config_value hooks)" = false ]; then say "(훅 등록 건너뜀)"; else hooks_apply install "$PYTHON"; fi
+  install_command
+  _mode=kick
+  if [ "$SYS_INSTALLED" != 1 ]; then
+    if write_plist "$PLIST.new"; then
+      if [ -f "$PLIST" ] && cmp -s "$PLIST.new" "$PLIST"; then
+        rm -f "$PLIST.new"
+      else
+        [ ! -f "$PLIST" ] || cp -p "$PLIST" "$PLIST.prev"
+        mv -f "$PLIST.new" "$PLIST" && cp "$PLIST" "$PLIST_COPY"
+        _mode=reload
+      fi
+    else
+      rm -f "$PLIST.new"
+      say "경고: 새 plist를 만들지 못해 지금 plist로 다시 시작한다." >&2
+    fi
+  fi
+  update_restart "$_mode" "$PLIST.prev" || say "경고: 서비스를 다시 시작하지 못했다($LABEL)." >&2
+  if wait_version "$NEWV" "$WAIT"; then
+    update_status ok "$NEWV" "$OLDV" "" 0
+    rm -f "$PLIST.prev"
+    say "업데이트 완료: $NEWV"
+    exit 0
+  fi
+  # 되돌리기: 이전 서버(와 plist)로. 결과를 먼저 남겨야 다시 뜬 이전 서버가 실패한 버전을 읽는다.
+  say "새 서버($NEWV)가 ${WAIT}초 안에 답하지 않아 이전 서버(${OLDV:-?})로 되돌린다." >&2
+  _rtmp=$(mktemp "$DATA_DIR/sheltie.XXXXXX") && cp -p "$SERVER.prev" "$_rtmp" && mv -f "$_rtmp" "$SERVER" \
+    || say "경고: 이전 서버 파일을 되돌리지 못했다. 직접 복사해라: cp '$SERVER.prev' '$SERVER'" >&2
+  if [ "$_mode" = reload ] && [ -f "$PLIST.prev" ]; then
+    mv -f "$PLIST.prev" "$PLIST" && cp "$PLIST" "$PLIST_COPY"
+  fi
+  update_status rolled_back "$NEWV" "$OLDV" "새 서버가 ${WAIT}초 안에 /api/health에 ${NEWV}로 답하지 않았다" 1
+  T0=$(date +%s)
+  update_restart "$_mode" || say "경고: 서비스를 다시 시작하지 못했다($LABEL)." >&2
+  if wait_version "$OLDV" "$WAIT"; then say "이전 서버로 되돌렸다(${OLDV:-?})."
+  else
+    # 마지막 수단: 서비스가 내려가 있으면 지금(되돌린) plist로 다시 올린다
+    if [ "$SYS_INSTALLED" != 1 ] && ! launchd_loaded; then
+      say "경고: 서비스가 내려가 있어 다시 올린다($PLIST)." >&2
+      T0=$(date +%s)
+      if launchd_up "$PLIST" && wait_version "$OLDV" "$WAIT"; then say "이전 서버로 되돌렸다(${OLDV:-?})."; exit 3; fi
+    fi
+    say "경고: 되돌린 서버도 답하지 않는다. 로그를 확인해라: tail -n 30 $LOG" >&2
+  fi
+  exit 3
+}
+[ "$MODE" != update ] || update_main
 
 find_hc() {
   HC=
@@ -725,6 +989,19 @@ else
   [ -s "$TMP" ] || die 1 "받은 서버 파일이 비어 있다: $SRC"
   "$PYTHON" -c 'import sys; compile(open(sys.argv[1]).read(), sys.argv[1], "exec")' "$TMP" \
     || die 1 "받은 서버 파일이 올바른 파이썬이 아니다: $SRC"
+  if [ "$SRC" = "$DEFAULT_SRC" ]; then
+    # 릴리스 매니페스트의 해시와 맞는지(서명 검증은 설치된 서버가 업데이트 때 한다)
+    _man="${DEFAULT_SRC%/*}/manifest.json"
+    TMPM=$(mktemp "$DATA_DIR/manifest.XXXXXX")
+    trap 'rm -f "$TMP" "$TMPM"' EXIT
+    curl --proto '=https' --tlsv1.2 -fsSL -o "$TMPM" "$_man" || die 1 "릴리스 manifest.json을 받지 못했다: $_man"
+    "$PYTHON" -c '
+import hashlib, json, sys
+want = json.load(open(sys.argv[1]))["files"]["sheltie.py"]
+sys.exit(0 if hashlib.sha256(open(sys.argv[2], "rb").read()).hexdigest() == want else 1)
+' "$TMPM" "$TMP" 2>/dev/null || die 1 "받은 서버 파일이 릴리스 manifest.json의 해시와 다르다: $SRC"
+    rm -f "$TMPM"
+  fi
   chmod 0755 "$TMP"
   mv -f "$TMP" "$SERVER"
   trap - EXIT
@@ -733,14 +1010,20 @@ fi
 old_stop_and_move
 run "$PYTHON" "$SERVER" init
 if [ "$DRY" != 1 ]; then
-  # 설정에 hc 경로와(지정했으면) 포트를 반영한다.
-  HR_CONFIG=$CONFIG HR_HC=$HC HR_PORT=$PORT "$PYTHON" -c '
+  # 설정에 hc 경로와(지정했으면) 포트, --no-hooks(자동 업데이트도 훅을 건드리지 않게), --no-auto-update를 반영한다.
+  HR_CONFIG=$CONFIG HR_HC=$HC HR_PORT=$PORT HR_NOHOOKS=$NOHOOKS HR_NOAUTO=$NOAUTO "$PYTHON" -c '
 import json, os
 p = os.environ["HR_CONFIG"]
 c = json.load(open(p))
 c["hc_path"] = os.environ["HR_HC"]
 if os.environ["HR_PORT"]:
     c["port"] = int(os.environ["HR_PORT"])
+if os.environ["HR_NOHOOKS"] == "1":
+    c["hooks"] = False
+else:
+    c.pop("hooks", None)
+if os.environ["HR_NOAUTO"] == "1":
+    c["auto_update"] = False
 tmp = p + ".tmp"
 fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
 with os.fdopen(fd, "w") as f:
@@ -756,47 +1039,9 @@ fi
 if [ "$NOHOOKS" = 1 ]; then say "(--no-hooks: 훅 등록 건너뜀)"; else hooks_apply install "$PYTHON"; fi
 
 # ---- 2c. sheltie 명령(~/.local/bin/sheltie)
-sq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
-install_command() {
-  if [ -e "$CMD_PATH" ] || [ -L "$CMD_PATH" ]; then
-    if ! { [ -f "$CMD_PATH" ] && grep -F "$CMD_MARK" "$CMD_PATH" >/dev/null 2>&1; }; then
-      say "$CMD_PATH 가 이미 있고 Sheltie가 만든 파일이 아니라 건드리지 않았다. sheltie 명령은 만들지 않았다."
-      return 0
-    fi
-  fi
-  if [ "$DRY" = 1 ]; then say "+ $CMD_PATH 작성(sheltie run <에이전트>)"; return 0; fi
-  mkdir -p "$CMD_DIR" || { say "$CMD_DIR 를 만들지 못해 sheltie 명령은 건너뛴다."; return 0; }
-  _ctmp=$(mktemp "$CMD_DIR/.sheltie.XXXXXX") || { say "sheltie 명령 파일을 만들지 못했다."; return 0; }
-  {
-    printf '#!/bin/sh\n%s Sheltie 설치기가 만들고 해제 때 지운다\n' "$CMD_MARK"
-    printf 'exec %s %s "$@"\n' "$(sq "$PYTHON")" "$(sq "$SERVER")"
-  } > "$_ctmp" && chmod 0755 "$_ctmp" && mv -f "$_ctmp" "$CMD_PATH" \
-    || { rm -f "$_ctmp"; say "sheltie 명령을 만들지 못했다."; return 0; }
-  case ":$PATH:" in
-    *":$CMD_DIR:"*) ;;
-    *) say "$CMD_DIR 가 PATH에 없다. 터미널에서 sheltie 명령을 쓰려면 한 번 실행해라: echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.zshrc" ;;
-  esac
-}
 install_command
 
 # ---- 3. LaunchAgent
-SVC_PATH=""; [ -z "$HC" ] || SVC_PATH="$(dirname "$HC"):"
-SVC_PATH="$SVC_PATH$(dirname "$PYTHON"):/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
-PLIST_BUILTIN='<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- install.sh가 @…@ 자리를 채워 ~/Library/LaunchAgents에 둔다. install.sh 안의 내장 사본과 같아야 한다(테스트가 비교). -->
-<plist version="1.0"><dict>
-  <key>Label</key><string>@LABEL@</string>
-  <key>ProgramArguments</key><array><string>@PYTHON@</string><string>@SERVER@</string><string>serve</string></array>
-  <key>EnvironmentVariables</key><dict>
-    <key>PATH</key><string>@PATH@</string>
-  </dict>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>ProcessType</key><string>Background</string>
-  <key>StandardOutPath</key><string>@LOG@</string>
-  <key>StandardErrorPath</key><string>@LOG@</string>
-</dict></plist>'
 TEMPLATE=
 SYS_INSTALLED=0
 [ ! -e "$SYS_PLIST" ] || SYS_INSTALLED=1
@@ -810,20 +1055,14 @@ if [ "$SYS_INSTALLED" = 1 ]; then
 elif [ "$DRY" = 1 ]; then
   say "+ $PLIST 작성(python=$PYTHON, server=$SERVER, log=$LOG)"
 else
-  HR_TEMPLATE=$TEMPLATE HR_BUILTIN=$PLIST_BUILTIN HR_OUT=$PLIST HR_LABEL=$LABEL HR_PYTHON=$PYTHON \
-  HR_SERVER=$SERVER HR_PATH=$SVC_PATH HR_LOG=$LOG "$PYTHON" -c '
-import os
-from xml.sax.saxutils import escape
-t = open(os.environ["HR_TEMPLATE"]).read() if os.environ["HR_TEMPLATE"] else os.environ["HR_BUILTIN"] + "\n"
-for k in ("LABEL", "PYTHON", "SERVER", "PATH", "LOG"):
-    t = t.replace("@%s@" % k, escape(os.environ["HR_" + k]))
-open(os.environ["HR_OUT"], "w").write(t)
-' || die 1 "plist를 만들지 못했다."
+  write_plist "$PLIST" || die 1 "plist를 만들지 못했다."
   cp "$PLIST" "$PLIST_COPY"
 fi
 if [ "$SYS_INSTALLED" != 1 ]; then
-  run launchctl bootout "gui/$UID_N/$LABEL" 2>/dev/null || true
-  if ! run launchctl bootstrap "gui/$UID_N" "$PLIST"; then
+  if [ "$DRY" = 1 ]; then
+    run launchctl bootout "gui/$UID_N/$LABEL"
+    run launchctl bootstrap "gui/$UID_N" "$PLIST"
+  elif launchd_down; ! launchd_up "$PLIST"; then
     rm -f "$PLIST"
     {
       echo "launchctl bootstrap이 실패했다. 홈이 외장 볼륨이면 ~/Library/LaunchAgents를 못 쓴다."
@@ -849,7 +1088,7 @@ sys.exit(0 if any(v and k.endswith(port) for k, v in (d.get("AllowFunnel") or {}
 if [ -n "$TS" ]; then
   if [ "$DRY" != 1 ] && funnel_on; then
     {
-      echo "tailscale Funnel이 포트 $PORT에 켜져 있다. 이대로면 서버가 인터넷에 공개된다."
+      echo "tailscale Funnel이 포트 ${PORT}에 켜져 있다. 이대로면 서버가 인터넷에 공개된다."
       echo "Funnel을 끈 뒤 다시 실행해라: $TS funnel --https=$PORT off"
       echo "(지금 설정 보기: $TS funnel status)"
     } >&2

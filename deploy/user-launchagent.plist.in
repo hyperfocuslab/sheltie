@@ -5,6 +5,7 @@
   <key>Label</key><string>@LABEL@</string>
   <key>ProgramArguments</key><array><string>@PYTHON@</string><string>@SERVER@</string><string>serve</string></array>
   <key>EnvironmentVariables</key><dict>
+    <key>HOME</key><string>@HOME@</string>
     <key>PATH</key><string>@PATH@</string>
   </dict>
   <key>RunAtLoad</key><true/>

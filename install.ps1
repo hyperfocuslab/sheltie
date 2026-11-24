@@ -1,6 +1,12 @@
-# Sheltie installer (Windows). Usage: powershell -File install.ps1 [-DryRun] [-Uninstall] [-NoHooks] [-NoHc] [-Help]
+# Sheltie installer (Windows). Usage: powershell -File install.ps1 [-DryRun] [-Uninstall] [-NoHooks] [-NoHc] [-NoAutoUpdate] [-Help]
+#   -NoAutoUpdate: turn off server auto-update (config auto_update: false; kept on reinstall).
+#   -Update: called by the server's auto-update, not by people. Replaces the server with SHELTIE_SRC keeping config, token
+#   and devices, skips tailscale/pairing/hc install, re-registers hooks, restarts the task. If the new version does not
+#   answer /api/health within SHELTIE_UPDATE_WAIT seconds (default 120) it restores sheltie.py.prev. The result goes to
+#   update_status.json in the config folder. SHELTIE_TASK (task name, default Sheltie): for tests, so a test task does not
+#   collide with the real one; the test task's server also gets USERPROFILE/LOCALAPPDATA/SHELTIE_TASK/SHELTIE_ENV_KEY.
 #   Via irm | iex no arguments can be passed: use SHELTIE_UNINSTALL=1 / SHELTIE_DRY_RUN=1 instead.
-#   Env: SHELTIE_SRC (server file https URL or local path; default: server\ next to this file, else GitHub raw),
+#   Env: SHELTIE_SRC (server file https URL or local path; default: server\ next to this file, else the latest server release),
 #   SHELTIE_HC (hc.exe path), SHELTIE_PORT (default 8790), SHELTIE_PYTHON (python.exe path),
 #   SHELTIE_TAILSCALE (tailscale CLI path), SHELTIE_SKIP_TAILSCALE=1 (skip tailscale check/serve/pair; for tests),
 #   SHELTIE_HEALTH_TRIES (health check attempts, default 10), SHELTIE_STOP_WAIT (seconds to wait for the old
@@ -29,9 +35,13 @@
   $HC_BASE_URL = "https://releases.herdr.dev/core/$HC_PIN_VERSION"
   # Mirror used when the original URL fails (same file names and hashes). Must equal HC_MIRROR_URL in install.sh (tested).
   $HC_MIRROR_URL = "https://github.com/hyperfocuslab/sheltie/releases/download/hc-$HC_PIN_VERSION"
-  # Default source of the server file. Change only this line if the repo is renamed.
-  $DEFAULT_SRC = 'https://raw.githubusercontent.com/hyperfocuslab/sheltie/main/server/sheltie.py'
-  $TASK = 'Sheltie'
+  # Default source of the server file: the latest server release asset (ops/release-server.sh), so only released code is
+  # installed. It must match the sha256 in manifest.json next to it. Change only this line if the repo is renamed.
+  $DEFAULT_SRC = 'https://github.com/hyperfocuslab/sheltie/releases/latest/download/sheltie.py'
+  $TASK = $env:SHELTIE_TASK
+  if (-not $TASK) { $TASK = 'Sheltie' }
+  # Result file of server auto-update (-Update) in the config folder. Same as UPDATE_STATUS_FILE in server/sheltie.py (tested).
+  $UPDATE_STATUS_NAME = 'update_status.json'
   $LOCAL = $env:LOCALAPPDATA
   if (-not $LOCAL) { $LOCAL = Join-Path $env:USERPROFILE 'AppData\Local' }
   $DATA = Join-Path $LOCAL 'sheltie'
@@ -50,6 +60,7 @@
   $MODE = 'install'
   $NOHOOKS = $false
   $NOHC = $false
+  $NOAUTO = $false
   $CMD_DIR = Join-Path $DATA 'bin'
   $CMD_PATH = Join-Path $CMD_DIR 'sheltie.cmd'
   $CMD_MARK = 'rem sheltie-command'
@@ -154,6 +165,34 @@
     cmd_path_added = '7IKs7Jqp7J6QIFBBVEjsl5AgezB9IOulvCDstpTqsIDtlojri6QuIOyDiCDthLDrr7jrhJDsnYQg7Je07Ja07JW8IHNoZWx0aWUg66qF66C57J20IOyeoe2ejOuLpC4=' # PATH entry added
     cmd_path_dry = 'KyDsgqzsmqnsnpAgUEFUSOyXkCB7MH0g7LaU6rCA' # dry-run PATH add
     cmd_path_dry_rm = 'KyDsgqzsmqnsnpAgUEFUSOyXkOyEnCB7MH0g7KCc6rGw' # dry-run PATH remove
+    upd_start = 'U2hlbHRpZSDshJzrsoQg7JeF642w7J207Yq4OiB7MH0gLT4gezF9' # update start
+    upd_abort = '7JeF642w7J207Yq4IOykkeuLqDogezB9' # update aborted
+    upd_nocfg = '7ISk7KCV7J20IOyXhuuLpDogezB9' # update: no config
+    upd_noserver = '7ISk7LmY65CcIOyEnOuyhCDtjIzsnbzsnbQg7JeG64ukOiB7MH0=' # update: no installed server
+    upd_nosrc = '7IOIIOyEnOuyhCDtjIzsnbzsnbQg7JeG64ukOiB7MH0=' # update: no new server file
+    upd_badpy = '7IOIIOyEnOuyhCDtjIzsnbzsnbQg7Jis67CU66W4IO2MjOydtOyNrOydtCDslYTri4jri6Q6IHswfQ==' # update: new server not valid python
+    upd_nover = '7IOIIOyEnOuyhCDtjIzsnbzsl5AgU0VSVkVSX1ZFUlNJT07snbQg7JeG64ukOiB7MH0=' # update: no SERVER_VERSION
+    upd_down = '67KE7KCE7J20IOyYrOudvOqwgOyngCDslYrripTri6QoezB9IC0+IHsxfSk=' # update: version not higher
+    upd_token = '7ISk7KCV7JeQ7IScIO2GoO2BsOydhCDsnb3sp4Ag66q77ZaI64ukOiB7MH0=' # update: token unreadable
+    upd_keep = '7KeA6riIIOyEnOuyhOulvCDrs7TqtIDtlZjsp4Ag66q77ZaI64ukOiB7MH0=' # update: could not keep .prev
+    upd_place = '7IOIIOyEnOuyhCDtjIzsnbzsnYQg65GQ7KeAIOuqu+2WiOuLpDogezB9' # update: could not place new server
+    upd_portbusy = '7J207KCEIOyEnOuyhOqwgCDtj6ztirggezB97J2EKOulvCkg64aT7KeAIOyViuyVhCDri6Tsi5wg652E7Jug64uk' # update: old server still holds port
+    upd_dry = 'KyB7MH0gLT4gezB9LnByZXYsIHsxfSAtPiB7MH0sIO2bhSDri6Tsi5wg65Ox66GdLCDsnpHsl4Ug64uk7IucIOyLnOyekSwgezJ97LSIIOyViOyXkCB7M30g7ZmV7J24KOyVhOuLiOuptCDrkJjrj4zrprwp' # dry-run update
+    upd_ok = '7JeF642w7J207Yq4IOyZhOujjDogezB9' # update done
+    upd_rb = '7IOIIOyEnOuyhCh7MH0p6rCAIHsxfey0iCDslYjsl5Ag64u17ZWY7KeAIOyViuyVhCDsnbTsoIQg7ISc67KEKHsyfSnroZwg65CY64+M66aw64ukLg==' # update rolling back
+    upd_rb_reason = '7IOIIOyEnOuyhOqwgCB7MH3stIgg7JWI7JeQIC9hcGkvaGVhbHRo7JeQIHsxfeuhnCDri7XtlZjsp4Ag7JWK7JWY64uk' # rollback reason
+    upd_rb_ok = '7J207KCEIOyEnOuyhOuhnCDrkJjrj4zroLjri6QoezB9KS4=' # rolled back
+    upd_rb_fail = '6rK96rOgOiDrkJjrj4zrprAg7ISc67KE64+EIOuLte2VmOyngCDslYrripTri6QuIOuhnOq3uOulvCDtmZXsnbjtlbTrnbw6IHswfQ==' # rolled back server silent
+    upd_rb_copy = '6rK96rOgOiDsnbTsoIQg7ISc67KEIO2MjOydvOydhCDrkJjrj4zrpqzsp4Ag66q77ZaI64ukLiDsp4HsoJEg67O17IKs7ZW06528OiB7MH0gLT4gezF9' # rollback copy failed
+    upd_status_fail = '6rK96rOgOiDsl4XrjbDsnbTtirgg6rKw6rO866W8IOuCqOq4sOyngCDrqrvtlojri6Q6IHswfQ==' # status write failed
+    upd_nohooks = 'KO2bhSDrk7HroZ0g6rG064SI65yAKQ==' # update: hooks skipped
+    upd_run_fail = '6rK96rOgOiDsnpHsl4XsnYQg64uk7IucIOyLnOyeke2VmOyngCDrqrvtlojri6QoezB9KS4=' # update: task restart failed
+    task_bad = 'U0hFTFRJRV9UQVNL64qUIOyYgeusuMK37Iir7J6Qwrfqs7XrsLHCt+ygkMK367CR7KSEwrftlZjsnbTtlIjrp4w6IHswfQ==' # bad SHELTIE_TASK
+    src_manifest_fail = '66a066as7IqkIG1hbmlmZXN0Lmpzb27snYQg67Cb7KeAIOuqu+2WiOuLpDogezB9' # release manifest download failed
+    src_hash = '67Cb7J2AIOyEnOuyhCDtjIzsnbzsnbQg66a066as7IqkIG1hbmlmZXN0Lmpzb27snZgg7ZW07Iuc7JmAIOuLpOultOuLpDogezB9' # server file hash differs from release manifest
+    upd_task_fail = '6rK96rOgOiDsnpHsl4Ug7KCV7J2Y66W8IOuwlOq+uOyngCDrqrvtlojri6QoezB9KS4g6rSA66as7J6QIOq2jO2VnOycvOuhnCDshKTsuZjtlZwg7J6R7JeF7J28IOyImCDsnojri6QuIOyEpOy5mOq4sOulvCDsnbzrsJggUG93ZXJTaGVsbOyXkOyEnCDtlZwg67KIIOuLpOyLnCDsi6TtlontlZjrqbQg67CU64CQ64ukLg==' # task XML not changed (admin-created task)
+    upd_err = '7JeF642w7J207Yq4IOykkSDsmKTrpZg6IHswfQ==' # error during update
+    help7 = 'ICAtTm9BdXRvVXBkYXRlOiDshJzrsoQg7J6Q64+ZIOyXheuNsOydtO2KuOulvCDrgYjri6Qo7ISk7KCVIGF1dG9fdXBkYXRlOiBmYWxzZSwg64uk7IucIOyEpOy5mO2VtOuPhCDqt7jrjIDroZwpLiAtVXBkYXRl64qUIOyekOuPmSDsl4XrjbDsnbTtirjqsIAg67aA66W464ukKOyCrOuejOydtCDsk7Dsp4Ag7JWK64qU64ukKS4=' # help line 7
   }
   # messages end
   function T([string]$Key) {
@@ -162,6 +201,9 @@
     return $s
   }
 
+  # Task XML. The TimeTrigger repeats every minute while the user is logged on: with IgnoreNew it starts the server
+  # only when it is not running. RestartOnFailure does not restart a server that exits non-zero (7950: exit 1 and
+  # os._exit both stayed down), so this is what brings a crashed server back (and lets the crash guard count starts).
   $TASK_XML_BUILTIN = @'
 <?xml version="1.0" encoding="UTF-16"?>
 @XML_COMMENT@
@@ -174,6 +216,14 @@
       <Enabled>true</Enabled>
       <UserId>@USER@</UserId>
     </LogonTrigger>
+    <TimeTrigger>
+      <Repetition>
+        <Interval>PT1M</Interval>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+      <StartBoundary>2026-01-01T00:00:00</StartBoundary>
+      <Enabled>true</Enabled>
+    </TimeTrigger>
   </Triggers>
   <Principals>
     <Principal id="Author">
@@ -540,7 +590,7 @@ except Exception:
 # ---- hooks_merge.py end
 '@
 
-  $HELP_TEXT = @((T 'help1'), (T 'help2'), (T 'help3'), (T 'help4'), (T 'help5'), (T 'help6'))
+  $HELP_TEXT = @((T 'help1'), (T 'help2'), (T 'help3'), (T 'help4'), (T 'help5'), (T 'help6'), (T 'help7'))
 
   function Say([string]$Msg) { Write-Host $Msg }
   function Die([int]$Code, [string]$Msg) {
@@ -617,6 +667,17 @@ except Exception:
       if ($c.Source -notlike '*\WindowsApps\*') { return $c.Source }
     }
     return $null
+  }
+  function Task-Python {
+    # python.exe of the registered task (its <Command> is pythonw.exe): -Update keeps the interpreter the service uses.
+    try {
+      $x = [xml][IO.File]::ReadAllText($TASK_COPY)
+      $c = [string]$x.Task.Actions.Exec.Command
+    } catch { return $null }
+    if (-not $c -or -not (Test-Path -LiteralPath $c -PathType Leaf)) { return $null }
+    $p = Join-Path (Split-Path -Parent $c) 'python.exe'
+    if (Test-Path -LiteralPath $p -PathType Leaf) { return $p }
+    return $c
   }
   function Find-Tailscale {
     $over = $env:SHELTIE_TAILSCALE
@@ -979,6 +1040,191 @@ if n != c:
     }
     return $Text
   }
+  # Task XML text: deploy\windows-task.xml.in next to this file, else the built-in copy (same text, tested).
+  # With a test task name (SHELTIE_TASK) the server runs through serve-test.py, which sets this installer's
+  # USERPROFILE/LOCALAPPDATA/SHELTIE_TASK/SHELTIE_ENV_KEY first (Task Scheduler has no per-task environment).
+  function Task-Xml([string]$Here) {
+    $tpl = $TASK_XML_BUILTIN.Replace('@XML_COMMENT@', (T 'xml_comment')).Replace('@XML_DESC@', (T 'xml_desc'))
+    if ($Here -and (Test-Path -LiteralPath (Join-Path $Here 'deploy\windows-task.xml.in') -PathType Leaf)) {
+      $tpl = [IO.File]::ReadAllText((Join-Path $Here 'deploy\windows-task.xml.in'), (New-Object System.Text.UTF8Encoding($false)))
+    }
+    $userName = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $xml = Fill-Template $tpl @{ PYTHONW = $PYW; SERVER = $SERVER; USER = $userName; WORKDIR = $DATA }
+    if ($env:SHELTIE_TASK) {
+      $launcher = Join-Path $DATA 'serve-test.py'
+      $envMap = @{ USERPROFILE = $env:USERPROFILE; LOCALAPPDATA = $env:LOCALAPPDATA; SHELTIE_TASK = $env:SHELTIE_TASK }
+      if ($env:SHELTIE_ENV_KEY) { $envMap.SHELTIE_ENV_KEY = $env:SHELTIE_ENV_KEY }
+      # Base64 so quotes/backslashes in paths cannot break the Python literal.
+      $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($envMap | ConvertTo-Json -Compress)))
+      $code = "import base64, json, os, runpy, sys`nos.environ.update(json.loads(base64.b64decode('$b64').decode('utf-8')))`nsys.argv = sys.argv[1:]`nrunpy.run_path(sys.argv[0], run_name='__main__')`n"
+      [IO.File]::WriteAllText($launcher, $code, (New-Object System.Text.UTF8Encoding($false)))
+      $xml = $xml.Replace('<Arguments>"', '<Arguments>"' + [Security.SecurityElement]::Escape($launcher) + '" "')
+    }
+    return $xml
+  }
+  function Update-Status([string]$Result, [string]$Ver, [string]$From, [string]$Reason, [bool]$Transient = $false) {
+    # The server reads this on its next start. Transient failures (no answer in time, port busy, write errors) are retried
+    # by the server and only the third one makes the version permanently failed; other failures are permanent at once.
+    $p = Join-Path $CONFIG_DIR $UPDATE_STATUS_NAME
+    try {
+      $o = [ordered]@{ result = $Result; version = $Ver; from = $From; reason = $Reason; transient = $Transient; time = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() }
+      [IO.File]::WriteAllText("$p.tmp", ($o | ConvertTo-Json -Compress), (New-Object System.Text.UTF8Encoding($false)))
+      Move-Item -LiteralPath "$p.tmp" -Destination $p -Force
+    } catch { [Console]::Error.WriteLine((T 'upd_status_fail' $p)) }
+  }
+  function Server-Version([string]$Path) {
+    # SERVER_VERSION line, same shape as SERVER_VERSION_LINE_RE in server/sheltie.py.
+    try { $t = [IO.File]::ReadAllText($Path) } catch { return '' }
+    $m = [regex]::Match($t, '(?m)^SERVER_VERSION = "([^"\r\n]*)"[ \t]*\r?$')
+    if ($m.Success) { return $m.Groups[1].Value }
+    return ''
+  }
+  function Version-Key([string]$V) {
+    $m = [regex]::Match($V, '^(0|[1-9][0-9]{0,4})\.(0|[1-9][0-9]{0,4})\.(0|[1-9][0-9]{0,4})$')
+    if (-not $m.Success) { return $null }
+    return ([long]$m.Groups[1].Value * 10000000000) + ([long]$m.Groups[2].Value * 100000) + [long]$m.Groups[3].Value
+  }
+  function Wait-Version([string]$Want, [double]$Since, [int]$Seconds, [string]$Token, [string]$Port) {
+    # True when a server started after $Since answers /api/health with $Want (any version if $Want is empty).
+    $deadline = (Get-Date).AddSeconds($Seconds)
+    while ($true) {
+      try {
+        $r = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:$Port/api/health" -Headers @{ Authorization = "Bearer $Token" } -TimeoutSec 3
+        if ($r.StatusCode -eq 200) {
+          $body = $r.Content
+          if ($body -is [byte[]]) { $body = [Text.Encoding]::UTF8.GetString($body) }
+          $d = $body | ConvertFrom-Json
+          if (((-not $Want) -or ([string]$d.server_version -eq $Want)) -and ([double]$d.started -ge $Since)) { return $true }
+        }
+      } catch {}
+      if ((Get-Date) -ge $deadline) { return $false }
+      Start-Sleep -Seconds 1
+    }
+  }
+  function Update-Fail([string]$Why, [switch]$Permanent) {
+    # Before the server file changed. -Permanent: the release itself is wrong (syntax, version line).
+    [Console]::Error.WriteLine((T 'upd_abort' $Why))
+    if (Test-Path -LiteralPath $CONFIG_DIR -PathType Container) { Update-Status 'failed' $script:NEWV $script:OLDV $Why (-not $Permanent) }
+    $global:HRCode = 1
+    throw 'HRExit'
+  }
+  # Server auto-update (-Update): started detached by the server with the downloaded server file in SHELTIE_SRC.
+  # Config, token and devices are only read. No tailscale, hc install or pairing. Rolls back if the new version is silent.
+  function Update-Main {
+    $now = { [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0 }
+    $script:NEWV = ''
+    $script:OLDV = ''
+    if (-not (Test-Path -LiteralPath $CONFIG -PathType Leaf)) { Update-Fail (T 'upd_nocfg' $CONFIG) }
+    if (-not (Test-Path -LiteralPath $SERVER -PathType Leaf)) { Update-Fail (T 'upd_noserver' $SERVER) }
+    $src = $env:SHELTIE_SRC
+    if (-not $src -or -not (Test-Path -LiteralPath $src -PathType Leaf)) { Update-Fail (T 'upd_nosrc' $src) }
+    & $PY -c "import sys; compile(open(sys.argv[1], encoding='utf-8-sig').read(), sys.argv[1], 'exec')" $src 2>$null | Out-Null
+    if ($LASTEXITCODE -ne 0) { Update-Fail (T 'upd_badpy' $src) -Permanent }
+    $script:NEWV = Server-Version $src
+    if (-not $script:NEWV) { Update-Fail (T 'upd_nover' $src) -Permanent }
+    $script:OLDV = Server-Version $SERVER
+    $nk = Version-Key $script:NEWV
+    $ok = ($null -ne $nk)
+    if ($ok -and $script:OLDV) { $okey = Version-Key $script:OLDV; $ok = ($null -ne $okey) -and ($nk -gt $okey) }
+    if (-not $ok) { Update-Fail (T 'upd_down' $script:OLDV $script:NEWV) -Permanent }
+    $cfg = Read-Config
+    $token = ''
+    if ($cfg) { $token = [string]$cfg.token }
+    if (-not $token) { Update-Fail (T 'upd_token' $CONFIG) }
+    $port = [string](Config-Port)
+    $wait = 120
+    if ($env:SHELTIE_UPDATE_WAIT -match '^[0-9]+$') { $wait = [int]$env:SHELTIE_UPDATE_WAIT }
+    $oldv = $script:OLDV
+    if (-not $oldv) { $oldv = '?' }
+    Say (T 'upd_start' $oldv $script:NEWV)
+    if ($DRY) { Say (T 'upd_dry' $SERVER $src $wait $script:NEWV); return }
+    $prev = "$SERVER.prev"
+    try { Copy-Item -LiteralPath $SERVER -Destination $prev -Force -ErrorAction Stop } catch { Update-Fail (T 'upd_keep' $prev) }
+    $t0 = & $now
+    # The server holds the port: stop it (this process is detached from it) and wait until the port is free.
+    # From here on the task is always started again (finally), whatever fails.
+    Stop-Old @([int]$port) -NoDie
+    $script:updRan = $false
+    try {
+      # The task's 1-minute repetition can start a server right after the stop: stop again (it fires once a minute).
+      for ($i = 0; $i -lt 2 -and (Port-Open ([int]$port)); $i++) { Stop-Old @([int]$port) -NoDie }
+      if (Port-Open ([int]$port)) { Update-Fail (T 'upd_portbusy' $port) }
+      $tmp = Join-Path $DATA ('sheltie.' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.tmp')
+      $placed = $false
+      try {
+        Copy-Item -LiteralPath $src -Destination $tmp -Force -ErrorAction Stop
+        Move-Item -LiteralPath $tmp -Destination $SERVER -Force -ErrorAction Stop
+        $placed = $true
+      } catch {} finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+      if (-not $placed) { Update-Fail (T 'upd_place' $SERVER) }
+      # The server file changed: any error from here on rolls back instead of leaving the task stopped.
+      $reload = $false
+      $good = $false
+      try {
+        # Start the new server first (the task's 1-minute repetition must not bring the old one back meanwhile),
+        # then hooks and the command file.
+        # Task: re-register only when its XML changed (the previous copy is kept for rollback).
+        $xml = Task-Xml ''
+        $cur = ''
+        if (Test-Path -LiteralPath $TASK_COPY -PathType Leaf) { try { $cur = [IO.File]::ReadAllText($TASK_COPY) } catch {} }
+        # Compare without line-ending/trailing-space differences (repo template vs built-in copy).
+        $reload = (($xml -replace "`r`n", "`n").Trim() -ne ($cur -replace "`r`n", "`n").Trim())
+        if ($reload) {
+          if ($cur) { Copy-Item -LiteralPath $TASK_COPY -Destination "$TASK_COPY.prev" -Force -ErrorAction SilentlyContinue }
+          try { [IO.File]::WriteAllText($TASK_COPY, $xml, [Text.Encoding]::Unicode) } catch {}
+          $rc = Run 'schtasks' @('/Create', '/TN', $TASK, '/XML', $TASK_COPY, '/F') -Quiet
+          if ($rc -ne 0) {
+            # A task created from an elevated PowerShell cannot be changed from here (access denied, 7950). Keep the old
+            # copy so the next update tries again, and go on with the old task definition.
+            [Console]::Error.WriteLine((T 'upd_task_fail' $TASK))
+            if ($cur) { try { [IO.File]::WriteAllText($TASK_COPY, $cur, [Text.Encoding]::Unicode) } catch {} }
+            Remove-Item -LiteralPath "$TASK_COPY.prev" -Force -ErrorAction SilentlyContinue
+            $reload = $false
+          }
+        }
+        $script:updRan = $true
+        $rc = Run 'schtasks' @('/Run', '/TN', $TASK) -Quiet
+        if ($rc -ne 0) { [Console]::Error.WriteLine((T 'upd_run_fail' $TASK)) }
+        if ($NOHOOKS -or ($cfg.PSObject.Properties.Name -contains 'hooks' -and $cfg.hooks -eq $false)) { Say (T 'upd_nohooks') } else { Apply-Hooks 'install' $PY }
+        Install-Command
+        $good = Wait-Version $script:NEWV $t0 $wait $token $port
+      } catch {
+        [Console]::Error.WriteLine((T 'upd_err' $_.Exception.Message))
+        $good = $false
+      }
+      if ($good) {
+        Update-Status 'ok' $script:NEWV $script:OLDV ''
+        Remove-Item -LiteralPath "$TASK_COPY.prev" -Force -ErrorAction SilentlyContinue
+        Say (T 'upd_ok' $script:NEWV)
+        return
+      }
+      # Roll back to the previous server (and task XML). Write the result first so the restarted old server reads it.
+      [Console]::Error.WriteLine((T 'upd_rb' $script:NEWV $wait $oldv))
+      Stop-Old @([int]$port) -NoDie
+      $script:updRan = $false
+      $rt = Join-Path $DATA ('sheltie.' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.tmp')
+      $back = $false
+      try {
+        Copy-Item -LiteralPath $prev -Destination $rt -Force -ErrorAction Stop
+        Move-Item -LiteralPath $rt -Destination $SERVER -Force -ErrorAction Stop
+        $back = $true
+      } catch {} finally { Remove-Item -LiteralPath $rt -Force -ErrorAction SilentlyContinue }
+      if (-not $back) { [Console]::Error.WriteLine((T 'upd_rb_copy' $prev $SERVER)) }
+      if ($reload -and (Test-Path -LiteralPath "$TASK_COPY.prev" -PathType Leaf)) {
+        Move-Item -LiteralPath "$TASK_COPY.prev" -Destination $TASK_COPY -Force -ErrorAction SilentlyContinue
+        $rc = Run 'schtasks' @('/Create', '/TN', $TASK, '/XML', $TASK_COPY, '/F') -Quiet
+      }
+      Update-Status 'rolled_back' $script:NEWV $script:OLDV (T 'upd_rb_reason' $wait $script:NEWV) $true
+      $t1 = & $now
+      $script:updRan = $true
+      $rc = Run 'schtasks' @('/Run', '/TN', $TASK) -Quiet
+      if (Wait-Version $script:OLDV $t1 $wait $token $port) { Say (T 'upd_rb_ok' $oldv) }
+      else { [Console]::Error.WriteLine((T 'upd_rb_fail' $LOGFILE)) }
+      $global:HRCode = 3
+    } finally {
+      if (-not $script:updRan) { $rc = Run 'schtasks' @('/Run', '/TN', $TASK) -Quiet }
+    }
+  }
 
   try {
     foreach ($a in $args) {
@@ -987,6 +1233,8 @@ if n != c:
         '^--?uninstall$' { $MODE = 'uninstall' }
         '^--?no-?hooks$' { $NOHOOKS = $true }
         '^--?no-?hc$' { $NOHC = $true }
+        '^--?no-?auto-?update$' { $NOAUTO = $true }
+        '^--?update$' { $MODE = 'update' }
         '^(--?help|-h|-\?)$' { foreach ($l in $HELP_TEXT) { Say $l }; return }
         default { Die 2 (T 'unknown_opt' $a) }
       }
@@ -994,6 +1242,7 @@ if n != c:
     if ($env:SHELTIE_UNINSTALL -eq '1') { $MODE = 'uninstall' }
     if ($env:SHELTIE_DRY_RUN -eq '1') { $DRY = $true }
     if ($env:SHELTIE_NO_HOOKS -eq '1') { $NOHOOKS = $true }
+    if ($TASK -notmatch '^[A-Za-z0-9 ._-]+$') { Die 2 (T 'task_bad' $TASK) }
 
     $PORT = $env:SHELTIE_PORT
     if ($PORT) {
@@ -1039,12 +1288,15 @@ if n != c:
     $T0 = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0
     if ([Environment]::OSVersion.Platform -ne 'Win32NT') { Die 1 (T 'win_only') }
 
-    $PY = Find-Python
+    $PY = $null
+    if ($MODE -eq 'update') { $PY = Task-Python }
+    if (-not $PY) { $PY = Find-Python }
     if (-not $PY) { Die 1 (T 'no_python') }
     & $PY -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' 2>$null | Out-Null
     if ($LASTEXITCODE -ne 0) { Die 1 (T 'old_python' $PY) }
     $PYW = Join-Path (Split-Path -Parent $PY) 'pythonw.exe'
     if (-not (Test-Path -LiteralPath $PYW -PathType Leaf)) { $PYW = $PY }
+    if ($MODE -eq 'update') { Update-Main; return }
 
     $HC = Find-Hc
     $HC_TRY = (-not $HC) -and (-not $env:SHELTIE_HC)
@@ -1098,6 +1350,18 @@ if n != c:
         if (-not (Test-Path -LiteralPath $tmp) -or (Get-Item -LiteralPath $tmp).Length -eq 0) { Die 1 (T 'src_empty' $SRC) }
         & $PY -c "import sys; compile(open(sys.argv[1], encoding='utf-8-sig').read(), sys.argv[1], 'exec')" $tmp 2>$null | Out-Null
         if ($LASTEXITCODE -ne 0) { Die 1 (T 'src_badpy' $SRC) }
+        if ($SRC -eq $DEFAULT_SRC) {
+          # Must match the release manifest (the installed server checks the manifest signature on updates).
+          $man = $DEFAULT_SRC.Substring(0, $DEFAULT_SRC.LastIndexOf('/')) + '/manifest.json'
+          $want = ''
+          try {
+            $mr = Invoke-WebRequest -UseBasicParsing -Uri $man
+            $mt = $mr.Content
+            if ($mt -is [byte[]]) { $mt = [Text.Encoding]::UTF8.GetString($mt) }
+            $want = [string](($mt | ConvertFrom-Json).files.'sheltie.py')
+          } catch { Die 1 (T 'src_manifest_fail' $man) }
+          if ((Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash.ToLower() -ne $want.ToLower()) { Die 1 (T 'src_hash' $SRC) }
+        }
         # A running server may hold the file and the port: stop it and wait for it to exit before replacing.
         # Old port only if a config exists (fresh install: nothing of ours is running).
         # A previous install still holding the port is stopped right after this (Old-StopMove).
@@ -1121,6 +1385,10 @@ if n != c:
       try {
         $c | Add-Member -NotePropertyName hc_path -NotePropertyValue $HC -Force
         if ($PORT) { $c | Add-Member -NotePropertyName port -NotePropertyValue ([int]$PORT) -Force }
+        # -NoHooks is remembered so auto-update leaves hooks alone too; -NoAutoUpdate is kept on later reinstalls.
+        if ($NOHOOKS) { $c | Add-Member -NotePropertyName hooks -NotePropertyValue $false -Force }
+        else { $c.PSObject.Properties.Remove('hooks') }
+        if ($NOAUTO) { $c | Add-Member -NotePropertyName auto_update -NotePropertyValue $false -Force }
         $utf8 = New-Object System.Text.UTF8Encoding($false)
         [IO.File]::WriteAllText("$CONFIG.tmp", ($c | ConvertTo-Json -Depth 10), $utf8)
         Move-Item -LiteralPath "$CONFIG.tmp" -Destination $CONFIG -Force
@@ -1136,15 +1404,10 @@ if n != c:
     Install-Command
 
     # ---- 3. Task Scheduler
-    $tpl = $TASK_XML_BUILTIN.Replace('@XML_COMMENT@', (T 'xml_comment')).Replace('@XML_DESC@', (T 'xml_desc'))
-    if ($HERE -and (Test-Path -LiteralPath (Join-Path $HERE 'deploy\windows-task.xml.in') -PathType Leaf)) {
-      $tpl = [IO.File]::ReadAllText((Join-Path $HERE 'deploy\windows-task.xml.in'), (New-Object System.Text.UTF8Encoding($false)))
-    }
     if ($DRY) {
       Say (T 'dry_xml' $TASK_COPY $PYW $SERVER $LOGFILE)
     } else {
-      $userName = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-      $xml = Fill-Template $tpl @{ PYTHONW = $PYW; SERVER = $SERVER; USER = $userName; WORKDIR = $DATA }
+      $xml = Task-Xml $HERE
       try { [IO.File]::WriteAllText($TASK_COPY, $xml, [Text.Encoding]::Unicode) } catch { Die 1 (T 'xml_fail') }
     }
     $rc = Run 'schtasks' @('/Create', '/TN', $TASK, '/XML', $TASK_COPY, '/F') -Quiet

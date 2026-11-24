@@ -840,7 +840,7 @@ class RelayHttpTests(unittest.TestCase):
     def test_health_includes_relay_url(self):
         self.start("https://relay.example.com")
         self.assertEqual(self.req("GET", "/api/health"),
-                         (200, {"ok": True, "name": hr.machine_name(), "started": round(hr.PROCESS_STARTED, 3), "push_relay_url": "https://relay.example.com", "relay_resign": [],
+                         (200, {"ok": True, "name": hr.machine_name(), "started": round(hr.PROCESS_STARTED, 3), "server_version": hr.SERVER_VERSION, "push_relay_url": "https://relay.example.com", "relay_resign": [],
                                 "push": {"last_success_at": None, "relay_limited_at": None, "failing": False}}))
         self.app.devices.add("ab" * 32, "sandbox", relay_sig=SIG)
         self.app.devices.add("cd" * 32, "sandbox", relay_sig=SIG)
@@ -850,7 +850,7 @@ class RelayHttpTests(unittest.TestCase):
 
     def test_health_without_relay_url(self):
         self.start("")
-        self.assertEqual(self.req("GET", "/api/health"), (200, {"ok": True, "name": hr.machine_name(), "started": round(hr.PROCESS_STARTED, 3),
+        self.assertEqual(self.req("GET", "/api/health"), (200, {"ok": True, "name": hr.machine_name(), "started": round(hr.PROCESS_STARTED, 3), "server_version": hr.SERVER_VERSION,
                                                                "push": {"last_success_at": None, "relay_limited_at": None, "failing": False}}))
 
     def test_add_device_relay_sig(self):
@@ -911,7 +911,7 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(self.req("GET", "/api/health", token="wrong")[0], 401)
         self.assertEqual(self.req("POST", "/api/terminals/t12/keys", {"keys": ["1"]}, token="x")[0], 401)
         self.assertEqual(self.hc.keys_calls, [])
-        self.assertEqual(self.req("GET", "/api/health"), (200, {"ok": True, "name": hr.machine_name(), "started": round(hr.PROCESS_STARTED, 3),
+        self.assertEqual(self.req("GET", "/api/health"), (200, {"ok": True, "name": hr.machine_name(), "started": round(hr.PROCESS_STARTED, 3), "server_version": hr.SERVER_VERSION,
                                                                "push": {"last_success_at": None, "relay_limited_at": None, "failing": False}}))
 
     def test_terminals_and_screen(self):

@@ -42,7 +42,8 @@ elif cmd == "serve":
             self.send_response(200 if ok else 401)
             self.end_headers()
             started = 0 if os.environ.get("STUB_OLD_STARTED") else STARTED
-            self.wfile.write(json.dumps({"ok": True, "started": started}).encode())
+            self.wfile.write(json.dumps({"ok": True, "started": started,
+                                         "server_version": globals().get("SERVER_VERSION")}).encode())
         def log_message(self, *a):
             pass
     HTTPServer(("127.0.0.1", int(cfg["port"])), H).serve_forever()
@@ -919,6 +920,234 @@ for _n in [n for n in dir(InstallPs1Test) if n.startswith("test_")]:
     setattr(InstallPs1MigrateTest, _n, None)  # 상속된 기존 테스트는 InstallPs1Test에서 이미 돈다
 
 
+def versioned_stub(version, broken=False):
+    """버전 줄이 있는 서버 대역. broken이면 serve가 바로 죽는다(시작하자마자 죽는 새 버전)."""
+    head = 'SERVER_VERSION = "%s"\n' % version
+    if broken:
+        head += 'import sys\nif (sys.argv[1:] or ["serve"])[0] == "serve":\n    sys.exit(1)\n'
+    return head + STUB_SERVER
+
+
+@unittest.skipUnless(PS and os.name == "nt", "Windows PowerShell이 없다(Windows에서만 돈다)")
+class InstallPs1UpdateTest(InstallPs1Test):
+    """-Update(서버 자동 업데이트가 부르는 모드)와 -NoAutoUpdate. 부모 테스트는 비운다."""
+
+    def setUp(self):
+        super().setUp()
+        self.old_src = self.write_src("old.py", versioned_stub("1.0.0"))
+        self.new_src = self.write_src("new.py", versioned_stub("1.0.1"))
+        self.cfg_dir = os.path.join(self.profile, ".config", "sheltie")
+        self.status_path = os.path.join(self.cfg_dir, "update_status.json")
+
+    def write_src(self, name, text):
+        p = os.path.join(self.tmp, name)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(text)
+        return p
+
+    def install_old(self, *args, **extra):
+        r = self.run_install(*args, SHELTIE_SRC=self.old_src, SHELTIE_SKIP_TAILSCALE="1", **extra)
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        with open(os.path.join(self.cfg_dir, "devices.json"), "w") as f:
+            json.dump([{"token": "ab" * 32, "env": "production"}], f)
+        open(self.log, "w").close()
+
+    def update(self, src=None, **extra):
+        extra.setdefault("SHELTIE_UPDATE_WAIT", "8")
+        return self.run_install("-Update", SHELTIE_SRC=src or self.new_src, **extra)
+
+    def cfg_files(self):
+        return {n: read(os.path.join(self.cfg_dir, n)) for n in ("config.json", "devices.json")}
+
+    def health(self):
+        tok = read_json(self.cfg_path())["token"]
+        import urllib.request
+        req = urllib.request.Request("http://127.0.0.1:%s/api/health" % self.port,
+                                     headers={"Authorization": "Bearer " + tok})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return json.loads(r.read())
+
+    def test_update_replaces_server_and_keeps_config_tokens_devices(self):
+        self.install_old()
+        before = self.cfg_files()
+        xml = self.task_xml()[1]
+        r = self.update()
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertEqual(read(self.server_path()), read(self.new_src))
+        self.assertEqual(read(self.server_path() + ".prev"), read(self.old_src))
+        self.assertEqual(self.cfg_files(), before)
+        st = read_json(self.status_path)
+        self.assertEqual((st["result"], st["version"], st["from"]), ("ok", "1.0.1", "1.0.0"))
+        c = self.calls()
+        self.assertFalse(any(x.startswith("tailscale") for x in c), c)
+        self.assertFalse(any(x.startswith("schtasks /Create") for x in c), c)  # XML가 같으면 다시 등록하지 않는다
+        self.assertLess(self.idx("schtasks /End"), self.idx("schtasks /Run"))
+        self.assertEqual(self.task_xml()[1], xml)
+        self.assertNotIn("PAIR-OK", r.stdout)
+        self.assertEqual(self.health()["server_version"], "1.0.1")
+
+    def test_update_rolls_back_when_new_server_dies(self):
+        self.install_old()
+        before = self.cfg_files()
+        broken = self.write_src("broken.py", versioned_stub("1.0.1", broken=True))
+        r = self.update(broken, SHELTIE_UPDATE_WAIT="4")
+        self.assertEqual(r.returncode, 3, r.stderr + r.stdout)
+        self.assertEqual(read(self.server_path()), read(self.old_src))
+        self.assertEqual(self.cfg_files(), before)
+        st = read_json(self.status_path)
+        self.assertEqual((st["result"], st["version"], st["from"]), ("rolled_back", "1.0.1", "1.0.0"))
+        self.assertEqual(self.health()["server_version"], "1.0.0")
+
+    def test_update_refuses_same_or_lower_version(self):
+        self.install_old()
+        for v in ("1.0.0", "0.9.9"):
+            r = self.update(self.write_src("v.py", versioned_stub(v)))
+            self.assertEqual(r.returncode, 1, r.stderr + r.stdout)
+            self.assertEqual(read(self.server_path()), read(self.old_src))
+            self.assertEqual(read_json(self.status_path)["result"], "failed")
+        self.assertFalse(any(x.startswith("schtasks") for x in self.calls()))
+
+    def test_update_bad_source_changes_nothing(self):
+        self.install_old()
+        bad = self.write_src("bad.py", 'SERVER_VERSION = "1.0.1"\ndef (:\n')
+        r = self.update(bad)
+        self.assertEqual(r.returncode, 1, r.stderr + r.stdout)
+        self.assertEqual(read(self.server_path()), read(self.old_src))
+        self.assertFalse(os.path.exists(self.server_path() + ".prev"))
+        self.assertFalse(any(x.startswith("schtasks") for x in self.calls()))
+
+    def test_update_without_install_fails(self):
+        r = self.update()
+        self.assertEqual(r.returncode, 1, r.stderr + r.stdout)
+        self.assertFalse(os.path.exists(self.server_path()))
+
+    def test_update_respects_no_hooks_install(self):
+        self.install_old("-NoHooks")
+        self.assertIs(read_json(self.cfg_path())["hooks"], False)
+        claude = os.path.join(self.profile, ".claude")
+        os.makedirs(claude)
+        r = self.update()
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertFalse(os.path.exists(os.path.join(claude, "settings.json")))
+
+    def test_update_reregisters_hooks(self):
+        self.install_old()
+        claude = os.path.join(self.profile, ".claude")
+        os.makedirs(claude)
+        r = self.update()
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertIn("hook claude", read(os.path.join(claude, "settings.json")))
+
+    def test_no_auto_update_kept_on_reinstall(self):
+        self.install_old("-NoAutoUpdate")
+        self.assertIs(read_json(self.cfg_path())["auto_update"], False)
+        r = self.run_install(SHELTIE_SRC=self.old_src, SHELTIE_SKIP_TAILSCALE="1")
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertIs(read_json(self.cfg_path())["auto_update"], False)
+
+    def test_test_task_name_and_launcher(self):
+        r = self.run_install(SHELTIE_SRC=self.old_src, SHELTIE_SKIP_TAILSCALE="1", SHELTIE_TASK="SheltieTest x")
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertTrue(any(x.startswith("schtasks /Create /TN SheltieTest x") for x in self.calls()), self.calls())
+        xml = self.task_xml()[1]
+        launcher = os.path.join(self.local, "sheltie", "serve-test.py")
+        self.assertIn('<Arguments>"%s" "%s" serve</Arguments>' % (launcher, self.server_path()), xml)
+        m = re.search(r"b64decode\('([A-Za-z0-9+/=]+)'\)", read(launcher))  # 환경은 base64 JSON으로 넣는다
+        self.assertEqual(json.loads(base64.b64decode(m.group(1)))["USERPROFILE"], self.profile)
+        # 런처가 실제로 환경을 넣고 서버 파일을 돈다(USERPROFILE을 서버가 그대로 본다)
+        probe = os.path.join(self.tmp, "probe.py")
+        with open(probe, "w") as f:
+            f.write("import os, sys\nprint(os.environ['USERPROFILE'] + '|' + os.environ['SHELTIE_TASK'] + '|' + ' '.join(sys.argv))\n")
+        out = subprocess.run([sys.executable, launcher, probe, "serve"], capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.stdout.strip(), "%s|SheltieTest x|%s serve" % (self.profile, probe), out.stderr)
+        self.assertEqual(self.run_install(SHELTIE_TASK="bad;name").returncode, 2)
+
+
+    def test_update_uses_task_python(self):
+        # 서비스(작업)가 쓰는 파이썬을 그대로 쓴다: 새로 찾을 파이썬이 없어도 업데이트된다
+        self.install_old()
+        r = self.update(SHELTIE_PYTHON=os.path.join(self.tmp, "gone", "python.exe"))
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertEqual(read_json(self.status_path)["result"], "ok")
+
+    def test_error_after_stop_rolls_back_and_restarts_task(self):
+        # 서버를 멈춘 뒤 예외(작업 런처 파일을 못 씀): 작업이 멈춘 채 끝나지 않고 이전 서버로 다시 뜬다
+        self.install_old(SHELTIE_TASK="SheltieTest")
+        launcher = os.path.join(self.local, "sheltie", "serve-test.py")
+        os.chmod(launcher, 0o444)
+        self.addCleanup(os.chmod, launcher, 0o666)
+        r = self.update(SHELTIE_TASK="SheltieTest", SHELTIE_UPDATE_WAIT="4")
+        self.assertEqual(r.returncode, 3, r.stderr + r.stdout)
+        self.assertEqual(read(self.server_path()), read(self.old_src))
+        st = read_json(self.status_path)
+        self.assertEqual((st["result"], st["transient"]), ("rolled_back", True))
+        self.assertEqual(self.health()["server_version"], "1.0.0")
+
+    def test_status_transient_flags(self):
+        self.install_old()
+        r = self.update(self.write_src("same.py", versioned_stub("1.0.0")))
+        self.assertEqual(r.returncode, 1)
+        self.assertIs(read_json(self.status_path)["transient"], False)
+        broken = self.write_src("broken.py", versioned_stub("1.0.1", broken=True))
+        r = self.update(broken, SHELTIE_UPDATE_WAIT="4")
+        self.assertEqual(r.returncode, 3, r.stderr + r.stdout)
+        self.assertIs(read_json(self.status_path)["transient"], True)
+
+    def test_default_wait_is_120_seconds(self):
+        self.install_old()
+        r = self.run_install("-Update", "-DryRun", SHELTIE_SRC=self.new_src)
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertIn("120", r.stdout)
+
+    def test_update_adds_repeating_trigger_to_old_task(self):
+        # 이 기능 전 작업 정의(반복 트리거 없음)는 -Update가 다시 등록해 1분 반복 트리거를 얻는다
+        self.install_old()
+        copy = os.path.join(self.local, "sheltie", "windows-task.xml")
+        with open(copy, "rb") as f:
+            xml = f.read().decode("utf-16")
+        old = re.sub(r"\s*<TimeTrigger>.*?</TimeTrigger>", "", xml, flags=re.S)
+        self.assertNotIn("TimeTrigger", old)
+        with open(copy, "wb") as f:
+            f.write(old.encode("utf-16"))
+        r = self.update()
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertTrue(any(x.startswith("schtasks /Create") for x in self.calls()), self.calls())
+        self.assertIn("<Interval>PT1M</Interval>", self.task_xml()[1])
+        self.assertLess(self.idx("schtasks /Run"), len(self.calls()))
+
+    def test_task_redefine_failure_keeps_old_copy_and_update_goes_on(self):
+        # 관리자 PowerShell로 만든 작업은 서버(제한 토큰)에서 다시 등록하지 못한다(7950: 액세스 거부). 업데이트는 계속하고
+        # 작업 사본은 옛것으로 남겨 다음 업데이트가 다시 시도한다.
+        self.install_old()
+        copy = os.path.join(self.local, "sheltie", "windows-task.xml")
+        with open(copy, "rb") as f:
+            old = re.sub(r"\s*<TimeTrigger>.*?</TimeTrigger>", "", f.read().decode("utf-16"), flags=re.S)
+        with open(copy, "wb") as f:
+            f.write(old.encode("utf-16"))
+        r = self.update(SCHTASKS_CREATE_RC="1")
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertIn(messages()["upd_task_fail"].split("(")[0], r.stderr)
+        with open(copy, "rb") as f:
+            self.assertNotIn("TimeTrigger", f.read().decode("utf-16"))
+        self.assertFalse(os.path.exists(copy + ".prev"))
+        self.assertEqual(read_json(self.status_path)["result"], "ok")
+
+    def test_launcher_survives_apostrophe_in_profile(self):
+        self.profile = os.path.join(self.tmp, "pro'file")
+        os.makedirs(self.profile)
+        r = self.run_install(SHELTIE_SRC=self.old_src, SHELTIE_SKIP_TAILSCALE="1", SHELTIE_TASK="SheltieTest")
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        launcher = os.path.join(self.local, "sheltie", "serve-test.py")
+        probe = os.path.join(self.tmp, "probe.py")
+        with open(probe, "w") as f:
+            f.write("import os\nprint(os.environ['USERPROFILE'])\n")
+        out = subprocess.run([sys.executable, launcher, probe, "serve"], capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.stdout.strip(), self.profile, out.stderr)
+
+for _n in [n for n in dir(InstallPs1Test) if n.startswith("test_")]:
+    setattr(InstallPs1UpdateTest, _n, None)  # 상속된 기존 테스트는 InstallPs1Test에서 이미 돈다
+
+
 class InstallPs1StaticTest(unittest.TestCase):
     """PowerShell이 없는 맥에서도 도는 파일 검사."""
 
@@ -981,6 +1210,33 @@ class InstallPs1StaticTest(unittest.TestCase):
 
     def test_dry_run_env_supported(self):
         self.assertIn("SHELTIE_DRY_RUN", read(INSTALL))
+
+    def test_update_options_documented(self):
+        t = read(INSTALL)
+        for want in ("-NoAutoUpdate", "-Update", "SHELTIE_UPDATE_WAIT", "SHELTIE_TASK", "update_status.json"):
+            self.assertIn(want, t, want)
+        self.assertIn("-NoAutoUpdate", messages()["help7"])
+
+    def test_task_repeats_every_minute_without_duplicates(self):
+        # RestartOnFailure는 0이 아닌 종료로 끝난 서버를 다시 띄우지 않는다(7950 실측). 1분 반복 + IgnoreNew가 다시 띄운다.
+        t = read(TEMPLATE)
+        m = re.search(r"<TimeTrigger>(.*?)</TimeTrigger>", t, re.S)
+        self.assertIsNotNone(m)
+        self.assertIn("<Interval>PT1M</Interval>", m.group(1))
+        self.assertNotIn("<Duration>", m.group(1))  # 기한 없음
+        self.assertIn("<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>", t)
+        self.assertIn("<LogonType>InteractiveToken</LogonType>", t)  # 로그온해 있을 때만
+
+    def test_default_source_is_release_in_both_installers(self):
+        want = "https://github.com/hyperfocuslab/sheltie/releases/latest/download/sheltie.py"
+        self.assertIn("$DEFAULT_SRC = '%s'" % want, read(INSTALL))
+        self.assertIn('DEFAULT_SRC="%s"' % want, read(os.path.join(ROOT, "install.sh")))
+        self.assertIn("src_hash", messages())
+
+    def test_launcher_env_not_embedded_as_raw_string(self):
+        t = read(INSTALL)
+        self.assertNotIn(""".Replace("'", "'")""", t)
+        self.assertIn("base64.b64decode", t)
 
     def test_no_ps7_only_syntax(self):
         t = read(INSTALL)

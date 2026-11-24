@@ -51,18 +51,22 @@ import logging.handlers
 import mimetypes
 import ntpath
 import os
+import random
 import re
 import secrets
 import select
 import shutil
 import socket
+import ssl
 import stat
 import subprocess
 import sys
 import threading
 import time
 import unicodedata
+import urllib.error
 import urllib.parse
+import urllib.request
 import uuid
 
 # 플랫폼 분기는 이 상수 하나로만 한다(테스트는 monkeypatch로 Windows 경로를 맥에서 돌린다).
@@ -126,6 +130,8 @@ HC_STYLED_WAIT = 0.4  # hc attach --observe 첫 그림을 받는 시간(초). �
 MAX_BODY = 64 * 1024
 # 이 프로세스가 뜬 시각(/api/health의 started). 설치기가 재설치 뒤 응답한 서버가 새 서버인지 대조한다.
 PROCESS_STARTED = time.time()
+# 서버 버전(/api/health의 server_version). 릴리스(ops/release-server.sh)마다 올린다. 자동 업데이트는 이보다 높은 버전만 받는다.
+SERVER_VERSION = "1.0.0"
 POLL_INTERVAL = 15
 BIND_RETRY = 10
 EVENTS_MAX_BACKOFF = 30
@@ -8009,6 +8015,13 @@ class App:
             except Exception:  # noqa: BLE001
                 log.exception("화면 판정 오류")
 
+    def update_busy(self):
+        """자동 업데이트를 미룰까: 승인·질문을 기다리는 터미널이나 붙잡힌 훅 요청이 있다."""
+        if self.tracker.blocked_items():
+            return True
+        with self.hooks.lock:
+            return any(h.state == "waiting" for s in self.hooks.sessions.values() for h in s["holds"])
+
     def poll_loop(self):
         while not self.stop.wait(POLL_INTERVAL):
             try:
@@ -9546,7 +9559,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 body = self._body() if method in ("POST", "DELETE") else {}
                 tid = urllib.parse.unquote(mt.group(1)) if mt.groups() else None
                 if name == "health":
-                    res = {"ok": True, "name": machine_name(), "started": round(PROCESS_STARTED, 3)}
+                    res = {"ok": True, "name": machine_name(), "started": round(PROCESS_STARTED, 3),
+                           "server_version": SERVER_VERSION}
                     res.update(getattr(app, "hc_version", None) or {})
                     if app.cfg.get("push_relay_url"):
                         res["push_relay_url"] = app.cfg["push_relay_url"]
@@ -9641,8 +9655,26 @@ def make_server(app, bind, port):
     return srv
 
 
-def make_server_retry(app, bind, port, sleep=time.sleep, attempts=None):
-    """부팅 직후 Tailscale IP가 아직 없으면 bind가 실패하므로 10초마다 다시 시도한다."""
+class PortTaken(Exception):
+    """같은 설정(토큰)의 Sheltie 서버가 이미 그 포트에서 답한다."""
+
+
+def sheltie_running(cfg, timeout=3):
+    """같은 설정의 Sheltie 서버가 cfg의 주소·포트에서 /api/health에 답하면 True."""
+    host = cfg["bind"] if cfg["bind"] not in ("", "0.0.0.0", "::") else "127.0.0.1"
+    url = "http://%s:%d/api/health" % ("[%s]" % host if ":" in host else host, cfg["port"])
+    req = urllib.request.Request(url, headers={"Authorization": "Bearer " + cfg["token"]})
+    try:
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=timeout) as r:
+            return r.status == 200 and json.loads(r.read(4096) or b"{}").get("ok") is True
+    except (OSError, ValueError, http.client.HTTPException):
+        return False
+
+
+def make_server_retry(app, bind, port, sleep=time.sleep, attempts=None, taken=None):
+    """부팅 직후 Tailscale IP가 아직 없으면 bind가 실패하므로 10초마다 다시 시도한다.
+    taken()이 True면(같은 설정의 서버가 이미 그 포트에서 답한다) 기다리지 않고 PortTaken: Windows 작업의 1분 반복 트리거나
+    끝나지 않은 이전 실행이 띄운 두 번째 서버가 포트를 기다리다 옛 코드로 포트를 잡지 않게."""
     check_bind(bind)
     n = 0
     while True:
@@ -9650,10 +9682,699 @@ def make_server_retry(app, bind, port, sleep=time.sleep, attempts=None):
             return make_server(app, bind, port)
         except OSError as e:
             n += 1
+            if taken is not None and taken():
+                raise PortTaken("%s:%d" % (bind, port))
             if attempts is not None and n >= attempts:
                 raise
             log.warning("bind %s:%d 실패(%s), %d초 뒤 재시도", bind, port, e.strerror or e, BIND_RETRY)
             sleep(BIND_RETRY)
+
+
+# ---------------------------------------------------------------- 자동 업데이트
+# 매니페스트(JSON {"version": "X.Y.Z", "files": {파일 이름: sha256}})를 보고 지금보다 높은 버전이면 파일을 받아
+# 해시·문법·버전 줄을 확인한 뒤, 받은 설치기를 --update(Windows -Update)로 서버와 분리된 프로세스로 띄운다.
+# 교체·재시작·되돌리기는 설치기가 하고 결과를 설정 폴더의 update_status.json에 남긴다. 서버는 그 파일을 읽어
+# 실패한 버전을 update_state.json에 적고 다시 받지 않는다. 설정 auto_update가 false면 아무것도 하지 않는다.
+UPDATE_MANIFEST_URL = "https://github.com/hyperfocuslab/sheltie/releases/latest/download/manifest.json"
+UPDATE_FIRST_DELAY = 600  # 서버 시작 뒤 첫 확인까지(초)
+UPDATE_INTERVAL = 24 * 3600  # 그 뒤 확인 간격(초). 여기에 간격의 5%까지 임의 지연을 더한다
+UPDATE_BUSY_RETRY = 900  # 승인·질문 대기 세션이 있어 미뤘을 때 다시 볼 때까지(초)
+UPDATE_ATTEMPT_GRACE = 3600  # 띄운 설치기가 결과 없이 이만큼 지나면 실패로 본다(서버가 다시 뜰 때는 바로 본다)
+UPDATE_STATUS_FILE = "update_status.json"  # 설치기 --update가 쓰는 결과. install.sh·install.ps1과 같은 이름(테스트가 비교)
+UPDATE_STATE_FILE = "update_state.json"  # 서버가 쓰는 상태(실패한 버전, 띄운 버전)
+UPDATE_LOG_NAME = "sheltie-update.log"  # 설치기 출력(서버 로그 폴더)
+UPDATE_FILE_NAMES = ("sheltie.py", "install.sh", "install.ps1")
+UPDATE_MAX_MANIFEST = 64 * 1024
+UPDATE_MAX_FILE = 8 * 1024 * 1024
+UPDATE_TIMEOUT = 30
+VERSION_RE = re.compile(r"^(0|[1-9][0-9]{0,4})\.(0|[1-9][0-9]{0,4})\.(0|[1-9][0-9]{0,4})$")
+SERVER_VERSION_LINE_RE = re.compile(r'^SERVER_VERSION = "([^"\r\n]*)"[ \t]*\r?$', re.M)  # CRLF 파일(Windows 체크아웃)도
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+CREATE_NEW_PROCESS_GROUP = 0x00000200
+CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+# 매니페스트 서명(ed25519). 릴리스는 manifest.json 원문 바이트에 대한 서명을 manifest.json.sig(base64)로 같이 올린다
+# (ops/sign_manifest.py, 개인키는 릴리스 맥의 키체인에만). 이 목록의 키 하나로라도 검증되면 받는다. 키를 바꿀 때는 새 키를
+# 더한 릴리스를 먼저 내고, 모두 그 버전으로 바뀐 뒤 옛 키를 뺀다.
+UPDATE_PUBLIC_KEYS = (
+    "2cc041508a2085cce6834fab14e45679b2b13fc84a051fc70ac0e80469acd23e",
+)
+UPDATE_SIG_SUFFIX = ".sig"
+UPDATE_MAX_SIG = 1024
+UPDATE_TRANSIENT_TRIES = 3  # 일시적 실패(응답 시간 초과·포트 사용 중·쓰기 실패)를 이만큼 겪은 버전은 다시 받지 않는다
+UPDATE_STARTS_FILE = "update_starts.json"  # 업데이트 직후 서버 시작 시각들(시작하자마자 죽는 릴리스 감지)
+UPDATE_CRASH_STARTS = 3  # 업데이트 뒤 UPDATE_WATCH 안에, UPDATE_CRASH_WINDOW 동안 이만큼 시작하면 이전 버전으로 되돌린다
+UPDATE_CRASH_WINDOW = 600
+UPDATE_WATCH = 3600  # 업데이트 뒤 이만큼 무사하면 시작 기록을 지운다
+UPDATE_CRASH_EXIT = 75  # 되돌린 뒤 끝낼 때 코드. 맥은 launchd KeepAlive, Windows는 작업의 1분 반복 트리거가 다시 띄운다
+
+
+# ---- ed25519 검증·서명(RFC 8032 5.1, 표준 라이브러리만). 서명은 ops/sign_manifest.py가 쓴다.
+_ED_P = 2 ** 255 - 19
+_ED_Q = 2 ** 252 + 27742317777372353535851937790883648493
+_ED_D = -121665 * pow(121666, _ED_P - 2, _ED_P) % _ED_P
+_ED_SQRT_M1 = pow(2, (_ED_P - 1) // 4, _ED_P)
+
+
+def _ed_add(a, b):
+    p = _ED_P
+    x = (a[1] - a[0]) * (b[1] - b[0]) % p
+    y = (a[1] + a[0]) * (b[1] + b[0]) % p
+    c = 2 * a[3] * b[3] * _ED_D % p
+    d = 2 * a[2] * b[2] % p
+    e, f, g, h = y - x, d - c, d + c, y + x
+    return (e * f % p, g * h % p, f * g % p, e * h % p)
+
+
+def _ed_mul(s, pt):
+    q = (0, 1, 1, 0)
+    while s > 0:
+        if s & 1:
+            q = _ed_add(q, pt)
+        pt = _ed_add(pt, pt)
+        s >>= 1
+    return q
+
+
+def _ed_equal(a, b):
+    p = _ED_P
+    return (a[0] * b[2] - b[0] * a[2]) % p == 0 and (a[1] * b[2] - b[1] * a[2]) % p == 0
+
+
+def _ed_recover_x(y, sign):
+    p = _ED_P
+    if y >= p:
+        return None
+    x2 = (y * y - 1) * pow(_ED_D * y * y + 1, p - 2, p) % p
+    if x2 == 0:
+        return None if sign else 0
+    x = pow(x2, (p + 3) // 8, p)
+    if (x * x - x2) % p:
+        x = x * _ED_SQRT_M1 % p
+    if (x * x - x2) % p:
+        return None
+    if (x & 1) != sign:
+        x = p - x
+    return x
+
+
+_ED_GY = 4 * pow(5, _ED_P - 2, _ED_P) % _ED_P
+_ED_GX = _ed_recover_x(_ED_GY, 0)
+_ED_G = (_ED_GX, _ED_GY, 1, _ED_GX * _ED_GY % _ED_P)
+
+
+def _ed_compress(pt):
+    zi = pow(pt[2], _ED_P - 2, _ED_P)
+    x, y = pt[0] * zi % _ED_P, pt[1] * zi % _ED_P
+    return (y | ((x & 1) << 255)).to_bytes(32, "little")
+
+
+def _ed_decompress(b):
+    if len(b) != 32:
+        return None
+    y = int.from_bytes(b, "little")
+    sign = y >> 255
+    y &= (1 << 255) - 1
+    x = _ed_recover_x(y, sign)
+    return None if x is None else (x, y, 1, x * y % _ED_P)
+
+
+def _ed_hint(b):
+    return int.from_bytes(hashlib.sha512(b).digest(), "little") % _ED_Q
+
+
+def _ed_expand(secret):
+    if len(secret) != 32:
+        raise ValueError("ed25519 개인키는 32바이트")
+    h = hashlib.sha512(secret).digest()
+    a = int.from_bytes(h[:32], "little")
+    a &= (1 << 254) - 8
+    a |= 1 << 254
+    return a, h[32:]
+
+
+def ed25519_public_key(secret):
+    """32바이트 개인키(seed) → 32바이트 공개키."""
+    return _ed_compress(_ed_mul(_ed_expand(secret)[0], _ED_G))
+
+
+def ed25519_sign(secret, msg):
+    a, prefix = _ed_expand(secret)
+    pub = _ed_compress(_ed_mul(a, _ED_G))
+    r = _ed_hint(prefix + msg)
+    rs = _ed_compress(_ed_mul(r, _ED_G))
+    s = (r + _ed_hint(rs + pub + msg) * a) % _ED_Q
+    return rs + s.to_bytes(32, "little")
+
+
+def ed25519_verify(public, msg, sig):
+    """서명이 맞으면 True. 형식이 틀린 입력도 False(예외 없음)."""
+    if not isinstance(public, bytes) or not isinstance(sig, bytes) or len(public) != 32 or len(sig) != 64:
+        return False
+    a = _ed_decompress(public)
+    r = _ed_decompress(sig[:32])
+    if a is None or r is None:
+        return False
+    s = int.from_bytes(sig[32:], "little")
+    if s >= _ED_Q:
+        return False
+    h = _ed_hint(sig[:32] + public + msg)
+    return _ed_equal(_ed_mul(s, _ED_G), _ed_add(r, _ed_mul(h, a)))
+
+
+def verify_manifest_sig(data, sig_text, keys=None):
+    """manifest.json 원문(data)과 manifest.json.sig 내용(base64 한 줄)을 공개키 목록으로 검증한다. 맞으면 True."""
+    try:
+        sig = base64.b64decode(sig_text.strip(), validate=True)
+    except (ValueError, TypeError):
+        return False
+    for k in (UPDATE_PUBLIC_KEYS if keys is None else keys):
+        try:
+            pub = bytes.fromhex(k)
+        except (ValueError, TypeError):
+            continue
+        if ed25519_verify(pub, data, sig):
+            return True
+    return False
+
+
+def parse_version(v):
+    """"X.Y.Z" → (X, Y, Z). 형식이 다르면 None."""
+    m = VERSION_RE.match(v) if isinstance(v, str) else None
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def check_update_url(url):
+    """매니페스트 위치 검사. https, 로컬 시험용 http://127.0.0.1·localhost, 또는 로컬 절대 경로만. 반환 (종류, 값)."""
+    if not isinstance(url, str) or not url.strip():
+        raise ValueError("update_url이 비었다")
+    if "://" not in url:
+        p = os.path.expanduser(url)
+        if not is_abs_path(p):
+            raise ValueError("update_url 거부: 로컬 파일은 절대 경로만: %r" % url)
+        return ("file", p)
+    u = urllib.parse.urlsplit(url)
+    u.port  # 포트가 숫자가 아니면 ValueError
+    ok = u.hostname and (u.scheme == "https" or (u.scheme == "http" and u.hostname in ("127.0.0.1", "localhost")))
+    if not ok or u.username or u.password or u.query or u.fragment:
+        raise ValueError("update_url 거부: https://만 허용(로컬 시험은 http://127.0.0.1·localhost, 로컬 절대 경로): %r" % url)
+    return ("url", url)
+
+
+def update_sibling(src, name):
+    """매니페스트와 같은 곳의 파일 위치."""
+    kind, loc = src
+    if kind == "file":
+        return (kind, os.path.join(os.path.dirname(loc), name))
+    return (kind, urllib.parse.urljoin(loc, name))
+
+
+class _UpdateRedirect(urllib.request.HTTPRedirectHandler):
+    """https(로컬 시험 주소는 같은 http 호스트)로만 넘어간다. GitHub 릴리스는 https 저장소로 넘긴다."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = urllib.parse.urlsplit(urllib.parse.urljoin(req.full_url, newurl))
+        old = urllib.parse.urlsplit(req.full_url)
+        if not (new.scheme == "https" or (new.scheme == old.scheme == "http" and new.hostname == old.hostname
+                                          and new.hostname in ("127.0.0.1", "localhost"))):
+            raise urllib.error.HTTPError(req.full_url, code, "https가 아닌 곳으로 넘기기 거부: %s" % newurl,
+                                         headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def update_fetch(src, limit):
+    """src(check_update_url 모양)의 내용(bytes). limit보다 크면 ValueError."""
+    kind, loc = src
+    if kind == "file":
+        with open(loc, "rb") as f:
+            data = f.read(limit + 1)
+    else:
+        opener = urllib.request.build_opener(_UpdateRedirect)
+        req = urllib.request.Request(loc, headers={"User-Agent": "sheltie-server/%s" % SERVER_VERSION})
+        with opener.open(req, timeout=UPDATE_TIMEOUT) as r:
+            data = r.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError("너무 크다(%d바이트 넘음): %s" % (limit, loc))
+    return data
+
+
+def parse_manifest(data):
+    """매니페스트 bytes → (버전, {파일 이름: sha256}). 모르는 파일 이름은 버린다. 형식이 다르면 ValueError."""
+    try:
+        m = json.loads(data.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        raise ValueError("매니페스트가 JSON이 아니다")
+    if not isinstance(m, dict):
+        raise ValueError("매니페스트가 객체가 아니다")
+    v = m.get("version")
+    if parse_version(v) is None:
+        raise ValueError("매니페스트 버전 형식이 다르다: %r" % (v,))
+    files = m.get("files")
+    if not isinstance(files, dict):
+        raise ValueError("매니페스트에 files가 없다")
+    out = {}
+    for name in UPDATE_FILE_NAMES:
+        if name not in files:
+            continue
+        h = files[name]
+        if not isinstance(h, str) or not SHA256_RE.match(h):
+            raise ValueError("매니페스트 해시 형식이 다르다: %s" % name)
+        out[name] = h
+    return v, out
+
+
+def installed_server_dir():
+    """설치기가 서버 파일을 두는 폴더(install.sh DATA_DIR, install.ps1 $DATA)."""
+    if IS_WINDOWS:
+        return os.path.join(_local_appdata(), "sheltie")
+    return os.path.expanduser("~/.local/share/sheltie")
+
+
+def spawn_installer(installer, server_file, log_path, windows=None):
+    """받은 설치기를 --update로 띄운다. 서버가 내려가도(launchd bootout·kickstart -k, 작업 스케줄러 /End) 살아남게
+    맥은 새 세션(프로세스 그룹 밖), Windows는 새 프로세스 그룹 + 숨은 콘솔(+가능하면 작업 개체 밖)로. 출력은 log_path에.
+    Windows: DETACHED_PROCESS로 띄운 powershell 5.1은 아무것도 안 하고 0으로 끝난다(7950 실측). CREATE_NO_WINDOW는 돌고,
+    작업 스케줄러 작업은 밖으로 나가기(CREATE_BREAKAWAY_FROM_JOB)를 거부하지만 /End 뒤에도 이 자식은 산다(7950 실측)."""
+    windows = IS_WINDOWS if windows is None else windows
+    env = dict(os.environ)
+    env["SHELTIE_SRC"] = server_file
+    os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+    with open(log_path, "wb") as out:
+        kw = dict(stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, close_fds=True,
+                  cwd=os.path.dirname(installer), env=env)
+        if windows:
+            ps = os.path.join(os.environ.get("SystemRoot") or r"C:\Windows", "System32", "WindowsPowerShell", "v1.0",
+                              "powershell.exe")
+            argv = [ps, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", installer, "-Update"]
+            flags = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+            try:
+                return subprocess.Popen(argv, creationflags=flags | CREATE_BREAKAWAY_FROM_JOB, **kw)
+            except OSError:  # 작업 개체가 밖으로 나가기를 막으면(ERROR_ACCESS_DENIED) 그대로 띄운다
+                return subprocess.Popen(argv, creationflags=flags, **kw)
+        return subprocess.Popen(["/bin/sh", installer, "--update"], start_new_session=True, **kw)
+
+
+def _cfg_seconds(v, default):
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0 else default
+
+
+class Updater:
+    """자동 업데이트 확인기. check_once는 한 번 보고 결과 낱말을 돌려준다(시험용).
+    startup_guard는 서버 시작 때 한 번: 업데이트 직후 짧은 시간에 여러 번 다시 뜨면(뜨자마자 죽는 릴리스) 이전 버전으로 되돌린다."""
+
+    def __init__(self, cfg, busy=None, fetch=None, spawn=None, server_file=None, install_dir=None, log_path=None,
+                 windows=None, version=None, rand=random.random, wall=time.time, public_keys=None):
+        self.cfg_enabled = cfg.get("auto_update", True) is not False
+        self.url = cfg.get("update_url") or UPDATE_MANIFEST_URL
+        self.first_delay = _cfg_seconds(cfg.get("update_first_check_sec"), UPDATE_FIRST_DELAY)
+        self.interval = _cfg_seconds(cfg.get("update_interval_sec"), UPDATE_INTERVAL)
+        self.busy = busy or (lambda: False)
+        self.fetch = fetch or update_fetch
+        self.spawn = spawn or spawn_installer
+        self.server_file = os.path.abspath(server_file or __file__)
+        self.install_dir = install_dir or installed_server_dir()
+        self.work = os.path.join(os.path.dirname(self.server_file), "update")
+        self.log_path = log_path or os.path.join(
+            os.path.dirname(os.path.expanduser(os.environ.get("SHELTIE_LOG") or default_log_path())), UPDATE_LOG_NAME)
+        self.windows = IS_WINDOWS if windows is None else windows
+        self.version = version or SERVER_VERSION
+        self.rand = rand
+        self.wall = wall
+        self.public_keys = UPDATE_PUBLIC_KEYS if public_keys is None else tuple(public_keys)
+        self.state_path = os.path.join(cfg["_dir"], UPDATE_STATE_FILE)
+        self.status_path = os.path.join(cfg["_dir"], UPDATE_STATUS_FILE)
+        self.starts_path = os.path.join(cfg["_dir"], UPDATE_STARTS_FILE)
+        self.status_done = False  # 이 프로세스에서 시작 때 결과 파일을 이미 읽었다(startup_guard)
+
+    def installed(self):
+        """설치기가 깐 서버 파일인가. 저장소에서 바로 띄운 서버는 설치기가 바꾸는 파일이 아니라 업데이트하지 않는다."""
+        nc = os.path.normcase
+        return nc(os.path.realpath(os.path.dirname(self.server_file))) == nc(os.path.realpath(self.install_dir))
+
+    def enabled(self):
+        return self.cfg_enabled and self.installed()
+
+    def load_state(self):
+        try:
+            with open(self.state_path, encoding="utf-8") as f:
+                st = json.load(f)
+        except (OSError, ValueError):
+            st = {}
+        if not isinstance(st, dict):
+            st = {}
+
+        def num(v):
+            return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+        failed = st.get("failed")
+        failed = [v for v in failed if parse_version(v)] if isinstance(failed, list) else []
+        att = st.get("attempted")
+        att = att if parse_version(att) else None
+        retries = st.get("retries")
+        retries = {k: v for k, v in retries.items() if parse_version(k) and isinstance(v, int) and not isinstance(v, bool)
+                   and v > 0} if isinstance(retries, dict) else {}
+        up = st.get("updated")
+        up = ({"to": up["to"], "from": up.get("from") if parse_version(up.get("from")) else None, "at": up["at"]}
+              if isinstance(up, dict) and parse_version(up.get("to")) and num(up.get("at")) is not None else None)
+        fe = st.get("fetch_errors")
+        fe = ({"day": fe["day"], "n": fe["n"], "warned": fe.get("warned") is True}
+              if isinstance(fe, dict) and isinstance(fe.get("day"), str) and isinstance(fe.get("n"), int) else None)
+        return {"failed": failed, "attempted": att, "attempted_at": num(st.get("attempted_at")) if att else None,
+                "retries": retries, "updated": up, "fetch_errors": fe}
+
+    def save_state(self, st):
+        write_private(self.state_path, st)
+
+    def _mark_failed(self, st, v):
+        st["retries"].pop(v, None)
+        if v not in st["failed"]:
+            st["failed"].append(v)
+            del st["failed"][:-50]
+
+    def _transient(self, st, v, what):
+        """일시적 실패 한 번. UPDATE_TRANSIENT_TRIES번째면 실패한 버전으로 적는다."""
+        n = st["retries"].get(v, 0) + 1
+        if n >= UPDATE_TRANSIENT_TRIES:
+            log.warning("업데이트 %s: %s(%d번째). 이 버전은 다시 받지 않는다(설치기 출력: %s)", v, what, n, self.log_path)
+            self._mark_failed(st, v)
+        else:
+            st["retries"][v] = n
+            log.warning("업데이트 %s: %s(%d/%d번째). 다음 확인 때 다시 한다(설치기 출력: %s)", v, what, n,
+                        UPDATE_TRANSIENT_TRIES, self.log_path)
+
+    def _log_tail(self, n=20):
+        try:
+            with open(self.log_path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                f.seek(max(0, f.tell() - 8192))
+                lines = f.read().decode("utf-8", "replace").splitlines()[-n:]
+        except OSError:
+            return
+        for line in lines:
+            log.warning("  설치기: %s", line)
+
+    def _updated(self, st, v, frm, at):
+        st["updated"] = {"to": v, "from": frm if parse_version(frm) else None, "at": at}
+        st["retries"].pop(v, None)
+
+    def process_status(self, startup=False):
+        """설치기가 남긴 결과를 읽어 실패한 버전을 기록한다. 결과 없이 띄운 버전만 남았으면, 서버가 다시 떴을 때(startup)나
+        띄운 지 UPDATE_ATTEMPT_GRACE가 지났을 때 지금 버전과 비교해 판단한다(아직 도는 설치기를 실패로 치지 않게).
+        일시적 실패(transient: true, 결과 없이 끝남)는 UPDATE_TRANSIENT_TRIES번째에야 실패한 버전으로 적는다."""
+        st = self.load_state()
+        before = json.dumps(st, sort_keys=True)
+        res = None
+        if os.path.exists(self.status_path):
+            try:
+                with open(self.status_path, encoding="utf-8-sig") as f:
+                    res = json.load(f)
+            except (OSError, ValueError):
+                res = None
+            if not isinstance(res, dict):
+                log.warning("업데이트 결과 파일을 읽지 못했다: %s", self.status_path)
+                res = {}
+            try:
+                os.unlink(self.status_path)
+            except OSError:
+                pass
+        if res is not None:
+            v = res.get("version")
+            if not parse_version(v):
+                v = st["attempted"]
+            if res.get("result") == "ok":
+                log.info("업데이트 완료: %s → %s", res.get("from"), v)
+                if v:
+                    at = res.get("time")
+                    at = at if isinstance(at, (int, float)) and not isinstance(at, bool) else self.wall()
+                    self._updated(st, v, res.get("from"), at)
+            elif res.get("transient") is True and v:
+                self._transient(st, v, "설치기 일시적 실패(%s): %s" % (res.get("result"), res.get("reason")))
+                self._log_tail()
+            else:
+                log.warning("업데이트 실패(%s): %s → %s, 이유: %s. 이 버전은 다시 받지 않는다(설치기 출력: %s)",
+                            res.get("result"), res.get("from"), v, res.get("reason"), self.log_path)
+                self._log_tail()
+                if v:
+                    self._mark_failed(st, v)
+            st["attempted"] = st["attempted_at"] = None
+        elif st["attempted"] and (startup or st["attempted"] == self.version or st["attempted_at"] is None
+                                  or self.wall() - st["attempted_at"] > UPDATE_ATTEMPT_GRACE):
+            if st["attempted"] == self.version:
+                log.info("업데이트 완료: 지금 서버 %s", self.version)
+                self._updated(st, self.version, None, self.wall())
+            else:
+                self._transient(st, st["attempted"], "설치기가 결과 없이 끝났다(지금 서버 %s)" % self.version)
+                self._log_tail()
+            st["attempted"] = st["attempted_at"] = None
+        if json.dumps(st, sort_keys=True) != before:
+            self.save_state(st)
+        return st
+
+    # ---- 뜨자마자 죽는 릴리스
+    def _load_starts(self):
+        try:
+            with open(self.starts_path, encoding="utf-8") as f:
+                v = json.load(f)
+        except (OSError, ValueError):
+            return []
+        return [t for t in v if isinstance(t, (int, float)) and not isinstance(t, bool)] if isinstance(v, list) else []
+
+    def _clear_starts(self):
+        try:
+            os.unlink(self.starts_path)
+        except OSError:
+            pass
+
+    def _prev_version(self):
+        """되돌릴 이전 서버 파일(.prev)의 SERVER_VERSION. 없거나 못 읽으면 None."""
+        try:
+            with open(self.server_file + ".prev", "rb") as f:
+                m = SERVER_VERSION_LINE_RE.search(f.read().decode("utf-8-sig", "replace"))
+        except OSError:
+            return None
+        return m.group(1) if m and parse_version(m.group(1)) else None
+
+    def _watching(self, st):
+        """업데이트로 지금 버전이 된 지 UPDATE_WATCH 안이고, 되돌릴 .prev가 지금보다 낮은 버전이면 그 기록.
+        (.prev가 지금과 같은 버전이면 다음 업데이트를 시도하다 되돌아온 것이라 되돌릴 곳이 없다)"""
+        up = st["updated"]
+        if not (up and up["to"] == self.version and 0 <= self.wall() - up["at"] < UPDATE_WATCH):
+            return None
+        pv = parse_version(self._prev_version())
+        return up if pv is not None and pv < parse_version(self.version) else None
+
+    def startup_guard(self):
+        """서버 시작 때 한 번. 되돌렸으면 True(호출한 쪽은 끝낸다: launchd KeepAlive·작업 스케줄러 1분 반복 트리거가 이전 버전으로 다시 띄운다)."""
+        if not self.installed():
+            return False
+        st = self.process_status(startup=True)
+        self.status_done = True
+        up = self._watching(st)
+        if not up:
+            self._clear_starts()
+            if st["updated"]:
+                st["updated"] = None
+                self.save_state(st)
+            return False
+        now = self.wall()
+        starts = [t for t in self._load_starts() if 0 <= now - t < UPDATE_CRASH_WINDOW] + [now]
+        if len(starts) < UPDATE_CRASH_STARTS:
+            try:
+                write_private(self.starts_path, starts)
+            except OSError as e:
+                log.warning("서버 시작 기록을 남기지 못했다: %s", e)
+            return False
+        prev = self.server_file + ".prev"
+        log.warning("업데이트 %s 뒤 %d분 안에 서버가 %d번 시작했다(뜨자마자 죽는다). 이전 서버(%s)로 되돌리고 이 버전은 "
+                    "다시 받지 않는다", self.version, UPDATE_CRASH_WINDOW // 60, len(starts), up["from"] or "?")
+        tmp = "%s.rollback.%d" % (self.server_file, os.getpid())
+        try:
+            shutil.copy2(prev, tmp)
+            os.replace(tmp, self.server_file)
+        except OSError as e:
+            log.error("이전 서버로 되돌리지 못했다(%s → %s): %s", prev, self.server_file, e)
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            return False
+        self._mark_failed(st, self.version)
+        st["updated"] = None
+        st["attempted"] = st["attempted_at"] = None
+        try:
+            self.save_state(st)
+        except OSError as e:
+            log.warning("업데이트 상태를 남기지 못했다: %s", e)
+        self._clear_starts()
+        return True
+
+    def settle(self):
+        """업데이트 뒤 UPDATE_WATCH 동안 무사했다: 시작 기록을 지운다."""
+        self._clear_starts()
+        st = self.load_state()
+        if st["updated"]:
+            st["updated"] = None
+            self.save_state(st)
+
+    # ---- 확인·받기
+    def _fetch_failed(self, st, what, e):
+        """받기 실패. 인증서 오류는 바로 warning, 그 밖의 실패는 같은 날 두 번째에 warning 한 번(나머지는 info)."""
+        reason = getattr(e, "reason", None)
+        if isinstance(e, ssl.SSLError) or isinstance(reason, ssl.SSLError):
+            log.warning("업데이트 %s를 받지 못했다(인증서 확인 실패): %s. 맥에서 python.org 파이썬을 쓰면 "
+                        "'Install Certificates.command'를 한 번 실행해야 한다", what, e)
+            return
+        day = time.strftime("%Y-%m-%d", time.localtime(self.wall()))
+        fe = st["fetch_errors"] if st["fetch_errors"] and st["fetch_errors"]["day"] == day else \
+            {"day": day, "n": 0, "warned": False}
+        fe["n"] += 1
+        if fe["n"] >= 2 and not fe["warned"]:
+            fe["warned"] = True
+            log.warning("업데이트 %s를 받지 못했다(오늘 %d번째): %s", what, fe["n"], e)
+        else:
+            log.info("업데이트 %s를 받지 못했다: %s", what, e)
+        st["fetch_errors"] = fe
+        try:
+            self.save_state(st)
+        except OSError:
+            pass
+
+    def check_once(self):
+        if not self.cfg_enabled:
+            return "disabled"
+        if not self.installed():
+            return "not_installed"
+        st = self.process_status()
+        if self.busy():
+            log.info("업데이트 확인을 미룬다: 승인·질문을 기다리는 세션이 있다")
+            return "busy"
+        try:
+            src = check_update_url(self.url)
+        except ValueError as e:
+            log.warning("업데이트 확인 안 함: %s", e)
+            return "bad_url"
+        try:
+            raw = self.fetch(src, UPDATE_MAX_MANIFEST)
+        except (OSError, ValueError, http.client.HTTPException) as e:
+            self._fetch_failed(st, "매니페스트", e)
+            return "download_error"
+        # 서명: 같은 곳의 manifest.json.sig. 없거나 틀리면 오늘은 받지 않는다(영구 실패로 치지 않는다).
+        sig_src = (src[0], src[1] + UPDATE_SIG_SUFFIX)
+        try:
+            sig = self.fetch(sig_src, UPDATE_MAX_SIG).decode("ascii")
+        except (OSError, ValueError, UnicodeDecodeError, http.client.HTTPException) as e:
+            log.warning("업데이트 거부: 매니페스트 서명을 받지 못했다(%s): %s", sig_src[1], e)
+            return "bad_signature"
+        if not verify_manifest_sig(raw, sig, self.public_keys):
+            log.warning("업데이트 거부: 매니페스트 서명이 맞지 않는다(%s)", src[1])
+            return "bad_signature"
+        try:
+            v, files = parse_manifest(raw)
+        except ValueError as e:
+            log.warning("업데이트 매니페스트 거부: %s", e)
+            return "bad_manifest"
+        cur, new = parse_version(self.version), parse_version(v)
+        if new <= cur:
+            if new < cur:
+                log.info("매니페스트 버전 %s가 지금 서버(%s)보다 낮아 받지 않는다", v, self.version)
+            return "up_to_date"
+        if v in st["failed"]:
+            log.info("업데이트 %s는 전에 실패해 받지 않는다", v)
+            return "failed_version"
+        inst = "install.ps1" if self.windows else "install.sh"
+        missing = [n for n in ("sheltie.py", inst) if n not in files]
+        if missing:
+            log.warning("업데이트 매니페스트 거부: %s가 없다", ", ".join(missing))
+            return "bad_manifest"
+        dest = os.path.join(self.work, v)
+        shutil.rmtree(self.work, ignore_errors=True)
+        os.makedirs(dest)
+        got = {}
+        for name in ("sheltie.py", inst):
+            try:
+                data = self.fetch(update_sibling(src, name), UPDATE_MAX_FILE)
+            except (OSError, ValueError, http.client.HTTPException) as e:
+                shutil.rmtree(self.work, ignore_errors=True)
+                self._fetch_failed(st, name, e)
+                return "download_error"
+            if hashlib.sha256(data).hexdigest() != files[name]:
+                log.warning("업데이트 %s 거부: %s 해시가 매니페스트와 다르다", v, name)
+                shutil.rmtree(self.work, ignore_errors=True)
+                return "hash_mismatch"
+            got[name] = os.path.join(dest, name)
+            with open(got[name], "wb") as f:
+                f.write(data)
+        try:
+            with open(got["sheltie.py"], "rb") as f:
+                text = f.read().decode("utf-8-sig")
+            compile(text, got["sheltie.py"], "exec")
+            m = SERVER_VERSION_LINE_RE.search(text)
+            if not m or m.group(1) != v:
+                raise ValueError("SERVER_VERSION 줄(%s)이 매니페스트 버전과 다르다" % (m.group(1) if m else "없음"))
+        except (SyntaxError, ValueError, UnicodeDecodeError) as e:
+            log.warning("업데이트 %s 거부: 받은 서버 파일이 올바르지 않다(%s). 이 버전은 다시 받지 않는다", v, e)
+            self._mark_failed(st, v)
+            self.save_state(st)
+            shutil.rmtree(self.work, ignore_errors=True)
+            return "bad_server_file"
+        if self.busy():
+            log.info("업데이트 적용을 미룬다: 승인·질문을 기다리는 세션이 있다")
+            return "busy"
+        st["attempted"] = v
+        st["attempted_at"] = self.wall()
+        # 다음 업데이트를 시작한다: 지난 업데이트의 시작 감시는 끝낸다(설치기가 서버를 다시 띄우는 것을 죽음으로 세지 않게)
+        st["updated"] = None
+        self._clear_starts()
+        self.save_state(st)
+        log.info("업데이트 시작: %s → %s (설치기 출력: %s)", self.version, v, self.log_path)
+        try:
+            self.spawn(got[inst], got["sheltie.py"], self.log_path, self.windows)
+        except OSError as e:
+            log.warning("업데이트 설치기를 띄우지 못했다: %s", e)
+            st["attempted"] = st["attempted_at"] = None
+            self.save_state(st)
+            return "spawn_error"
+        return "started"
+
+    def next_delay(self, result):
+        if result == "busy":
+            return min(UPDATE_BUSY_RETRY, self.interval)
+        return self.interval + self.rand() * self.interval * 0.05
+
+    def run(self, stop, mono=time.monotonic):
+        if not self.installed():
+            log.info("자동 업데이트 안 함: 설치기로 깐 서버가 아니다(%s)", self.server_file)
+            return
+        st = None
+        if not self.status_done:
+            try:
+                st = self.process_status(startup=True)
+            except Exception:  # noqa: BLE001
+                log.exception("업데이트 결과 읽기 오류")
+        if st is None:
+            st = self.load_state()
+        # 업데이트 뒤 UPDATE_WATCH가 지나면 시작 기록을 지운다(꺼져 있어도: 그 전에 받은 업데이트일 수 있다)
+        up = self._watching(st)
+        settle_at = mono() + max(0.0, up["at"] + UPDATE_WATCH - self.wall()) if up else None
+        if not self.cfg_enabled:
+            log.info("자동 업데이트 꺼짐(설정 auto_update: false)")
+        next_check = mono() + self.first_delay if self.cfg_enabled else None
+        while settle_at is not None or next_check is not None:
+            wait = min(t for t in (settle_at, next_check) if t is not None) - mono()
+            if stop.wait(max(0.0, wait)):
+                return
+            now = mono()
+            if settle_at is not None and now >= settle_at:
+                settle_at = None
+                try:
+                    self.settle()
+                except Exception:  # noqa: BLE001
+                    log.exception("업데이트 시작 기록 정리 오류")
+            if next_check is not None and now >= next_check:
+                try:
+                    r = self.check_once()
+                except Exception:  # noqa: BLE001
+                    log.exception("업데이트 확인 오류")
+                    r = "error"
+                next_check = mono() + self.next_delay(r)
 
 
 # ---------------------------------------------------------------- 진입점
@@ -9716,15 +10437,33 @@ def cmd_serve():
         log.error("%s", e)
         print(e, file=sys.stderr)
         return 2
+    if sheltie_running(cfg):
+        # Windows 작업의 1분 반복 트리거는 서버가 돌고 있어도 새로 띄울 때가 있다(7950 실측, 업데이트 뒤): 바로 끝낸다
+        log.info("다른 Sheltie 서버가 이미 %s:%d에서 돈다. 이 프로세스는 끝낸다", cfg["bind"], cfg["port"])
+        return 0
     app = build_app(cfg)
     app.hc_version = hc_version_check(cfg.get("hc_path"))
     app.pusher.available()
-    srv = make_server_retry(app, cfg["bind"], cfg["port"])
-    log.info("시작 %s:%d (푸시: %s)", cfg["bind"], cfg["port"], "중계" if cfg.get("push_relay_url") else "직접")
+    try:
+        srv = make_server_retry(app, cfg["bind"], cfg["port"], taken=lambda: sheltie_running(cfg))
+    except PortTaken as e:
+        log.info("다른 Sheltie 서버가 이미 %s에서 돈다. 이 프로세스는 끝낸다", e)
+        return 0
+    # 포트를 잡은 시작만 센다(포트를 못 잡고 끝난 두 번째 실행은 뜨자마자 죽는 릴리스가 아니다)
+    updater = Updater(cfg, busy=app.update_busy)
+    try:
+        if updater.startup_guard():
+            srv.server_close()
+            return UPDATE_CRASH_EXIT
+    except Exception:  # noqa: BLE001
+        log.exception("업데이트 시작 점검 오류")
+    log.info("시작 %s:%d (푸시: %s, 서버 %s)", cfg["bind"], cfg["port"], "중계" if cfg.get("push_relay_url") else "직접",
+             SERVER_VERSION)
     app.poll(initial=True)
     threading.Thread(target=app.events_loop, name="events", daemon=True).start()
     threading.Thread(target=app.poll_loop, name="poll", daemon=True).start()
     threading.Thread(target=app.screen_poll_loop, name="screen-poll", daemon=True).start()
+    threading.Thread(target=updater.run, args=(app.stop,), name="update", daemon=True).start()
     try:
         srv.serve_forever()
     finally:

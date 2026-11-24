@@ -1,4 +1,5 @@
 import json
+import re
 import os
 import shutil
 import stat
@@ -51,7 +52,7 @@ class InstallTest(unittest.TestCase):
         with open(self.stub, "w") as f:
             f.write(STUB_SERVER)
         os.symlink(sys.executable, os.path.join(self.bin, "python3"))
-        self.fake("launchctl", "exit ${LAUNCHCTL_RC:-0}")
+        self.fake("launchctl", '[ "$1" = print ] && exit 113; exit ${LAUNCHCTL_RC:-0}')
         self.fake("curl", "exit 0")
         self.fake("hc", "echo '{\"terminals\":[]}'")
         self.fake("tailscale",
@@ -269,30 +270,61 @@ class InstallTest(unittest.TestCase):
         shutil.copy(INSTALL, lone)
         env = {"HOME": self.home, "PATH": self.bin + ":/usr/bin:/bin", "FAKE_LOG": self.log,
                "TS_SERVE_FILE": self.ts_serve_file, "SHELTIE_HEALTH_TRIES": "2", "STUB_SRC": self.stub,
-               "TS_SERVE_JSON": self.ts_serve_json, "SHELTIE_SYS_AGENTS_DIR": self.sys_dir}
+               "TS_SERVE_JSON": self.ts_serve_json, "SHELTIE_SYS_AGENTS_DIR": self.sys_dir,
+               "STUB_MANIFEST": self.stub_manifest()}
         env.update(extra)
         return subprocess.run(["sh", os.path.join(lone, "install.sh")], env=env, capture_output=True, text=True)
 
-    FAKE_CURL_DL = ('while [ $# -gt 0 ]; do [ "$1" = -o ] && out=$2; shift; done; '
-                    '[ -z "${out:-}" ] || [ "$out" = /dev/null ] || cat "$STUB_SRC" > "$out"; exit 0')
+    def stub_manifest(self, sha=None):
+        """서버 대역의 릴리스 매니페스트(manifest.json) 경로."""
+        import hashlib
+        p = os.path.join(self.tmp, "manifest-%s.json" % (sha or "ok"))
+        with open(self.stub, "rb") as f:
+            h = sha or hashlib.sha256(f.read()).hexdigest()
+        with open(p, "w") as f:
+            json.dump({"version": "1.0.0", "files": {"sheltie.py": h, "install.sh": "0" * 64}}, f)
+        return p
+
+    # 가짜 curl: -o 파일에 URL이 manifest.json이면 $STUB_MANIFEST, 아니면 $STUB_SRC를 쓴다.
+    FAKE_CURL_DL = ('url=; out=; while [ $# -gt 0 ]; do case "$1" in -o) out=$2; shift;; https://*) url=$1;; esac; '
+                    'shift; done; [ -z "$out" ] || [ "$out" = /dev/null ] || case "$url" in '
+                    '*/manifest.json) [ -f "${STUB_MANIFEST:-}" ] || exit 22; cat "$STUB_MANIFEST" > "$out";; '
+                    '*) cat "$STUB_SRC" > "$out";; esac; exit 0')
+    RELEASE_URL = "https://github.com/hyperfocuslab/sheltie/releases/latest/download/"
 
     def test_default_source_is_github_raw_when_piped(self):
         self.fake("curl", self.FAKE_CURL_DL)
         r = self.lone_install()
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertTrue(any("https://raw.githubusercontent.com/" in x and x.endswith("server/sheltie.py")
-                            for x in self.calls()))
+        self.assertTrue(any(x.endswith(self.RELEASE_URL + "sheltie.py") for x in self.calls()), self.calls())
+        self.assertTrue(any(x.endswith(self.RELEASE_URL + "manifest.json") for x in self.calls()), self.calls())
+        self.assertFalse(any("raw.githubusercontent.com" in x for x in self.calls()))
+
+    def test_release_server_hash_mismatch_aborts(self):
+        self.fake("curl", self.FAKE_CURL_DL)
+        r = self.lone_install(STUB_MANIFEST=self.stub_manifest("a" * 64))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("manifest.json", r.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".local/share/sheltie/sheltie.py")))
+        self.assertFalse(any(x.startswith("launchctl") for x in self.calls()))
+
+    def test_release_manifest_missing_aborts(self):
+        self.fake("curl", self.FAKE_CURL_DL)
+        r = self.lone_install(STUB_MANIFEST=os.path.join(self.tmp, "none.json"))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("manifest.json", r.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".local/share/sheltie/sheltie.py")))
 
     def test_piped_from_folder_with_server_file_still_uses_github(self):
         # curl | sh 는 $0이 "sh"라서, 서버 파일이 있는 폴더(이 저장소 루트)에서 돌려도 그 파일을 쓰면 안 된다.
         self.fake("curl", self.FAKE_CURL_DL)
         env = {"HOME": self.home, "PATH": self.bin + ":/usr/bin:/bin", "FAKE_LOG": self.log,
                "TS_SERVE_FILE": self.ts_serve_file, "SHELTIE_HEALTH_TRIES": "2", "STUB_SRC": self.stub,
-               "TS_SERVE_JSON": self.ts_serve_json, "SHELTIE_SYS_AGENTS_DIR": self.sys_dir}
+               "TS_SERVE_JSON": self.ts_serve_json, "SHELTIE_SYS_AGENTS_DIR": self.sys_dir,
+               "STUB_MANIFEST": self.stub_manifest()}
         r = subprocess.run(["sh", "-s"], input=read(INSTALL), cwd=ROOT, env=env, capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertTrue(any("https://raw.githubusercontent.com/" in x and x.endswith("server/sheltie.py")
-                            for x in self.calls()))
+        self.assertTrue(any(x.endswith(self.RELEASE_URL + "sheltie.py") for x in self.calls()), self.calls())
 
     def test_http_source_rejected(self):
         r = self.lone_install(SHELTIE_SRC="http://example.invalid/sheltie.py")
@@ -326,6 +358,7 @@ class InstallTest(unittest.TestCase):
         r = self.run_install(SHELTIE_SRC="https://example.invalid/sheltie.py", STUB_SRC=self.stub)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertTrue(any("https://example.invalid/sheltie.py" in x for x in self.calls()))
+        self.assertFalse(any("manifest.json" in x for x in self.calls()))  # 시험용 SHELTIE_SRC는 그대로 받는다
 
 
     # ---- herdr-core 자동 설치(고정 버전 받기 + SHA256 검증)
@@ -983,6 +1016,14 @@ class InstallHooksTest(InstallTest):
         r = self.run_install("--uninstall")
         self.assertIn("opencode: 우리 훅이 없다", r.stdout)
 
+    def test_no_bare_variable_before_non_ascii(self):
+        # UTF-8 로캘의 sh(bash 3.2)는 "$VAR로"의 한글 바이트를 변수 이름으로 읽는다(set -u면 죽는다). ${VAR}로 쓴다.
+        # 서버가 띄우는 설치기는 파이썬이 LC_CTYPE=UTF-8을 넘겨 이 로캘로 돈다(자동 업데이트 되돌리기에서 실측).
+        for p in (INSTALL, os.path.join(ROOT, "ops", "release-server.sh"), os.path.join(ROOT, "ops", "hc-watch.sh")):
+            bad = [(i + 1, l) for i, l in enumerate(read(p).splitlines())
+                   if not l.lstrip().startswith("#") and re.search(r"\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7f]", l)]
+            self.assertEqual(bad, [], p)
+
     def test_hooks_merge_script_identical_in_ps1(self):
         def block(path):
             t = read(path)
@@ -990,6 +1031,394 @@ class InstallHooksTest(InstallTest):
             b = t.index("# ---- hooks_merge.py end")
             return t[a:b].replace("\r\n", "\n")
         self.assertEqual(block(INSTALL), block(os.path.join(ROOT, "install.ps1")))
+
+
+# 버전 줄이 있는 서버 대역(옛·새). init·pair는 STUB_SERVER와 같다.
+def versioned_stub(version, extra=""):
+    return STUB_SERVER + 'SERVER_VERSION = "%s"\n%s' % (version, extra)
+
+
+# 가짜 launchctl(상태 있음): $HEALTH_FILE.loaded가 있으면 서비스가 올라가 있다. bootstrap·kickstart는 설치된 서버 파일의
+# 버전으로 health 응답 파일을 쓴다(BROKEN 버전은 응답 없음). 실제 launchd처럼 올라가 있는데 bootstrap하면 5(EIO)로 실패하고,
+# BOOTOUT_LAG초면 bootout이 그만큼 늦게 끝난다(비동기). BOOTSTRAP_FAILS=N: 처음 N번 bootstrap 실패.
+# BOOTSTRAP_FAIL_GREP: plist에 그 글자가 있으면 bootstrap 실패(새 plist가 망가진 경우). print는 올라가 있으면 0, 아니면 113.
+FAKE_LAUNCHCTL_HEALTH = r"""
+L="$HEALTH_FILE.loaded"; U="$HEALTH_FILE.unloading"; N="$HEALTH_FILE.bsfails"
+if [ -f "$U" ] && [ "$(date +%s)" -ge "$(cat "$U")" ]; then rm -f "$U" "$L"; fi
+health() {
+  v=$(sed -n 's/^SERVER_VERSION = "\(.*\)"$/\1/p' "$HOME/.local/share/sheltie/sheltie.py")
+  case " ${BROKEN:-} " in *" $v "*) rm -f "$HEALTH_FILE";;
+  *) printf '{"ok":true,"server_version":"%s","started":%s}' "$v" "$(date +%s)" > "$HEALTH_FILE";; esac
+}
+case "$1" in
+  print) [ -f "$L" ] || exit 113 ;;
+  bootout) [ -f "$L" ] && [ ! -f "$U" ] || exit 3; rm -f "$HEALTH_FILE"
+    if [ -n "${BOOTOUT_LAG:-}" ]; then echo $(( $(date +%s) + BOOTOUT_LAG )) > "$U"; else rm -f "$L"; fi ;;
+  bootstrap) [ ! -f "$L" ] || { echo "Bootstrap failed: 5: Input/output error" >&2; exit 5; }
+    n=$(cat "$N" 2>/dev/null || echo 0)
+    if [ "$n" -lt "${BOOTSTRAP_FAILS:-0}" ]; then echo $((n + 1)) > "$N"; echo "Bootstrap failed: 5" >&2; exit 5; fi
+    if [ -n "${BOOTSTRAP_FAIL_GREP:-}" ] && grep -q "$BOOTSTRAP_FAIL_GREP" "$3"; then echo "Bootstrap failed: 5" >&2; exit 5; fi
+    touch "$L"; health ;;
+  kickstart) [ -f "$L" ] || exit 113; health ;;
+esac
+exit ${LAUNCHCTL_RC:-0}
+"""
+# 가짜 curl: health 응답 파일이 있으면 내보내고, 없으면 연결 실패처럼 끝난다.
+FAKE_CURL_HEALTH = '[ -f "$HEALTH_FILE" ] || exit 7; cat "$HEALTH_FILE"'
+
+
+@unittest.skipIf(os.name == "nt", "맥 전용")
+class InstallUpdateTest(InstallTest):
+    """--update(서버 자동 업데이트가 부르는 모드)와 --no-auto-update. 부모 테스트는 비운다."""
+
+    def setUp(self):
+        super().setUp()
+        self.health = os.path.join(self.tmp, "health.json")
+        self.fake("launchctl", FAKE_LAUNCHCTL_HEALTH)
+        self.fake("curl", FAKE_CURL_HEALTH)
+        self.old_src = self.write_src("old.py", versioned_stub("1.0.0"))
+        self.new_src = self.write_src("new.py", versioned_stub("1.0.1"))
+        self.server = os.path.join(self.home, ".local/share/sheltie/sheltie.py")
+        self.cfg_dir = os.path.join(self.home, ".config/sheltie")
+        self.status_path = os.path.join(self.cfg_dir, "update_status.json")
+
+    def write_src(self, name, text):
+        p = os.path.join(self.tmp, name)
+        with open(p, "w") as f:
+            f.write(text)
+        return p
+
+    def run_install(self, *args, **extra):
+        extra.setdefault("LANG", "en_US.UTF-8")  # 서버가 띄우는 설치기와 같은 UTF-8 로캘(sh가 "$VAR한글"을 다르게 읽는다)
+        extra.setdefault("HEALTH_FILE", self.health)
+        extra.setdefault("SHELTIE_UPDATE_WAIT", "3")
+        return super().run_install(*args, **extra)
+
+    def install_old(self, *args):
+        r = self.run_install(*args, SHELTIE_SRC=self.old_src)
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        with open(os.path.join(self.cfg_dir, "devices.json"), "w") as f:
+            json.dump([{"token": "ab" * 32, "env": "production"}], f)
+        open(self.log, "w").close()
+
+    def update(self, src=None, **extra):
+        return self.run_install("--update", SHELTIE_SRC=src or self.new_src, **extra)
+
+    def cfg_files(self):
+        return {n: read(os.path.join(self.cfg_dir, n)) for n in ("config.json", "devices.json")}
+
+    def status(self):
+        return read_json(self.status_path)
+
+    def test_update_replaces_server_and_keeps_config_tokens_devices(self):
+        self.install_old()
+        before = self.cfg_files()
+        plist = read(self.plist())
+        r = self.update()
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertEqual(read(self.server), read(self.new_src))
+        self.assertEqual(read(self.server + ".prev"), read(self.old_src))
+        self.assertEqual(stat.S_IMODE(os.stat(self.server).st_mode), 0o755)
+        self.assertEqual(self.cfg_files(), before)
+        st = self.status()
+        self.assertEqual((st["result"], st["version"], st["from"]), ("ok", "1.0.1", "1.0.0"))
+        self.assertEqual(stat.S_IMODE(os.stat(self.status_path).st_mode), 0o600)
+        c = self.calls()
+        uid = os.getuid()
+        # plist가 같으면 kickstart -k만(bootout 없이)
+        self.assertEqual([x for x in c if x.startswith("launchctl")],
+                         ["launchctl kickstart -k gui/%s/com.hyperfocuslab.sheltie" % uid])
+        self.assertEqual(read(self.plist()), plist)
+        self.assertFalse(any(x.startswith("tailscale") for x in c), c)
+        self.assertNotIn("PAIR-OK", r.stdout)
+        self.assertNotIn("herdr-core", r.stdout)
+
+    def test_update_rolls_back_when_new_server_does_not_answer(self):
+        self.install_old()
+        before = self.cfg_files()
+        r = self.update(BROKEN="1.0.1")
+        self.assertEqual(r.returncode, 3, r.stderr + r.stdout)
+        self.assertEqual(read(self.server), read(self.old_src))
+        self.assertEqual(self.cfg_files(), before)
+        st = self.status()
+        self.assertEqual((st["result"], st["version"], st["from"]), ("rolled_back", "1.0.1", "1.0.0"))
+        self.assertIn("이전 서버로 되돌렸다", r.stdout)
+        kicks = [x for x in self.calls() if x.startswith("launchctl kickstart")]
+        self.assertEqual(len(kicks), 2)  # 새 서버로 한 번, 되돌린 뒤 한 번
+        self.assertEqual(read_json(self.health)["server_version"], "1.0.0")
+
+    def test_rollback_status_written_before_old_server_restarts(self):
+        # 다시 뜬 옛 서버가 실패한 버전을 읽으려면 결과 파일이 재시작보다 먼저 있어야 한다
+        self.install_old()
+        self.fake("launchctl", 'case "$1" in kickstart) '
+                  '[ -f "$HOME/.config/sheltie/update_status.json" ] && echo has-status >> "$FAKE_LOG";; esac; '
+                  + FAKE_LAUNCHCTL_HEALTH)
+        r = self.update(BROKEN="1.0.1")
+        self.assertEqual(r.returncode, 3, r.stderr + r.stdout)
+        c = self.calls()
+        self.assertEqual(c.count("has-status"), 1, c)
+        self.assertLess(c.index("launchctl kickstart -k gui/%s/com.hyperfocuslab.sheltie" % os.getuid()),
+                        c.index("has-status"))
+
+    def test_changed_plist_reloads_and_rollback_restores_it(self):
+        self.install_old()
+        old_plist = read(self.plist()).replace("    <key>HOME</key><string>%s</string>\n" % self.home, "")
+        with open(self.plist(), "w") as f:
+            f.write(old_plist)  # 이 기능 전 plist(HOME 없음)
+        r = self.update()
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertIn("<key>HOME</key>", read(self.plist()))
+        self.assertEqual(read(self.plist()), read(os.path.join(self.home, ".local/share/sheltie",
+                                                                "com.hyperfocuslab.sheltie.plist")))
+        launch = [x.split()[1] for x in self.calls() if x.startswith("launchctl") and " print " not in x + " "]
+        self.assertEqual(launch, ["bootout", "bootstrap"])
+        self.assertFalse(os.path.exists(self.plist() + ".prev"))
+        # 고장 난 다음 버전: plist도 되돌린다
+        with open(self.plist(), "w") as f:
+            f.write(old_plist)
+        newer = self.write_src("newer.py", versioned_stub("1.0.2"))
+        r = self.update(newer, BROKEN="1.0.2")
+        self.assertEqual(r.returncode, 3, r.stderr + r.stdout)
+        self.assertEqual(read(self.plist()), old_plist)
+        self.assertEqual(read(self.server), read(self.new_src))
+
+    def test_update_refuses_same_or_lower_version(self):
+        self.install_old()
+        for v in ("1.0.0", "0.9.9"):
+            r = self.update(self.write_src("v.py", versioned_stub(v)))
+            self.assertEqual(r.returncode, 1, r.stderr + r.stdout)
+            self.assertIn("버전이 올라가지 않는다", r.stderr)
+            self.assertEqual(read(self.server), read(self.old_src))
+            self.assertEqual(self.status()["result"], "failed")
+        self.assertFalse(any(x.startswith("launchctl") for x in self.calls()))
+
+    def test_update_bad_sources_change_nothing(self):
+        self.install_old()
+        before = self.cfg_files()
+        for src, msg in ((self.write_src("bad.py", versioned_stub("1.0.1", "def (:")), "올바른 파이썬이 아니다"),
+                         (self.write_src("nover.py", STUB_SERVER), "SERVER_VERSION이 없다"),
+                         (os.path.join(self.tmp, "missing.py"), "새 서버 파일이 없다")):
+            r = self.update(src)
+            self.assertEqual(r.returncode, 1, msg)
+            self.assertIn(msg, r.stderr)
+            self.assertEqual(read(self.server), read(self.old_src))
+            self.assertFalse(os.path.exists(self.server + ".prev"))
+        self.assertEqual(self.cfg_files(), before)
+        self.assertEqual(self.status()["result"], "failed")
+        self.assertFalse(any(x.startswith("launchctl") for x in self.calls()))
+
+    def test_update_without_install_fails_and_creates_nothing(self):
+        r = self.update()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("설정이 없다", r.stderr)
+        self.assertFalse(os.path.exists(self.cfg_dir))
+        self.assertFalse(os.path.exists(self.server))
+
+    def test_update_reregisters_hooks_unless_installed_without(self):
+        self.install_old()
+        claude = os.path.join(self.home, ".claude")
+        os.makedirs(claude)
+        r = self.update()
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertIn("sheltie.py\\\" hook claude", read(os.path.join(claude, "settings.json")))
+
+    def test_update_respects_no_hooks_install(self):
+        self.install_old("--no-hooks")
+        self.assertIs(read_json(os.path.join(self.cfg_dir, "config.json"))["hooks"], False)
+        claude = os.path.join(self.home, ".claude")
+        os.makedirs(claude)
+        r = self.update()
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertFalse(os.path.exists(os.path.join(claude, "settings.json")))
+        # 훅과 함께 다시 설치하면 표시를 지운다
+        r = self.run_install(SHELTIE_SRC=self.new_src)
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertNotIn("hooks", read_json(os.path.join(self.cfg_dir, "config.json")))
+
+    def test_no_auto_update_option_kept_on_reinstall(self):
+        self.install_old("--no-auto-update")
+        cfg = os.path.join(self.cfg_dir, "config.json")
+        self.assertIs(read_json(cfg)["auto_update"], False)
+        r = self.run_install(SHELTIE_SRC=self.old_src)
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertIs(read_json(cfg)["auto_update"], False)
+
+    def test_default_install_has_no_auto_update_key(self):
+        self.install_old()
+        self.assertNotIn("auto_update", read_json(os.path.join(self.cfg_dir, "config.json")))
+
+    def test_update_dry_run_changes_nothing(self):
+        self.install_old()
+        before = read(self.server)
+        r = self.run_install("--update", "--dry-run", SHELTIE_SRC=self.new_src)
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertEqual(read(self.server), before)
+        self.assertFalse(os.path.exists(self.status_path))
+        self.assertFalse(any(x.startswith("launchctl") for x in self.calls()))
+
+    def test_system_plist_update_uses_kickstart(self):
+        self.install_old()
+        os.makedirs(self.sys_dir)
+        with open(os.path.join(self.sys_dir, "com.hyperfocuslab.sheltie.plist"), "w") as f:
+            f.write("<plist/>")
+        r = self.update()
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertEqual([x for x in self.calls() if x.startswith("launchctl")],
+                         ["launchctl kickstart -k gui/%s/com.hyperfocuslab.sheltie" % os.getuid()])
+
+    def test_test_label_used_for_service_and_passed_to_server(self):
+        r = self.run_install(SHELTIE_SRC=self.old_src, SHELTIE_LABEL="agent-sheltie-test")
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        p = os.path.join(self.home, "Library/LaunchAgents/agent-sheltie-test.plist")
+        text = read(p)
+        self.assertIn("<string>agent-sheltie-test</string>", text)
+        self.assertIn("<key>SHELTIE_LABEL</key><string>agent-sheltie-test</string>", text)
+        self.assertIn("launchctl bootstrap gui/%s %s" % (os.getuid(), p), self.calls())
+        self.assertFalse(any("com.hyperfocuslab.sheltie" in x for x in self.calls()))
+        self.assertEqual(self.run_install(SHELTIE_LABEL="bad label;x").returncode, 2)
+
+    # ---- 서비스 다시 올리기(bootout은 비동기: 끝날 때까지 기다리고, bootstrap은 다시 시도하고, 안 되면 이전 plist로)
+    def force_reload(self):
+        """설치된 plist를 이 기능 전 모양(HOME 없음)으로 바꿔 다음 업데이트가 bootout+bootstrap하게 한다. 그 plist를 돌려준다."""
+        old = read(self.plist()).replace("    <key>HOME</key><string>%s</string>\n" % self.home, "")
+        with open(self.plist(), "w") as f:
+            f.write(old)
+        return old
+
+    def loaded(self):
+        return os.path.exists(self.health + ".loaded")
+
+    def test_reload_waits_for_async_bootout(self):
+        self.install_old()
+        self.force_reload()
+        r = self.update(BOOTOUT_LAG="2")
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertEqual(self.status()["result"], "ok")
+        self.assertTrue(self.loaded())
+        launch = [x.split()[1] for x in self.calls() if x.startswith("launchctl")]
+        self.assertEqual(launch[0], "bootout")
+        self.assertIn("print", launch)
+        self.assertEqual(launch[-1], "bootstrap")
+        self.assertEqual(launch.count("bootstrap"), 1)  # 내려간 걸 확인한 뒤 한 번에 된다
+
+    def test_reload_retries_bootstrap(self):
+        self.install_old()
+        self.force_reload()
+        r = self.update(BOOTSTRAP_FAILS="2")
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertEqual(self.status()["result"], "ok")
+        self.assertTrue(self.loaded())
+        self.assertEqual([x.split()[1] for x in self.calls() if x.startswith("launchctl bootstrap")],
+                         ["bootstrap"] * 3)
+
+    def test_new_plist_that_never_loads_falls_back_to_previous_plist(self):
+        self.install_old()
+        old_plist = self.force_reload()
+        r = self.update(BOOTSTRAP_FAIL_GREP="<key>HOME</key>")
+        self.assertTrue(self.loaded(), r.stderr + r.stdout)  # 서비스가 내려간 채 끝나지 않는다
+        self.assertEqual(read(self.plist()), old_plist)
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)  # 이전 plist로 새 서버가 떴다
+        self.assertEqual(self.status()["result"], "ok")
+        self.assertEqual(read_json(self.health)["server_version"], "1.0.1")
+
+    def test_rollback_reload_waits_and_service_stays_up(self):
+        self.install_old()
+        self.force_reload()
+        r = self.update(BROKEN="1.0.1", BOOTOUT_LAG="1")
+        self.assertEqual(r.returncode, 3, r.stderr + r.stdout)
+        self.assertTrue(self.loaded())
+        self.assertEqual(read(self.server), read(self.old_src))
+        self.assertEqual(read_json(self.health)["server_version"], "1.0.0")
+        self.assertIn("이전 서버로 되돌렸다", r.stdout)
+
+    # ---- 교체 뒤 쓰기 실패(set -e로 중간에 끝나지 않는다)
+    def test_write_failure_after_replace_still_restarts_and_records(self):
+        self.install_old()
+        self.force_reload()
+        copy = os.path.join(self.home, ".local/share/sheltie/com.hyperfocuslab.sheltie.plist")
+        os.chmod(copy, 0o444)  # 서비스 정의 사본을 못 쓴다(디스크·권한 오류 흉내)
+        r = self.update()
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertEqual(self.status()["result"], "ok")
+        self.assertTrue(self.loaded())
+        self.assertEqual(read_json(self.health)["server_version"], "1.0.1")
+
+    def test_write_failure_during_rollback_still_restarts_and_records(self):
+        self.install_old()
+        self.force_reload()
+        copy = os.path.join(self.home, ".local/share/sheltie/com.hyperfocuslab.sheltie.plist")
+        os.chmod(copy, 0o444)
+        r = self.update(BROKEN="1.0.1")
+        self.assertEqual(r.returncode, 3, r.stderr + r.stdout)
+        st = self.status()
+        self.assertEqual((st["result"], st["transient"]), ("rolled_back", True))
+        self.assertTrue(self.loaded())
+        self.assertEqual(read_json(self.health)["server_version"], "1.0.0")
+
+    def test_keep_prev_failure_is_transient_and_changes_nothing(self):
+        self.install_old()
+        prev = self.server + ".prev"
+        with open(prev, "w") as f:
+            f.write("old")
+        os.chmod(prev, 0o444)
+        r = self.update()
+        self.assertEqual(r.returncode, 1, r.stderr + r.stdout)
+        self.assertEqual(read(self.server), read(self.old_src))
+        st = self.status()
+        self.assertEqual((st["result"], st["transient"]), ("failed", True))
+        self.assertFalse(any(x.startswith("launchctl") for x in self.calls()))
+
+    def test_status_transient_flags(self):
+        self.install_old()
+        r = self.update(self.write_src("same.py", versioned_stub("1.0.0")))
+        self.assertEqual(r.returncode, 1)
+        self.assertIs(self.status()["transient"], False)  # 릴리스가 잘못됐다: 바로 영구
+        r = self.update(BROKEN="1.0.1")
+        self.assertEqual(r.returncode, 3)
+        self.assertIs(self.status()["transient"], True)  # 응답 시간 초과: 다시 해 본다
+
+    def test_default_wait_is_120_seconds(self):
+        self.install_old()
+        env_wait = {"SHELTIE_UPDATE_WAIT": ""}
+        r = self.run_install("--update", "--dry-run", SHELTIE_SRC=self.new_src, **env_wait)
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertIn("120초", r.stdout)
+
+    # ---- 지금 서비스가 쓰는 파이썬을 그대로 쓴다
+    def other_python(self):
+        d = os.path.join(self.tmp, "bin2")
+        os.makedirs(d, exist_ok=True)
+        p = os.path.join(d, "python3")
+        with open(p, "w") as f:
+            f.write('#!/bin/sh\necho "otherpy" >> "$FAKE_LOG"\nexec "%s" "$@"\n' % sys.executable)
+        os.chmod(p, 0o755)
+        return d
+
+    def test_update_uses_service_python_not_path_python(self):
+        self.install_old()
+        plist = read(self.plist())
+        d = self.other_python()
+        r = self.update(PATH=d + ":" + self.bin + ":/usr/bin:/bin")
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertNotIn("otherpy", self.calls())
+        self.assertEqual(read(self.plist()), plist)  # plist(파이썬 경로)가 그대로라 다시 올리지 않았다
+        self.assertIn(os.path.join(self.bin, "python3"), read(os.path.join(self.home, ".local/bin/sheltie")))
+
+    def test_update_finds_python_when_service_python_missing(self):
+        self.install_old()
+        with open(self.plist(), "w") as f:
+            f.write(read(self.plist()).replace(os.path.join(self.bin, "python3"), os.path.join(self.tmp, "gone/python3")))
+        d = self.other_python()
+        r = self.update(PATH=d + ":" + self.bin + ":/usr/bin:/bin")
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertIn("otherpy", self.calls())
+        self.assertIn(os.path.join(d, "python3"), read(self.plist()))
+
+    def test_plist_sets_home(self):
+        self.install_old()
+        self.assertIn("<key>HOME</key><string>%s</string>" % self.home, read(self.plist()))
+        self.assertNotIn("SHELTIE_LABEL", read(self.plist()))
+
 
 
 OLD_LABEL = "com.hyperfocuslab.herdr-remote"  # 이전 설치 이름: 옮기기 시험용
@@ -1270,6 +1699,7 @@ class InstallMigrateTest(InstallTest):
 for _n in [n for n in dir(InstallTest) if n.startswith("test_")]:
     setattr(InstallHooksTest, _n, None)  # 상속된 기존 테스트는 InstallTest에서 이미 돈다
     setattr(InstallMigrateTest, _n, None)
+    setattr(InstallUpdateTest, _n, None)
 
 
 if __name__ == "__main__":
