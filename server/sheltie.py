@@ -6133,6 +6133,16 @@ class ApnsPusher:
                 sent += 1
         return sent
 
+    def can_reach(self, device):
+        """보내 보지 않고, 이 기기에 알림을 보낼 설정이 갖춰졌는가(훅 붙잡기가 본다).
+        알림 권한이 꺼진 폰은 서버가 알 수 없어 True로 본다."""
+        if device.get("env") == FCM_ENV:
+            return self._fcm_pusher() is not None and bool(device.get("relay_sig"))
+        return self._can_reach_apns(device)
+
+    def _can_reach_apns(self, device):
+        return self.available()
+
     def push_device(self, device, payload, ttl=None):
         """기기 하나에만 보낸다(시험 알림). 반환: (http_code, reason). 예외는 (0, 예외 이름)."""
         if device.get("env") == FCM_ENV:
@@ -6218,6 +6228,9 @@ class RelayPusher(ApnsPusher):
 
     def available(self):
         return bool(self._url)
+
+    def _can_reach_apns(self, device):
+        return bool(self._url) and bool(device.get("relay_sig"))  # 서명 없으면 send_one이 건너뛴다
 
     def _new_conn(self):
         cls = http.client.HTTPSConnection if self._https else http.client.HTTPConnection
@@ -6745,14 +6758,16 @@ def _hook_rule_text(rule):
 
 
 def hook_always_rules(suggestions):
-    """permission_suggestions 중 계속 허용에 쓸 것: type addRules, behavior allow만(addDirectories·setMode는 쓰지 않는다)."""
+    """permission_suggestions 중 계속 허용에 쓸 것: type addRules, behavior allow만(addDirectories·setMode는 쓰지 않는다).
+    destination은 항상 session으로 바꾼다. Claude Code는 보통 localSettings로 제안하는데 그대로 돌려주면
+    설정 파일에 영구 규칙이 남는다. 폰 버튼은 "이 세션 동안 허용"이다(SPEC: 영구 허용은 잠금화면 버튼에 붙이지 않는다)."""
     out = []
     if isinstance(suggestions, list):
         for s in suggestions:
             if (isinstance(s, dict) and s.get("type") == "addRules" and s.get("behavior") == "allow"
                     and isinstance(s.get("rules"), list) and s["rules"]
                     and all(_hook_rule_text(r) for r in s["rules"])):
-                out.append(s)
+                out.append(dict(s, destination="session"))
     return out
 
 
@@ -6845,7 +6860,7 @@ def hook_permission_hold(agent, body):
             options.append(("%s: %s" % (OPENCODE_PERM_LABELS[1], ", ".join(perms))[:300], None))
         else:
             rules = [_hook_rule_text(r) for s in perms for r in s["rules"]]
-            options.append(("Yes, and don't ask again for %s" % ", ".join(rules)[:300], None))
+            options.append(("Yes, and don't ask again this session for %s" % ", ".join(rules)[:300], None))
     reject = len(options)
     options.append((no, None))
     p = _finish("approval", title, question, text or hook_tool_body(tool, inp), options, selected=0,
@@ -8090,8 +8105,24 @@ class App:
         self._flush()
         log.info("훅 세션 끝 %s (%s)", tid, reason)
 
+    def _hook_push_reachable(self):
+        """알림을 보낼 수 있는 등록 기기가 한 대라도 있는가. 없으면 붙잡아 봐야 PC만 최대 9분 기다린다."""
+        can = getattr(self.pusher, "can_reach", None)
+        for d in self.devices.list():
+            try:
+                if can is None or can(d):
+                    return True
+            except Exception:  # noqa: BLE001 - 판정 오류면 붙잡는 쪽(지금까지 동작)으로
+                log.exception("알림 가능 판정 오류")
+                return True
+        return False
+
     def _hook_hold(self, tid, hold, alive):
-        """폰 답·연결 끊김·시간 초과 중 먼저 오는 것까지 이 요청(스레드)을 붙잡는다."""
+        """폰 답·연결 끊김·시간 초과 중 먼저 오는 것까지 이 요청(스레드)을 붙잡는다.
+        알림 받을 기기가 없으면 붙잡지 않고 바로 {}(터미널 대화상자)."""
+        if not self._hook_push_reachable():
+            log.info("훅 붙잡지 않음 %s %s: 알림 받을 기기 없음", tid, hold.event_name)
+            return {}
         if self.hooks.add_hold(tid, hold):
             self._hook_observe(tid)
         log.info("훅 붙잡기 %s %s %s", tid, hold.event_name, hold.tool_name)

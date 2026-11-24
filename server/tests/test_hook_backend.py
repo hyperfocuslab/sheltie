@@ -50,6 +50,7 @@ class HookBase(unittest.TestCase):
         self.tmp = tempfile.mkdtemp()
         self.home = os.path.realpath(tempfile.mkdtemp())
         self.app, self.hc, self.pusher = base.make_app(self.tmp, home=self.home)
+        self.app.devices.add("ab" * 32, "sandbox")  # 알림 받을 기기가 있어야 붙잡는다
         self.hc.add("t1", base.st("working"))
         self.srv = hr.make_server(self.app, "127.0.0.1", 0)
         self.port = self.srv.server_address[1]
@@ -160,14 +161,32 @@ class PermissionTests(HookBase):
         box = self.hook_bg("claude", body)
         p = self.blocked(tid)
         self.assertEqual(p["always_index"], 1)
-        self.assertEqual(p["options"][1]["label"], "Yes, and don't ask again for Bash(npm test)")
+        self.assertEqual(p["options"][1]["label"], "Yes, and don't ask again this session for Bash(npm test)")
         self.assertEqual(self.pusher.payloads[-1]["aps"]["category"], "HR_PERMISSION_ALWAYS")
         self.assertEqual(self.answer(tid, {"action": "always"})[1]["error"], "needs_prompt_id")
         self.assertEqual(self.answer(tid, {"action": "always", "prompt_id": p["id"]})[0], 200)
         self.assertEqual(self.result(box)[1], {"hookSpecificOutput": {
             "hookEventName": "PermissionRequest", "decision": {"behavior": "allow", "updatedPermissions": [
                 {"type": "addRules", "rules": [{"toolName": "Bash", "ruleContent": "npm test"}],
-                 "behavior": "allow", "destination": "localSettings"}]}}})
+                 "behavior": "allow", "destination": "session"}]}}})
+
+    def test_always_rules_stay_in_session(self):
+        # "이 세션 동안 허용"이 설정 파일에 영구 규칙으로 남지 않게: 어느 destination이든 session으로 돌려준다.
+        rule = {"type": "addRules", "rules": [{"toolName": "Bash", "ruleContent": "ls"}], "behavior": "allow"}
+        sugg = [dict(rule, destination=d) for d in ("localSettings", "projectSettings", "userSettings", "session")]
+        sugg.append(dict(rule))  # destination 없음
+        out = hr.hook_always_rules(sugg)
+        self.assertEqual([s["destination"] for s in out], ["session"] * 5)
+        self.assertEqual(sugg[0]["destination"], "localSettings")  # 입력은 그대로
+        body = load("claude-permission-addrules-doc.json")
+        for s in body["permission_suggestions"]:
+            s["destination"] = "userSettings"
+        tid = self.tid_of(body)
+        box = self.hook_bg("claude", body)
+        p = self.blocked(tid)
+        self.assertEqual(self.prompt_answer(tid, {"prompt_id": p["id"], "option_index": p["always_index"]})[0], 200)
+        perms = self.result(box)[1]["hookSpecificOutput"]["decision"]["updatedPermissions"]
+        self.assertEqual({x["destination"] for x in perms}, {"session"})
 
     def test_claude_always_via_card_option(self):
         body = load("claude-permission-addrules-doc.json")
@@ -305,6 +324,63 @@ class PermissionTests(HookBase):
         self.assertEqual((r["reminder"], r["prompt_id"], r["aps"]["category"]), (1, p["id"], "HR_PERMISSION"))
         self.answer(tid, {"action": "reject"})
         self.result(box)
+
+
+class NoDeviceTests(HookBase):
+    """알림 받을 기기가 없으면 붙잡지 않고 바로 {}(PC 대화상자)."""
+
+    def no_devices(self):
+        for d in self.app.devices.list():
+            self.app.devices.remove(d["token"])
+
+    def assert_not_held(self, agent, body):
+        t0 = time.monotonic()
+        self.assertEqual(self.hook(agent, body), (200, {}))
+        self.assertLess(time.monotonic() - t0, 2)
+        tid = self.tid_of(body)
+        self.assertIsNone(self.app.hooks.current_prompt(tid))
+        self.assertEqual(self.app.hooks.queued(tid), 0)
+
+    def test_no_devices_permission_not_held(self):
+        self.no_devices()
+        self.assert_not_held("claude", load("claude-permission-bash-2.1.329.json"))
+        self.assertEqual(self.pusher.payloads, [])
+
+    def test_no_devices_question_not_held(self):
+        self.no_devices()
+        self.assert_not_held("claude", load("claude-ask-single-doc.json"))
+
+    def test_unreachable_devices_not_held(self):
+        self.pusher.can_reach = lambda d: False
+        self.assert_not_held("claude", load("claude-permission-bash-2.1.329.json"))
+
+    def test_one_reachable_device_holds(self):
+        self.app.devices.add("cd" * 32, "production")
+        self.pusher.can_reach = lambda d: d["token"] == "cd" * 32
+        body = load("claude-permission-bash-2.1.329.json")
+        box = self.hook_bg("claude", body)
+        p = self.blocked(self.tid_of(body))
+        self.assertEqual(self.answer(self.tid_of(body), {"action": "approve", "prompt_id": p["id"]})[0], 200)
+        self.assertEqual(self.result(box)[1]["hookSpecificOutput"]["decision"], {"behavior": "allow"})
+
+    def test_pusher_can_reach(self):
+        apns = {"token": "ab" * 32, "env": "production"}
+        fcm = {"token": "x" * 40, "env": hr.FCM_ENV}
+        signed = lambda d: dict(d, relay_sig="s")  # noqa: E731
+        cfg = dict(hr.DEFAULTS, apns_key_path=os.path.join(self.tmp, "nokey.p8"), fcm_relay_url="")
+        ap = hr.ApnsPusher(cfg, self.app.devices)
+        self.assertFalse(ap.can_reach(apns))  # 키 파일 없음
+        self.assertFalse(ap.can_reach(signed(fcm)))  # 중계 꺼짐
+        open(cfg["apns_key_path"], "w").close()
+        self.assertTrue(ap.can_reach(apns))
+        ap2 = hr.ApnsPusher(dict(cfg, fcm_relay_url="https://relay.invalid"), self.app.devices)
+        self.assertFalse(ap2.can_reach(fcm))  # 서명 없음
+        self.assertTrue(ap2.can_reach(signed(fcm)))
+        rp = hr.RelayPusher(dict(cfg, push_relay_url="https://relay.invalid", fcm_relay_url="https://relay.invalid"),
+                            self.app.devices)
+        self.assertFalse(rp.can_reach(apns))  # 서명 없음(relay_sig_bad로 지워진 경우 포함)
+        self.assertTrue(rp.can_reach(signed(apns)))
+        self.assertTrue(rp.can_reach(signed(fcm)))
 
 
 class QuestionPlanTests(HookBase):
