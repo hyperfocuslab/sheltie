@@ -1374,6 +1374,18 @@ class TranscriptTests(unittest.TestCase):
         turns2, cut2 = hr.parse_transcript(fixture("claude-session-2.1.329.jsonl").split("\n"), 2)
         self.assertEqual((len(turns2), cut2), (2, True))
 
+    def test_injected_blocks_hidden(self):
+        """Claude 앱이 사용자 말 자리에 넣는 system-reminder·side-sessions-event는 보이지 않는다."""
+        only = json.dumps({"type": "user", "message": {"content": [{"type": "text", "text":
+            "<system-reminder>\nLinked sessions now\n</system-reminder>\n\n<side-sessions-event>None of the sessions"
+            " you started is working now.</side-sessions-event>"}]}})
+        mixed = json.dumps({"type": "user", "message": {"content":
+            "<system-reminder>\nCodebase instructions\n</system-reminder>이거 봐줘"}})
+        plain = json.dumps({"type": "user", "message": {"content": [{"type": "text", "text": "<b>태그</b> 그대로"}]}})
+        turns, _ = hr.parse_transcript([only, mixed, plain], 50)
+        self.assertEqual([t["parts"] for t in turns],
+                         [[{"kind": "text", "text": "이거 봐줘"}], [{"kind": "text", "text": "<b>태그</b> 그대로"}]])
+
     def test_caps(self):
         big = json.dumps({"type": "assistant", "message": {"content": [
             {"type": "text", "text": "x" * 9000},

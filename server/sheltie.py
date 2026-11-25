@@ -3451,8 +3451,21 @@ def _strip_ansi(text):
     return text.replace("\x1b", "").replace("\r\n", "\n").replace("\r", "\n")
 
 
+# Claude 앱·Claude Code가 사용자 말 자리에 끼워 넣는 내부 알림 블록. 통째로 지우고 남은 글만 보인다.
+INJECTED_BLOCK_RE = re.compile(
+    r"<(system-reminder|side-sessions-event|ci-monitor-event|task-notification)>.*?</\1>\s*", re.S)
+
+
 def _hidden(text):
     return text.lstrip().startswith(HIDDEN_USER_PREFIXES)
+
+
+def _user_text(text):
+    """사용자 말로 보일 글. 내부 블록을 빼고, 남은 게 없거나 숨길 명령 출력이면 None."""
+    text = INJECTED_BLOCK_RE.sub("", text).strip()
+    if not text or _hidden(text):
+        return None
+    return text
 
 
 CODEX_HIDDEN_USER_PREFIXES = ("<", "# AGENTS.md instructions")
@@ -3831,15 +3844,17 @@ def parse_transcript(lines, limit=50):
         if typ == "user":
             parts = []
             if isinstance(content, str):
-                if content.strip() and not _hidden(content):
-                    parts.append({"kind": "text", "text": _cap(content)})
+                t = _user_text(content)
+                if t:
+                    parts.append({"kind": "text", "text": _cap(t)})
             elif isinstance(content, list):
                 for c in content:
                     if not isinstance(c, dict):
                         continue
                     if c.get("type") == "text" and isinstance(c.get("text"), str):
-                        if c["text"].strip() and not _hidden(c["text"]):
-                            parts.append({"kind": "text", "text": _cap(c["text"])})
+                        t = _user_text(c["text"])
+                        if t:
+                            parts.append({"kind": "text", "text": _cap(t)})
                     elif c.get("type") == "tool_result":
                         t = tools.get(c.get("tool_use_id"))
                         if t is not None:
