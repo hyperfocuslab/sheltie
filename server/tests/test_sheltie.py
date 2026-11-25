@@ -1386,6 +1386,19 @@ class TranscriptTests(unittest.TestCase):
         self.assertEqual([t["parts"] for t in turns],
                          [[{"kind": "text", "text": "이거 봐줘"}], [{"kind": "text", "text": "<b>태그</b> 그대로"}]])
 
+    def test_mid_turn_message_shown(self):
+        """작업 중에 보낸 말(queued_command 첨부)은 그 자리에 사용자 말로 보인다. 이미지는 건너뛴다."""
+        a1 = json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "보는 중"}]}})
+        q = json.dumps({"type": "attachment", "attachment": {"type": "queued_command", "prompt": [
+            {"type": "image", "source": {"type": "base64", "data": "xx"}}, {"type": "text", "text": "여기서 채팅은 못해?"}]}})
+        q2 = json.dumps({"type": "attachment", "attachment": {"type": "queued_command", "prompt": "글만"}})
+        other = json.dumps({"type": "attachment", "attachment": {"type": "hook_success", "content": "x"}})
+        a2 = json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "답"}]}})
+        turns, _ = hr.parse_transcript([a1, q, q2, other, a2], 50)
+        self.assertEqual([(t["role"], [p["text"] for p in t["parts"]]) for t in turns],
+                         [("assistant", ["보는 중"]), ("user", ["여기서 채팅은 못해?"]), ("user", ["글만"]),
+                          ("assistant", ["답"])])
+
     def test_caps(self):
         big = json.dumps({"type": "assistant", "message": {"content": [
             {"type": "text", "text": "x" * 9000},

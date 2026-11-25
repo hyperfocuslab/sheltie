@@ -131,7 +131,7 @@ MAX_BODY = 64 * 1024
 # 이 프로세스가 뜬 시각(/api/health의 started). 설치기가 재설치 뒤 응답한 서버가 새 서버인지 대조한다.
 PROCESS_STARTED = time.time()
 # 서버 버전(/api/health의 server_version). 릴리스(ops/release-server.sh)마다 올린다. 자동 업데이트는 이보다 높은 버전만 받는다.
-SERVER_VERSION = "1.0.2"
+SERVER_VERSION = "1.0.3"
 POLL_INTERVAL = 15
 BIND_RETRY = 10
 EVENTS_MAX_BACKOFF = 30
@@ -3834,6 +3834,20 @@ def parse_transcript(lines, limit=50):
         typ = rec.get("type")
         if typ == "response_item":  # Codex rollout 줄
             _codex_record(rec.get("payload"), turns, tools)
+            continue
+        att = rec.get("attachment")
+        if typ == "attachment" and isinstance(att, dict) and att.get("type") == "queued_command":
+            # 작업 중에 보낸 사용자 말. Claude Code는 user 줄 대신 첨부로 남긴다.
+            prompt = att.get("prompt")
+            items = [{"type": "text", "text": prompt}] if isinstance(prompt, str) else prompt
+            parts = []
+            for c in items if isinstance(items, list) else []:
+                if isinstance(c, dict) and c.get("type") == "text" and isinstance(c.get("text"), str):
+                    t = _user_text(c["text"])
+                    if t:
+                        parts.append({"kind": "text", "text": _cap(t)})
+            if parts:
+                turns.append({"role": "user", "parts": parts})
             continue
         if typ not in ("user", "assistant"):
             continue
