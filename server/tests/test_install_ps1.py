@@ -57,6 +57,9 @@ with open(os.environ["FAKE_LOG"], "a", encoding="utf-8") as f:
     f.write(name + " " + " ".join(args) + "\\n")
 if name == "schtasks":
     if args and args[0] == "/End":
+        if os.environ.get("SCHTASKS_END_STDERR") and args[2:3] == [os.environ["SCHTASKS_END_STDERR"]]:
+            sys.stderr.write("ERROR: The system cannot find the file specified.\\r\\n")  # like real /End on a missing task
+            sys.exit(1)
         # like real /End: return at once, the process exits a bit later (never with SCHTASKS_END_NOKILL)
         if os.path.exists(os.environ["FAKE_PIDS"]) and not os.environ.get("SCHTASKS_END_NOKILL"):
             pids = open(os.environ["FAKE_PIDS"]).read().split()
@@ -504,6 +507,19 @@ class InstallPs1Test(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
         self.assertFalse(any(self.pid_alive(x) for x in old), old)
 
+    def test_quiet_command_stderr_not_in_transcript(self):
+        # PS5.1은 2>$null로 버린 네이티브 stderr도 transcript에 남긴다(7950 실측). 없는 작업 /End 오류가 설치 기록에 안 나와야 한다.
+        tr = os.path.join(self.tmp, "transcript.txt")
+        script = ("Start-Transcript -Path '%s' -Force | Out-Null; & '%s'; Stop-Transcript | Out-Null"
+                  % (tr.replace("'", "''"), INSTALL.replace("'", "''")))
+        cmd = [PS, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script]
+        r = subprocess.run(cmd, env=self.env(SCHTASKS_END_STDERR="Sheltie"), capture_output=True, timeout=120)
+        out = r.stdout.decode("utf-8", "replace") + r.stderr.decode("utf-8", "replace")
+        self.assertIn("schtasks /End /TN Sheltie", self.calls())
+        text = open(tr, "rb").read().decode("utf-16" if open(tr, "rb").read(2) == b"\xff\xfe" else "utf-8", "replace")
+        self.assertNotIn("cannot find the file", text)
+        self.assertNotIn("cannot find the file", out)
+
     def test_old_server_health_is_not_success(self):
         # started가 설치 시작보다 이른 서버(옛 서버)만 답하면 실패로 본다.
         r = self.run_install(STUB_OLD_STARTED="1")
@@ -890,6 +906,19 @@ class InstallPs1MigrateTest(InstallPs1Test):
         self.assertFalse(os.path.exists(self.new_cfg_dir))
         self.assertTrue(os.path.exists(self.old_server))
         self.assertFalse(any(x.startswith("schtasks") for x in self.calls()), self.calls())
+
+    def test_old_folder_removed_while_old_server_still_exiting(self):
+        # 7950: 옛 서버가 아직 끝나는 중이면(작업 폴더가 옛 설치 폴더) 폴더가 빈 채로 남았다
+        self.make_old_install(hooks=False)
+        holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)", self.old_server],
+                                  cwd=self.old_data)
+        try:
+            r = self.run_install()
+        finally:
+            holder.kill()
+            holder.wait()
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertFalse(os.path.exists(self.old_data))
 
     def test_uninstall_also_removes_old_task(self):
         self.make_old_install()

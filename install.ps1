@@ -599,9 +599,12 @@ except Exception:
     throw 'HRExit'
   }
   # Mutating commands run only through here. With dry-run it just prints.
+  # Drop native stderr lines merged with 2>&1 (see Run).
+  filter NoErr { if ($_ -isnot [System.Management.Automation.ErrorRecord]) { $_ } }
   function Run([string]$Exe, [string[]]$A, [switch]$Quiet) {
     if ($DRY) { Say ('+ ' + ((@($Exe) + $A) -join ' ')); return 0 }
-    if ($Quiet) { & $Exe @A 2>$null | Out-Null } else { & $Exe @A | Out-Host }
+    # 2>&1 | Out-Null, not 2>$null: PS5.1 still writes 2>$null native stderr to a transcript (7950 measured).
+    if ($Quiet) { & $Exe @A 2>&1 | Out-Null } else { & $Exe @A | Out-Host }
     return $LASTEXITCODE
   }
   # Add/remove our hook entries in ~/.claude/settings.json, ~/.codex/hooks.json, ~/.qwen/settings.json and write/remove
@@ -625,7 +628,7 @@ except Exception:
         $pa = @($script, $Act, $agent, $file, $Py, $SERVER, 'windows')
         if ($DRY) { $pa += 'dry' }
         $res = 'error'
-        try { $res = "$(& $Py @pa 2>$null | Select-Object -First 1)".Trim() } catch { $res = 'error' }
+        try { $res = "$(& $Py @pa 2>&1 | NoErr | Select-Object -First 1)".Trim() } catch { $res = 'error' }
         switch ($res) {
           'added' { Say (T 'hk_added' $pre $agent $file) }
           'updated' { Say (T 'hk_updated' $pre $agent $file) }
@@ -659,7 +662,7 @@ except Exception:
     }
     $py = Get-Command py -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($py) {
-      $out = & $py.Source -3 -c 'import sys; print(sys.executable)' 2>$null
+      $out = & $py.Source -3 -c 'import sys; print(sys.executable)' 2>&1 | NoErr
       $exe = "$($out | Select-Object -First 1)".Trim()  # empty output (py launcher but no Python) must not throw
       if ($LASTEXITCODE -eq 0 -and $exe -and (Test-Path -LiteralPath $exe -PathType Leaf)) { return $exe }
     }
@@ -881,7 +884,7 @@ except Exception:
   }
   function Funnel-On {
     # True if Funnel (public internet) is on for this port. False if it cannot be determined.
-    $raw = (& $TS serve status --json 2>$null | Out-String)
+    $raw = (& $TS serve status --json 2>&1 | NoErr | Out-String)
     try { $d = $raw | ConvertFrom-Json } catch { return $false }
     if (-not $d -or -not $d.AllowFunnel) { return $false }
     foreach ($p in $d.AllowFunnel.PSObject.Properties) {
@@ -1002,7 +1005,7 @@ if n != c:
         if (Test-Path -LiteralPath $CONFIG) {
           $fix = Join-Path ([IO.Path]::GetTempPath()) ('fixpaths.' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.py')
           [IO.File]::WriteAllText($fix, $FIXPATHS_PY, (New-Object System.Text.UTF8Encoding($false)))
-          try { & $PY $fix $CONFIG $OLD_CONFIG_DIR $CONFIG_DIR 2>$null | Out-Null; $frc = $LASTEXITCODE } catch { $frc = 1 }
+          try { & $PY $fix $CONFIG $OLD_CONFIG_DIR $CONFIG_DIR 2>&1 | Out-Null; $frc = $LASTEXITCODE } catch { $frc = 1 }
           finally { Remove-Item -LiteralPath $fix -Force -ErrorAction SilentlyContinue }
           if ($frc -ne 0) { Die 1 (T 'mig_fix_fail' $CONFIG $CONFIG_DIR) }
         }
@@ -1031,7 +1034,18 @@ if n != c:
     } elseif ($DRY) {
       Say (T 'dry_delete' $OLD_DATA '')
     } else {
-      Remove-Item -LiteralPath $OLD_DATA -Recurse -Force -ErrorAction SilentlyContinue
+      # The old server can still be exiting (its working folder is $OLD_DATA, which blocks deleting the folder):
+      # end what is left of it, then retry for a few seconds (7950: an empty folder stayed behind).
+      foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name like 'python%'" -ErrorAction SilentlyContinue)) {
+        $cl = [string]$p.CommandLine
+        if ($cl.IndexOf($OLD_SERVER, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and -not ($cl -match '\shook(\s|$)')) {
+          Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+      }
+      for ($i = 0; $i -lt 20 -and (Test-Path -LiteralPath $OLD_DATA); $i++) {
+        Remove-Item -LiteralPath $OLD_DATA -Recurse -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $OLD_DATA) { Start-Sleep -Milliseconds 500 }
+      }
     }
   }
   function Fill-Template([string]$Text, $Map) {
@@ -1118,7 +1132,7 @@ if n != c:
     if (-not (Test-Path -LiteralPath $SERVER -PathType Leaf)) { Update-Fail (T 'upd_noserver' $SERVER) }
     $src = $env:SHELTIE_SRC
     if (-not $src -or -not (Test-Path -LiteralPath $src -PathType Leaf)) { Update-Fail (T 'upd_nosrc' $src) }
-    & $PY -c "import sys; compile(open(sys.argv[1], encoding='utf-8-sig').read(), sys.argv[1], 'exec')" $src 2>$null | Out-Null
+    & $PY -c "import sys; compile(open(sys.argv[1], encoding='utf-8-sig').read(), sys.argv[1], 'exec')" $src 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) { Update-Fail (T 'upd_badpy' $src) -Permanent }
     $script:NEWV = Server-Version $src
     if (-not $script:NEWV) { Update-Fail (T 'upd_nover' $src) -Permanent }
@@ -1292,7 +1306,7 @@ if n != c:
     if ($MODE -eq 'update') { $PY = Task-Python }
     if (-not $PY) { $PY = Find-Python }
     if (-not $PY) { Die 1 (T 'no_python') }
-    & $PY -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' 2>$null | Out-Null
+    & $PY -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) { Die 1 (T 'old_python' $PY) }
     $PYW = Join-Path (Split-Path -Parent $PY) 'pythonw.exe'
     if (-not (Test-Path -LiteralPath $PYW -PathType Leaf)) { $PYW = $PY }
@@ -1307,7 +1321,7 @@ if n != c:
       if (-not $TS) { Die 1 (T 'no_ts') }
       $running = $false
       try {
-        $st = (& $TS status --json 2>$null | Out-String) | ConvertFrom-Json
+        $st = (& $TS status --json 2>&1 | NoErr | Out-String) | ConvertFrom-Json
         $running = ($st.BackendState -eq 'Running')
       } catch {}
       if (-not $running) { Die 1 (T 'ts_logged_out') }
@@ -1348,7 +1362,7 @@ if n != c:
           Copy-Item -LiteralPath $SRC -Destination $tmp -Force
         }
         if (-not (Test-Path -LiteralPath $tmp) -or (Get-Item -LiteralPath $tmp).Length -eq 0) { Die 1 (T 'src_empty' $SRC) }
-        & $PY -c "import sys; compile(open(sys.argv[1], encoding='utf-8-sig').read(), sys.argv[1], 'exec')" $tmp 2>$null | Out-Null
+        & $PY -c "import sys; compile(open(sys.argv[1], encoding='utf-8-sig').read(), sys.argv[1], 'exec')" $tmp 2>&1 | Out-Null
         if ($LASTEXITCODE -ne 0) { Die 1 (T 'src_badpy' $SRC) }
         if ($SRC -eq $DEFAULT_SRC) {
           # Must match the release manifest (the installed server checks the manifest signature on updates).
@@ -1429,7 +1443,7 @@ if n != c:
         throw 'HRExit'
       }
       $stText = ''
-      if (-not $DRY) { $stText = (& $TS serve status 2>$null | Out-String) }
+      if (-not $DRY) { $stText = (& $TS serve status 2>&1 | NoErr | Out-String) }
       if (-not $DRY -and $stText.Contains(":$PORT ") -and $stText.Contains("proxy http://127.0.0.1:$PORT")) {
         Say (T 'serve_exists' $PORT)
       } else {
