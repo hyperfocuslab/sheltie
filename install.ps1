@@ -5,6 +5,9 @@
 #   so typing claude gives the phone send/view features. Default: ask on a console (Y), apply when there is none. -NoWrapClaude is
 #   kept as config wrap_claude: false: reinstall then neither asks nor adds, and removes an old block (delete the key to be asked again).
 #   The function lives only between `# >>> sheltie: claude >>>` and `# <<< sheltie: claude <<<` and -Uninstall removes just that.
+#   A profile is only written when the execution policy of the shell that reads it allows profiles (RemoteSigned, Unrestricted, Bypass; Process scope ignored, all
+#   Undefined = Restricted on a Windows client). Otherwise a one-line note is printed, an old block is removed, and the policy is never changed.
+#   Tests replace the lookup with SHELTIE_TEST_EXEC_POLICY, SHELTIE_TEST_EXEC_POLICY_7, SHELTIE_TEST_PRODUCT_TYPE.
 #   Symlinked profiles are not touched. Original claude once: $env:SHELTIE_NO_WRAP=1 or & (Get-Command claude -CommandType Application).
 #   -Update (auto-update) never touches the profiles.
 #   -NoAutoUpdate: turn off server auto-update (config auto_update: false; kept on reinstall).
@@ -213,6 +216,7 @@
     wrap_cfg_fail = '6rK96rOgOiDshKTsoJXsl5Agd3JhcF9jbGF1ZGXrpbwg64Ko6riw7KeAIOuqu+2WiOuLpCh7MH0pLg==' # wrap_cfg_fail
     wrap_done = 'Y2xhdWRlIO2VqOyImOuKlCDsg4ggUG93ZXJTaGVsbCDssL3rtoDthLAg7KCB7Jqp65Cc64ukKOyngOq4iCDssL3snYAgLiAkUFJPRklMRSkuIOybkOuemCBjbGF1ZGXroZwg652E7Jqw66Ck66m0ICRlbnY6U0hFTFRJRV9OT19XUkFQPTEg7ISk7KCVIO2bhCDsi6TtlontlZjqsbDrgpggJiAoR2V0LUNvbW1hbmQgY2xhdWRlIC1Db21tYW5kVHlwZSBBcHBsaWNhdGlvbiku' # wrap_done
     help8 = 'ICAtTm9XcmFwQ2xhdWRlOiBQb3dlclNoZWxsIO2UhOuhnO2VhOyXkCBjbGF1ZGXrpbwgc2hlbHRpZSBydW4gY2xhdWRl66GcIOqwkOyLuOuKlCDtlajsiJjrpbwg64Sj7KeAIOyViuuKlOuLpCjshKTsoJUgd3JhcF9jbGF1ZGU6IGZhbHNlLCDri6Tsi5wg7ISk7LmY7ZW064+EIOq3uOuMgOuhnCkuIO2ZmOqyveuzgOyImCBTSEVMVElFX05PX1dSQVBfQ0xBVURFPTEuIOq4sOuzuOydgCDthLDrr7jrhJDsl5DshJwg66y76rOgIOuEo+uKlOuLpC4=' # help8
+    wrap_policy = 'ezB9OiBQb3dlclNoZWxsIOyLpO2WiSDsoJXssYXsnbQgezF96528IOydtCDtlITroZztlYTsnYQg7J297KeAIOuqu+2VtCBjbGF1ZGUg7ZWo7IiY66W8IOuEo+yngCDslYrripTri6Qo7J6I642YIOu4lOuhneydgCDsp4DsmrTri6QpLiDsvJzroKTrqbQgU2V0LUV4ZWN1dGlvblBvbGljeSAtU2NvcGUgQ3VycmVudFVzZXIgUmVtb3RlU2lnbmVkIOulvCDsi6TtlontlZwg65KkIOyEpOy5mOq4sOulvCDri6Tsi5wg64+M66Ck6528Lg==' # wrap_policy
   }
   # messages end
   function T([string]$Key) {
@@ -943,6 +947,63 @@ function claude {
 }
 # <<< sheltie: claude <<<
 '@
+  # Execution policy of the shell that will read a profile. A profile that policy blocks (Restricted, the Windows client default) makes every new
+  # PowerShell window print a PSSecurityException, so the claude block is only put where the policy allows profiles. This installer never changes a policy.
+  # The Process scope is ignored (this script may run under -ExecutionPolicy Bypass or irm | iex); MachinePolicy, UserPolicy, CurrentUser, LocalMachine, first defined wins.
+  # SHELTIE_TEST_EXEC_POLICY / SHELTIE_TEST_EXEC_POLICY_7 (comma list in that order) and SHELTIE_TEST_PRODUCT_TYPE replace the live lookup. They exist only for tests.
+  function Exec-Effective($Vals, [string]$Default) {
+    foreach ($v in @($Vals)) { $s = ([string]$v).Trim(); if ($s -and $s -ne 'Undefined') { return $s } }
+    return $Default
+  }
+  function Exec-Allows([string]$Pol) { return (@('RemoteSigned', 'Unrestricted', 'Bypass') -contains $Pol) }
+  function Exec-Default([string]$Kind) {
+    # All scopes Undefined: PowerShell 7 on Windows is RemoteSigned. Windows PowerShell 5.1 is Restricted on a client OS and RemoteSigned on a server OS.
+    if ($Kind -eq '7') { return 'RemoteSigned' }
+    $pt = $env:SHELTIE_TEST_PRODUCT_TYPE
+    if (-not $pt) { try { $pt = [string](Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).ProductType } catch { $pt = '1' } }
+    if ($pt -eq '1') { return 'Restricted' }
+    return 'RemoteSigned'
+  }
+  function Exec-Read([string]$Kind) {
+    # The four scope values in order, or $null when they cannot be read (then the default is used).
+    $order = 'MachinePolicy', 'UserPolicy', 'CurrentUser', 'LocalMachine'
+    $map = @{}
+    $tv = $env:SHELTIE_TEST_EXEC_POLICY
+    if ($Kind -eq '7') { $tv = $env:SHELTIE_TEST_EXEC_POLICY_7 }
+    if ($null -ne $tv) {
+      $parts = $tv.Split(',')
+      for ($k = 0; $k -lt 4; $k++) { if ($k -lt $parts.Length) { $map[$order[$k]] = $parts[$k].Trim() } }
+    } elseif (($Kind -eq '5' -and $PSVersionTable.PSVersion.Major -le 5) -or ($Kind -eq '7' -and $PSVersionTable.PSVersion.Major -ge 6)) {
+      try { foreach ($x in (Get-ExecutionPolicy -List)) { $map[[string]$x.Scope] = [string]$x.ExecutionPolicy } } catch { return $null }
+    } else {
+      $exe = ''
+      if ($Kind -eq '5') { $exe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe' }
+      else {
+        $g = Get-Command pwsh -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($g) { $exe = $g.Source } elseif ($env:ProgramFiles) { $exe = Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe' }
+      }
+      if (-not $exe -or -not (Test-Path -LiteralPath $exe -PathType Leaf)) { return $null }
+      try {
+        $psi = New-Object Diagnostics.ProcessStartInfo
+        $psi.FileName = $exe
+        $psi.Arguments = '-NoProfile -NonInteractive -Command "Get-ExecutionPolicy -List | ForEach-Object { [string]$_.Scope + ''='' + [string]$_.ExecutionPolicy }"'
+        $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+        $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
+        $p = [Diagnostics.Process]::Start($psi)
+        $so = $p.StandardOutput.ReadToEndAsync(); $se = $p.StandardError.ReadToEndAsync()
+        if (-not $p.WaitForExit(15000)) { try { $p.Kill() } catch {}; return $null }
+        foreach ($ln in ($so.Result -split "`r?`n")) {
+          if ($ln -match '^(\w+)=(\w+)\s*$') { $map[$Matches[1]] = $Matches[2] }
+        }
+      } catch { return $null }
+    }
+    if ($map.Count -eq 0) { return $null }
+    return @($order | ForEach-Object { $map[$_] })
+  }
+  function Get-ProfilePolicy([string]$Kind) {
+    $vals = Exec-Read $Kind
+    return (Exec-Effective $vals (Exec-Default $Kind))
+  }
   function Wrap-Profiles {
     # Profiles of Windows PowerShell 5.1 (always) and PowerShell 7 (pwsh installed or the file exists), under the real Documents folder (OneDrive-aware).
     $docs = $env:SHELTIE_DOCUMENTS
@@ -952,11 +1013,11 @@ function claude {
     $has7 = [bool](Get-Command pwsh -CommandType Application -ErrorAction SilentlyContinue)
     if (-not $has7 -and $env:ProgramFiles) { $has7 = Test-Path -LiteralPath (Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe') -PathType Leaf }
     return @(
-      @{ Path = (Join-Path $docs 'WindowsPowerShell\Microsoft.PowerShell_profile.ps1'); Make = $true },
-      @{ Path = $ps7; Make = $has7 }
+      @{ Path = (Join-Path $docs 'WindowsPowerShell\Microsoft.PowerShell_profile.ps1'); Make = $true; Kind = '5' },
+      @{ Path = $ps7; Make = $has7; Kind = '7' }
     )
   }
-  function Wrap-One([string]$Path, [string]$Act, [bool]$Make) {
+  function Wrap-One([string]$Path, [string]$Act, [bool]$Make, [bool]$DelEmpty = $false) {
     # Put (replace) or remove the block in one profile. Text outside the block, its encoding (BOM or not, UTF-16) and its newlines stay.
     # Written to a temp file in the same folder and swapped in. A symlinked profile is left alone.
     $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
@@ -1030,6 +1091,12 @@ function claude {
       if ($Act -eq 'install') { Say (T 'wrap_dry_add' $Path) } else { Say (T 'wrap_dry_rm' $Path) }
       return
     }
+    if ($Act -eq 'remove' -and $DelEmpty -and $new.Trim().Length -eq 0) {
+      # Only our block was in the file (and we are taking it out because the policy blocks profiles): the file is ours, an empty profile helps nobody, so delete it.
+      try { Remove-Item -LiteralPath $Path -Force -ErrorAction Stop } catch { [Console]::Error.WriteLine((T 'wrap_fail' $Path $_.Exception.Message)); return }
+      Say (T 'wrap_removed' $Path)
+      return
+    }
     $body = $enc.GetBytes($new)
     $all = New-Object byte[] ($pre.Length + $body.Length)
     [Buffer]::BlockCopy($pre, 0, $all, 0, $pre.Length)
@@ -1053,7 +1120,19 @@ function claude {
     if ($Act -eq 'install') { Say (T 'wrap_added' $Path) } else { Say (T 'wrap_removed' $Path) }
   }
   function Wrap-Apply([string]$Act) {
-    foreach ($e in (Wrap-Profiles)) { Wrap-One $e.Path $Act ([bool]$e.Make) }
+    foreach ($e in (Wrap-Profiles)) {
+      if ($Act -ne 'install') { Wrap-One $e.Path $Act ([bool]$e.Make); continue }
+      $ex = Test-Path -LiteralPath $e.Path -PathType Leaf
+      if (-not ($ex -or $e.Make)) { continue }
+      $pol = Get-ProfilePolicy $e.Kind
+      if (-not (Exec-Allows $pol)) {
+        Say (T 'wrap_policy' $e.Path $pol)
+        Wrap-One $e.Path 'remove' $false $true
+        continue
+      }
+      Wrap-One $e.Path $Act ([bool]$e.Make)
+      $script:WrapAdded++
+    }
   }
   function Wrap-Main {
     # Decide (-NoWrapClaude: no and remember, config wrap_claude false: no, console: ask with default Y, else yes), then add or remove. Returns $true when added.
@@ -1066,7 +1145,7 @@ function claude {
       try { $ans = [string](Read-Host (T 'wrap_ask').TrimEnd()) } catch { $ans = '' }
       if ($ans -match '^[nN]') { $wrap = $false; $save = $true }
     }
-    if ($wrap) { Wrap-Apply 'install'; return $true }
+    if ($wrap) { $script:WrapAdded = 0; Wrap-Apply 'install'; return ($script:WrapAdded -gt 0) }
     if ($save -and -not $DRY) {
       try {
         $c = Read-Config

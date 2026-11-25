@@ -210,6 +210,9 @@ class InstallPs1Test(unittest.TestCase):
             "SHELTIE_PORT": self.port, "SHELTIE_HEALTH_TRIES": "3",
             "SHELTIE_ENV_KEY": "HKCU:\\" + self.subkey, "SHELTIE_HC_URL": self.hc_zip, "SHELTIE_DOCUMENTS": self.docs,
             "SHELTIE_HC_SHA256": self.hc_zip_sha,
+            # 테스트 전용: 실제 실행 정책 대신 쓰는 값(MachinePolicy,UserPolicy,CurrentUser,LocalMachine). 진짜 기기 정책(7950은 모두 Undefined=Restricted)과 상관없이 같은 결과가 나오게 한다.
+            "SHELTIE_TEST_EXEC_POLICY": "Undefined,Undefined,RemoteSigned,Undefined",
+            "SHELTIE_TEST_EXEC_POLICY_7": "Undefined,Undefined,RemoteSigned,Undefined",
         })
         env.update(extra)
         for k in [k for k, v in env.items() if v is None]:
@@ -1305,6 +1308,103 @@ class InstallPs1WrapClaudeTest(InstallPs1Test):
         self.run_install()
         r = self.run_install("-Uninstall")
         self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.rb(self.p5()), b"keep=1\r\n")
+
+    # ---- 실행 정책: 프로필을 못 읽게 막는 정책이면 블록을 넣지 않고(있던 것은 지우고) 안내만 한다.
+    POLICY_NOTE = "실행 정책이"
+
+    def exec_fn(self, expr, env_extra=None):
+        """정책 판정 함수들만 install.ps1에서 꺼내 PowerShell에서 돌린다."""
+        text = read(INSTALL)
+        body = text[text.index("  function Exec-Effective"):text.index("  function Wrap-Profiles")]
+        script = body + "\n[Console]::Out.Write(" + expr + ")"
+        sysroot = os.environ.get("SystemRoot", r"C:\Windows")
+        env = {k: v for k, v in os.environ.items() if not k.startswith("SHELTIE_")}
+        env.update(env_extra or {})
+        r = subprocess.run([PS, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", "-"],
+                           input=script.encode("utf-8"), env=env, capture_output=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr.decode("utf-8", "replace"))
+        return r.stdout.decode("utf-8", "replace")
+
+    def test_policy_effective_first_defined_scope_wins(self):
+        cases = [
+            ("'Undefined','Undefined','Undefined','Undefined'", "Restricted"),
+            ("'Undefined','Undefined','Undefined','RemoteSigned'", "RemoteSigned"),
+            ("'Undefined','Undefined','Restricted','RemoteSigned'", "Restricted"),   # CurrentUser가 LocalMachine보다 먼저
+            ("'Undefined','RemoteSigned','Restricted','Bypass'", "RemoteSigned"),
+            ("'AllSigned','Bypass','Bypass','Bypass'", "AllSigned"),                  # MachinePolicy가 제일 세다
+            ("'Undefined','Undefined','Unrestricted','Restricted'", "Unrestricted"),
+        ]
+        for vals, want in cases:
+            self.assertEqual(self.exec_fn("(Exec-Effective @(%s) 'Restricted')" % vals), want, vals)
+
+    def test_policy_allows_only_remotesigned_unrestricted_bypass(self):
+        for pol, want in (("RemoteSigned", "True"), ("Unrestricted", "True"), ("Bypass", "True"), ("Restricted", "False"),
+                          ("AllSigned", "False"), ("Default", "False"), ("Undefined", "False")):
+            self.assertEqual(self.exec_fn("(Exec-Allows '%s')" % pol), want, pol)
+
+    def test_policy_default_client_restricted_server_remotesigned_ps7_remotesigned(self):
+        self.assertEqual(self.exec_fn("(Exec-Default '5')", {"SHELTIE_TEST_PRODUCT_TYPE": "1"}), "Restricted")
+        self.assertEqual(self.exec_fn("(Exec-Default '5')", {"SHELTIE_TEST_PRODUCT_TYPE": "3"}), "RemoteSigned")
+        self.assertEqual(self.exec_fn("(Exec-Default '7')", {"SHELTIE_TEST_PRODUCT_TYPE": "1"}), "RemoteSigned")
+
+    def test_policy_test_env_list_is_read_in_scope_order(self):
+        e = {"SHELTIE_TEST_PRODUCT_TYPE": "1", "SHELTIE_TEST_EXEC_POLICY": "Undefined,Undefined,Undefined,Undefined",
+             "SHELTIE_TEST_EXEC_POLICY_7": "Undefined,AllSigned,Undefined,Undefined"}
+        self.assertEqual(self.exec_fn("(Get-ProfilePolicy '5')", e), "Restricted")
+        self.assertEqual(self.exec_fn("(Get-ProfilePolicy '7')", e), "AllSigned")
+
+    def test_restricted_policy_creates_no_profile_and_prints_note(self):
+        r = self.run_install(SHELTIE_TEST_EXEC_POLICY="Undefined,Undefined,Undefined,Undefined", SHELTIE_TEST_PRODUCT_TYPE="1")
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertFalse(os.path.exists(self.p5()))
+        self.assertFalse(os.path.exists(self.p7()))
+        self.assertIn(self.POLICY_NOTE, r.stdout)
+        self.assertIn("Restricted", r.stdout)
+        self.assertIn("Set-ExecutionPolicy -Scope CurrentUser RemoteSigned", r.stdout)
+        self.assertNotIn("새 PowerShell 창부터", r.stdout)  # 아무것도 안 넣었으니 안내하지 않는다
+        self.assertNotIn("wrap_claude", read_json(self.cfg_path()))  # 정책 때문에 안 넣은 것은 거절로 기억하지 않는다
+
+    def test_policy_is_judged_per_profile(self):
+        # 5.1은 막히고 7은 허용: 7 프로필만 생긴다(7 프로필 파일이 이미 있는 경우)
+        self.wb(self.p7(), b"x = 1\n")
+        r = self.run_install(SHELTIE_TEST_EXEC_POLICY="Undefined,Undefined,AllSigned,Undefined")
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertFalse(os.path.exists(self.p5()))
+        self.assertEqual(self.count(self.rb(self.p7()).decode("utf-8-sig")), (1, 1))
+        self.assertIn("AllSigned", r.stdout)
+        self.assertIn("새 PowerShell 창부터", r.stdout)
+
+    def test_restricted_policy_removes_old_block_and_deletes_block_only_file(self):
+        self.wb(self.p7(), b"keep = 1\n")
+        self.assertEqual(self.run_install().returncode, 0)
+        self.assertEqual(self.count(self.rb(self.p5()).decode("utf-8-sig")), (1, 1))
+        r = self.run_install(SHELTIE_TEST_EXEC_POLICY="Undefined,Undefined,Restricted,Undefined",
+                             SHELTIE_TEST_EXEC_POLICY_7="Undefined,Undefined,Restricted,Undefined")
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertFalse(os.path.exists(self.p5()))          # 블록뿐이던 파일은 지운다
+        self.assertEqual(self.rb(self.p7()), b"keep = 1\n")  # 남의 내용이 있으면 블록만 지운다
+        self.assertEqual([n for n in os.listdir(os.path.dirname(self.p5())) if n.endswith(".tmp")], [])
+
+    def test_restricted_policy_dry_run_prints_same_note_and_changes_nothing(self):
+        self.assertEqual(self.run_install().returncode, 0)
+        before = self.rb(self.p5())
+        r = self.run_install("-DryRun", SHELTIE_TEST_EXEC_POLICY="Undefined,Undefined,Restricted,Undefined")
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertEqual(self.rb(self.p5()), before)
+        self.assertIn(self.POLICY_NOTE, r.stdout)
+        self.assertIn(self.p5(), r.stdout)
+        os.remove(self.p5())
+        r = self.run_install("-DryRun", SHELTIE_TEST_EXEC_POLICY="Undefined,Undefined,Restricted,Undefined")
+        self.assertIn(self.POLICY_NOTE, r.stdout)
+        self.assertFalse(os.path.exists(self.p5()))
+
+    def test_uninstall_ignores_policy(self):
+        self.wb(self.p5(), b"keep=1\r\n")
+        self.run_install()
+        r = self.run_install("-Uninstall", SHELTIE_TEST_EXEC_POLICY="Undefined,Undefined,Restricted,Undefined")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn(self.POLICY_NOTE, r.stdout)
         self.assertEqual(self.rb(self.p5()), b"keep=1\r\n")
 
     def test_wrap_dry_run_changes_nothing(self):
