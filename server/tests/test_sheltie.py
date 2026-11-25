@@ -23,6 +23,7 @@ import sheltie as hr  # noqa: E402
 
 hr.log.addHandler(logging.NullHandler())
 hr.log.propagate = False
+hr.pc_idle_sec = lambda: None  # 테스트 중 실제 PC 입력(ioreg)을 보지 않는다: 모름 → 끝남 알림은 전처럼 보낸다
 
 TOKEN = "test-token-0123456789abcdefghij"
 FIX = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")

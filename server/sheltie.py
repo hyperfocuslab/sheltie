@@ -132,7 +132,7 @@ MAX_BODY = 64 * 1024
 # 이 프로세스가 뜬 시각(/api/health의 started). 설치기가 재설치 뒤 응답한 서버가 새 서버인지 대조한다.
 PROCESS_STARTED = time.time()
 # 서버 버전(/api/health의 server_version). 릴리스(ops/release-server.sh)마다 올린다. 자동 업데이트는 이보다 높은 버전만 받는다.
-SERVER_VERSION = "1.0.5"
+SERVER_VERSION = "1.0.6"
 POLL_INTERVAL = 15
 BIND_RETRY = 10
 EVENTS_MAX_BACKOFF = 30
@@ -140,6 +140,9 @@ JWT_TTL = 50 * 60
 RELAY_TIMEOUT = 10
 RELAY_IDLE_MAX = 60  # 이보다 오래 쉰 연결은 NAT가 조용히 버렸을 수 있어 새로 맺는다
 RELAY_RETRY_WAIT = 1.0  # 중계 5xx 뒤 한 번 다시 보내기 전 쉬는 시간(초)
+PRESENCE_QUIET_SEC = 120  # PC 입력이 이 초 안에 있었으면 끝남 알림을 보내지 않는다. config presence_quiet_sec(0이면 끔)
+PRESENCE_CACHE_SEC = 5  # PC 입력 시각을 다시 읽지 않고 쓰는 시간(초). 끝남이 몰려도 ioreg를 여러 번 띄우지 않게
+PRESENCE_CMD_TIMEOUT = 2
 REMINDER_AFTER_SEC = (300, 1800)  # 막힘 첫 알림 뒤 다시 알릴 시점(초). config reminder_after_sec로 바꾼다
 PUSH_STATUS_FILE = "push_status.json"
 PUSH_FAILING_WINDOW_MS = 24 * 3600 * 1000
@@ -6401,12 +6404,16 @@ class Tracker:
     - gate_done을 건 터미널(사용자 말을 알 수 있는 훅 세션)은 사용자 말 하나(arm_done)당 done을 한 번만 알린다.
       그 뒤 사용자 말 없이 끝난 턴(백그라운드 작업 알림 등으로 자동으로 깨어난 턴)은 상태만 바꾸고 알리지 않는다.
       서버가 사용자 말을 아직 못 본 터미널은 첫 done을 알린다(다시 켠 뒤 모두 조용해지지 않게).
+    - PC 입력이 quiet_sec 안에 있었으면(presence) done을 보내지 않고 알린 것으로 친다. 입력 시각을 모르면 보낸다.
+      blocked·재알림·exited는 상관없다.
     """
 
-    def __init__(self, notify, prompt_for=None, reminders=None):
+    def __init__(self, notify, prompt_for=None, reminders=None, presence=None, quiet_sec=0):
         self.notify = notify
         self.prompt_for = prompt_for
         self.reminders = reminders
+        self.presence = presence  # () → PC 마지막 입력 뒤 지난 초, 모르면 None
+        self.quiet_sec = quiet_sec  # 입력이 이 초 안에 있었으면 done을 보내지 않는다(0이면 끔)
         self.lock = threading.Lock()
         self.last = {}
         self.done_turn = {}
@@ -6444,6 +6451,13 @@ class Tracker:
                         return None
                     self.done_armed[tid] = False
             else:
+                return None
+        if state == "done" and self.presence is not None and self.quiet_sec > 0:
+            # 사용자가 PC 앞에 있다: 끝남은 화면으로 본다. 위에서 이미 이 turn과 사용자 말 몫(done_armed)을 썼으므로
+            # 알린 것으로 친다. 그래서 사용자가 자리를 뜬 뒤 자동으로 깨어난 턴이 이 말의 끝남을 대신 알리지 않는다.
+            idle = self.presence()
+            if idle is not None and idle < self.quiet_sec:
+                log.info("끝남 알림 생략 %s: PC 사용 중(입력 %d초 전)", tid, int(idle))
                 return None
         prompt = None
         if state == "blocked" and self.prompt_for:
@@ -6500,6 +6514,96 @@ class Tracker:
     def known_claude(self):
         with self.lock:
             return set(self.claude_seen)
+
+
+# ---------------------------------------------------------------- PC 앞에 있는지(마지막 입력)
+
+HID_IDLE_RE = re.compile(r'"HIDIdleTime"\s*=\s*(\d+)')
+
+
+def parse_hid_idle(text):
+    """ioreg -c IOHIDSystem 출력의 HIDIdleTime(나노초)을 초로. 없으면 None."""
+    m = HID_IDLE_RE.search(text or "")
+    return int(m.group(1)) / 1e9 if m else None
+
+
+def win_idle_ms(tick64, last_input):
+    """Windows: GetTickCount64 값과 GetLastInputInfo.dwTime(32비트 GetTickCount)으로 마지막 입력 뒤 밀리초.
+    dwTime은 49.7일마다 0으로 돌아가므로 하위 32비트끼리 2^32 나머지로 뺀다. 켜진 시간보다 길면 엉터리라 None."""
+    if tick64 is None or last_input is None or tick64 < 0:
+        return None
+    idle = ((tick64 & 0xFFFFFFFF) - (last_input & 0xFFFFFFFF)) & 0xFFFFFFFF
+    return idle if idle <= tick64 else None
+
+
+def mac_idle_sec(runner=None):
+    try:
+        p = (runner or subprocess.run)(["ioreg", "-c", "IOHIDSystem", "-d", "4"], capture_output=True, text=True,
+                                       timeout=PRESENCE_CMD_TIMEOUT)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return parse_hid_idle(p.stdout) if p.returncode == 0 else None
+
+
+def win_idle_sec():
+    """서버가 도는 대화형 세션의 마지막 입력만 보인다(다른 세션·서비스 세션이면 엉터리일 수 있다)."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class LASTINPUTINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
+        u32 = ctypes.WinDLL("user32", use_last_error=True)
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        u32.GetLastInputInfo.argtypes = [ctypes.POINTER(LASTINPUTINFO)]
+        u32.GetLastInputInfo.restype = wintypes.BOOL
+        k32.GetTickCount64.argtypes = []
+        k32.GetTickCount64.restype = ctypes.c_ulonglong
+        lii = LASTINPUTINFO(ctypes.sizeof(LASTINPUTINFO), 0)
+        if not u32.GetLastInputInfo(ctypes.byref(lii)):
+            return None
+        ms = win_idle_ms(int(k32.GetTickCount64()), int(lii.dwTime))
+    except (OSError, ValueError, AttributeError, ImportError):
+        return None
+    return ms / 1000.0 if ms is not None else None
+
+
+def pc_idle_sec():
+    """PC 마지막 키보드·마우스 입력 뒤 지난 초. 모르면(실패, 다른 OS) None."""
+    if sys.platform == "darwin":
+        return mac_idle_sec()
+    if IS_WINDOWS:
+        return win_idle_sec()
+    return None
+
+
+class IdleProbe:
+    """pc_idle_sec를 PRESENCE_CACHE_SEC 동안 재사용한다. 재사용할 때는 지난 시간만큼 더한다(모름은 그대로)."""
+
+    def __init__(self, read, clock=time.monotonic, ttl=PRESENCE_CACHE_SEC):
+        self.read = read
+        self.clock = clock
+        self.ttl = ttl
+        self.lock = threading.Lock()
+        self.at = None
+        self.value = None
+
+    def __call__(self):
+        with self.lock:
+            now = self.clock()
+            if self.at is None or now - self.at >= self.ttl:
+                self.value = self.read()
+                self.at = now
+            return None if self.value is None else self.value + (now - self.at)
+
+
+def presence_quiet_sec(cfg):
+    """config presence_quiet_sec: 0 이상 초(0이면 끔). 형식이 틀리면 기본값."""
+    v = cfg.get("presence_quiet_sec", PRESENCE_QUIET_SEC)
+    if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0:
+        return v
+    log.warning("presence_quiet_sec 형식이 틀려 기본값 %s를 쓴다", PRESENCE_QUIET_SEC)
+    return PRESENCE_QUIET_SEC
 
 
 # ---------------------------------------------------------------- 미답 재알림
@@ -7787,7 +7891,9 @@ class App:
         self._screen_sent = {}  # 제목 규칙 없는 "full" 에이전트: tid → 앱에서 메시지를 보낸 시각(SEND_SETTLE)
         self._screen_turns = {}  # "full" 에이전트: tid → 끝남 횟수(Tracker의 turn 대신)
         self._card_states = {}  # card_status 에이전트: tid → 이번 막힘에서 마지막으로 읽은 카드 status
-        self.tracker = Tracker(self._notify, prompt_for=self._prompt_for_push, reminders=self.reminders)
+        self.tracker = Tracker(self._notify, prompt_for=self._prompt_for_push, reminders=self.reminders,
+                               presence=IdleProbe(lambda: pc_idle_sec()),  # 테스트가 pc_idle_sec를 바꾼다
+                               quiet_sec=presence_quiet_sec(cfg))
         self.blocked_since = BlockedSince()
         self.live_activity = LiveActivityStore(
             os.path.join(cfg["_dir"], LIVE_ACTIVITY_FILE) if cfg.get("_dir") else None)
