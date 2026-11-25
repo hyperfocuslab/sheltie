@@ -24,6 +24,13 @@ elif cmd == "pair":
     if os.environ.get("PAIR_FAIL"):
         sys.exit(2)
     print("PAIR-OK")
+elif cmd == "codex-trust":
+    with open(os.environ["FAKE_LOG"], "a") as f:
+        f.write("server codex-trust\\n")
+    if os.environ.get("CODEX_TRUST_FAIL"):
+        print("codex 실행 파일을 찾지 못했다", file=sys.stderr)
+        sys.exit(1)
+    print("Codex 훅 신뢰 등록: 5개")
 '''
 
 FAKE_SH = '#!/bin/sh\necho "$(basename "$0") $*" >> "$FAKE_LOG"\n%s\n'
@@ -759,6 +766,36 @@ class InstallHooksTest(InstallTest):
         self.assertFalse(os.path.exists(self.settings() + ".sheltie-bak"), "원본이 없으면 백업도 없다")
         self.assertIn("새로 시작", r.stdout)
         self.assertEqual(read(self.settings())[:4], '{\n  ')  # 들여쓰기 2칸
+
+    def test_codex_trust_after_codex_hooks(self):
+        os.makedirs(self.codex)
+        r = self.run_install()
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertEqual(self.calls().count("server codex-trust"), 1)
+        self.assertIn("Codex 훅 신뢰 등록: 5개", r.stdout)
+        # 훅이 이미 있어도(unchanged) 다시 신뢰를 확인한다: 예전 설치는 신뢰 없이 훅만 넣었다
+        r = self.run_install()
+        self.assertIn("codex 훅이 이미 등록돼 있다", r.stdout)
+        self.assertEqual(self.calls().count("server codex-trust"), 2)
+
+    def test_codex_trust_failure_warns_and_install_continues(self):
+        os.makedirs(self.codex)
+        r = self.run_install(CODEX_TRUST_FAIL="1")
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertIn("신뢰를 등록하지 못했다(codex 실행 파일을 찾지 못했다)", r.stderr)
+        self.assertIn("/hooks", r.stderr)
+        self.assertTrue(os.path.exists(self.plist()))
+
+    def test_codex_trust_skipped_without_codex_dryrun_nohooks_uninstall(self):
+        os.makedirs(self.claude)
+        self.run_install()
+        self.assertNotIn("server codex-trust", self.calls())
+        os.makedirs(self.codex)
+        r = self.run_install("--dry-run")
+        self.assertIn("(dry-run) Codex에 Sheltie 훅 신뢰 등록", r.stdout)
+        self.run_install("--no-hooks")
+        self.run_install("--uninstall")
+        self.assertNotIn("server codex-trust", self.calls())
 
     def test_agent_dirs_missing_are_skipped(self):
         r = self.run_install()

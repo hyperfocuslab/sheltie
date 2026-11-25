@@ -10759,6 +10759,218 @@ def cmd_run(args, runner=None, attach=None, env=None, cwd=None, hc_path="config"
     return 128 + sig if isinstance(sig, int) else 1
 
 
+# ---- codex-trust: 설치기가 부른다. Codex(CLI·앱)는 config.toml [hooks.state."<key>"] trusted_hash 로 신뢰가
+# 기록된 사용자 훅만 돌린다. 해시는 Codex 버전마다 계산법이 바뀔 수 있어 직접 만들지 않고 `codex app-server`
+# (줄 단위 JSON-RPC)에 hooks/list 로 묻고, Codex TUI(/hooks, codex-rs/tui/src/hooks_rpc.rs)와 같은
+# config/batchWrite 로 우리 훅(sheltie.py … hook codex)만 신뢰한다. 다른 훅은 건드리지 않는다.
+CODEX_TRUST_TIMEOUT = 20.0
+CODEX_HOOK_RE = re.compile(r"""sheltie\.py["'] hook codex(?![\w-])""")
+
+
+def is_sheltie_codex_hook(cmd):
+    return isinstance(cmd, str) and bool(CODEX_HOOK_RE.search(cmd))
+
+
+def _release_key(path):
+    """daemon releases/<ver>-<triple>/ 폴더 이름의 버전 숫자로 정렬한다(0.172.0 > 0.99.0)."""
+    name = os.path.basename(os.path.dirname(os.path.dirname(path)))
+    m = re.match(r"(\d+)\.(\d+)\.(\d+)", name)
+    return tuple(int(x) for x in m.groups()) if m else (-1, -1, -1)
+
+
+def find_codex_bin(env=None):
+    """신뢰를 물을 codex 실행 파일. SHELTIE_CODEX_BIN(테스트) > Codex 앱이 받아 둔 최신 daemon > PATH의 codex >
+    ChatGPT 앱에 든 CLI. 없으면 None."""
+    import glob
+    env = os.environ if env is None else env
+    over = env.get("SHELTIE_CODEX_BIN")
+    if over:
+        return over if os.path.isfile(over) else None
+    exe = "codex.exe" if IS_WINDOWS else "codex"
+    homes = []
+    home = env.get("USERPROFILE" if IS_WINDOWS else "HOME") or os.path.expanduser("~")
+    for h in (env.get("CODEX_HOME"), os.path.join(home, ".codex")):
+        if h and h not in homes:
+            homes.append(h)
+    daemons = []
+    for h in homes:
+        daemons += [p for p in glob.glob(os.path.join(h, "packages", "app-server-daemon", "releases", "*", "bin", exe))
+                    if os.path.isfile(p)]
+    if daemons:
+        return max(daemons, key=_release_key)
+    path_env = env.get("PATH")
+    for name in (("codex.exe", "codex.cmd", "codex") if IS_WINDOWS else ("codex",)):
+        p = shutil.which(name, path=path_env)
+        if p:
+            return p
+    if not IS_WINDOWS:
+        app = "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
+        if os.path.isfile(app):
+            return app
+    return None
+
+
+def _kill_tree(proc):
+    try:
+        if IS_WINDOWS:
+            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=5, **subprocess_kwargs())
+        else:
+            import signal
+            os.killpg(proc.pid, signal.SIGKILL)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
+class _CodexRpcError(Exception):
+    pass
+
+
+def codex_trust_hooks(codex_bin, cwd, timeout=CODEX_TRUST_TIMEOUT, env=None):
+    """우리 Codex 훅을 신뢰로 기록한다. 돌려준다: (새로 신뢰한 수, 이미 신뢰돼 있던 수). 실패는 _CodexRpcError(한 줄 이유).
+    timeout 안에 끝나지 않으면 자식(codex app-server)을 죽이고 실패한다."""
+    import queue
+    deadline = time.monotonic() + timeout
+    kw = subprocess_kwargs(text=True)
+    if not IS_WINDOWS:
+        kw = {"start_new_session": True, "encoding": "utf-8", "errors": "replace"}
+    try:
+        proc = subprocess.Popen([codex_bin, "app-server"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, cwd=cwd, env=env, bufsize=1, **kw)
+    except (OSError, ValueError) as e:
+        raise _CodexRpcError("codex를 실행하지 못했다(%s): %s" % (codex_bin, e))
+    lines = queue.Queue()
+
+    def pump():
+        try:
+            for line in proc.stdout:
+                lines.put(line)
+        except (OSError, ValueError):
+            pass
+        lines.put(None)
+
+    pumper = threading.Thread(target=pump, daemon=True)
+    pumper.start()
+
+    ids = iter(range(1, 100))
+
+    def next_id():
+        return next(ids)
+
+    def send(obj):
+        try:
+            proc.stdin.write(json.dumps(obj) + "\n")
+            proc.stdin.flush()
+        except (OSError, ValueError) as e:
+            raise _CodexRpcError("codex app-server에 쓰지 못했다: %s" % e)
+
+    def call(rid, method, params):
+        send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise _CodexRpcError("codex app-server가 %d초 안에 답하지 않았다(%s)" % (timeout, method))
+            try:
+                line = lines.get(timeout=left)
+            except queue.Empty:
+                continue
+            if line is None:
+                raise _CodexRpcError("codex app-server가 답 없이 끝났다(%s)" % method)
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue  # 로그 같은 다른 줄
+            if not isinstance(msg, dict) or "id" not in msg:
+                continue  # 알림
+            if "method" in msg:  # 서버가 묻는 요청: 받지 않는다고 답해 기다리게 두지 않는다
+                send({"jsonrpc": "2.0", "id": msg["id"], "error": {"code": -32601, "message": "not supported"}})
+                continue
+            if msg.get("id") != rid:
+                continue
+            if msg.get("error") is not None:
+                e = msg["error"]
+                raise _CodexRpcError("%s 실패: %s" % (method, (e.get("message") if isinstance(e, dict) else e)))
+            return msg.get("result")
+
+    def ours():
+        res = call(next_id(), "hooks/list", {"cwds": [cwd]})
+        data = res.get("data") if isinstance(res, dict) else None
+        if not isinstance(data, list):
+            raise _CodexRpcError("hooks/list 응답 형식이 낯설다")
+        found = []
+        for entry in data:
+            hooks = entry.get("hooks") if isinstance(entry, dict) else None
+            for h in hooks if isinstance(hooks, list) else []:
+                if isinstance(h, dict) and is_sheltie_codex_hook(h.get("command")) \
+                        and isinstance(h.get("key"), str) and isinstance(h.get("currentHash"), str):
+                    found.append(h)
+        return found
+
+    try:
+        call(next_id(), "initialize", {"clientInfo": {"name": "sheltie", "version": SERVER_VERSION}})
+        send({"jsonrpc": "2.0", "method": "initialized"})
+        hooks = ours()
+        if not hooks:
+            raise _CodexRpcError("Codex가 Sheltie 훅을 찾지 못했다")
+        todo = {h["key"]: h["currentHash"] for h in hooks if h.get("trustStatus") in ("untrusted", "modified")}
+        already = sum(1 for h in hooks if h.get("trustStatus") in ("trusted", "managed"))
+        if todo:
+            call(next_id(), "config/batchWrite", {
+                "edits": [{"keyPath": "hooks.state",
+                           "value": {k: {"trusted_hash": v} for k, v in todo.items()},
+                           "mergeStrategy": "upsert"}],
+                "filePath": None, "expectedVersion": None, "reloadUserConfig": True})
+            left = [h["key"] for h in ours() if h["key"] in todo and h.get("trustStatus") not in ("trusted", "managed")]
+            if left:
+                raise _CodexRpcError("신뢰를 기록했지만 Codex가 아직 신뢰하지 않는다(%d개)" % len(left))
+        return len(todo), already
+    finally:
+        try:
+            proc.stdin.close()
+        except (OSError, ValueError):
+            pass
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            _kill_tree(proc)
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+        # 읽는 스레드가 끝났을 때만 닫는다(손자가 파이프를 쥐고 있으면 읽기 중 close가 멈출 수 있다)
+        pumper.join(timeout=1)
+        if not pumper.is_alive():
+            try:
+                proc.stdout.close()
+            except (OSError, ValueError):
+                pass
+
+
+def cmd_codex_trust(args, env=None, out=None, err=None, timeout=CODEX_TRUST_TIMEOUT):
+    """sheltie.py codex-trust: 설치기가 Codex 훅을 쓴 뒤 부른다. 성공 0, 실패 1(이유 한 줄은 stderr)."""
+    out = out or sys.stdout
+    err = err or sys.stderr
+    env = dict(os.environ) if env is None else env
+    codex = find_codex_bin(env)
+    if not codex:
+        print("codex 실행 파일을 찾지 못했다", file=err)
+        return 1
+    try:
+        added, already = codex_trust_hooks(codex, os.path.expanduser("~"), timeout=timeout, env=env)
+    except _CodexRpcError as e:
+        print(str(e).replace("\n", " ")[:300], file=err)
+        return 1
+    if added:
+        print("Codex 훅 신뢰 등록: %d개" % added, file=out)
+    else:
+        print("Codex 훅이 이미 신뢰돼 있다(%d개)" % already, file=out)
+    return 0
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     cmd = argv[0] if argv else "serve"
@@ -10766,6 +10978,8 @@ def main(argv=None):
         return cmd_hook(argv[1:])
     if cmd == "run":  # 사용자 터미널: 서버 로그 파일을 열지 않는다
         return cmd_run(argv[1:])
+    if cmd == "codex-trust":  # 설치기가 부른다
+        return cmd_codex_trust(argv[1:])
     setup_logging()
     if cmd == "init":
         init_config()
@@ -10776,7 +10990,7 @@ def main(argv=None):
         return cmd_test_push()
     if cmd == "pair":
         return cmd_pair()
-    print("사용법: sheltie.py [init|serve|test-push|pair|hook <claude|codex|qwen|opencode>|run <에이전트> [인자…]]",
+    print("사용법: sheltie.py [init|serve|test-push|pair|codex-trust|hook <claude|codex|qwen|opencode>|run <에이전트> [인자…]]",
           file=sys.stderr)
     return 2
 

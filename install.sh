@@ -557,6 +557,7 @@ HOOKS_PY_EOF
 hooks_apply() {
   _act=$1; _py=$2
   _dryarg=""; [ "$DRY" != 1 ] || _dryarg=dry
+  _cxhooks=0
   for _t in claude codex qwen opencode; do
     _dir="$HOME/.$_t"; _file="$_dir/settings.json"
     case "$_t" in
@@ -575,7 +576,22 @@ hooks_apply() {
       broken) say "경고: $_file 이 올바른 JSON이 아니라 건드리지 않았다. 고친 뒤 다시 실행해라." >&2 ;;
       *) say "경고: $_t 훅 처리에 실패했다($_file). 설치는 계속한다." >&2 ;;
     esac
+    case "$_t:$_act:$_res" in codex:install:added|codex:install:updated|codex:install:unchanged) _cxhooks=1 ;; esac
   done
+  [ "$_cxhooks" = 1 ] && codex_trust "$_py"
+  return 0
+}
+
+# codex_trust <python>: Codex는 config.toml에 신뢰가 기록된 훅만 돌린다. 설치(동의) = 신뢰로 보고, 서버의
+# codex-trust가 codex app-server에 물어 우리 훅만 신뢰로 기록한다(다른 훅은 건드리지 않는다). 실패해도 설치는 계속한다.
+codex_trust() {
+  if [ "$DRY" = 1 ]; then say "(dry-run) Codex에 Sheltie 훅 신뢰 등록(codex app-server)"; return 0; fi
+  if _ctout=$("$1" "$SERVER" codex-trust 2>&1); then
+    if [ -n "$_ctout" ]; then say "$(printf '%s' "$_ctout" | tail -n 1)"; fi
+  else
+    say "경고: Codex에 Sheltie 훅 신뢰를 등록하지 못했다($(printf '%s' "$_ctout" | tail -n 1)). Codex CLI에서 /hooks, Codex 앱은 설정의 훅 화면에서 Sheltie 훅을 승인해라." >&2
+  fi
+  return 0
 }
 
 # sheltie 명령(~/.local/bin/sheltie)
@@ -1304,7 +1320,7 @@ else
   say "(tailscale 없이 설치해서 pair는 건너뜀)"
 fi
 if [ "$NOHOOKS" != 1 ]; then
-  say "Claude Code·Codex·Qwen Code·OpenCode를 새로 시작해야 훅이 적용된다(Codex는 /hooks 에서 한 번 신뢰해야 한다)."
+  say "Claude Code·Codex·Qwen Code·OpenCode를 새로 시작해야 훅이 적용된다."
 fi
 if [ "$WRAP_DONE" = 1 ] && [ "$DRY" != 1 ]; then
   say "claude 셸 함수는 새 터미널부터 적용된다(지금 터미널은 source ~/.zshrc). 원래 claude로 띄우려면 command claude 또는 SHELTIE_NO_WRAP=1 claude."

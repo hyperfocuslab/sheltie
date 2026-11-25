@@ -139,7 +139,9 @@
     hk_fail = '6rK96rOgOiB7MH0g7ZuFIOyymOumrOyXkCDsi6TtjKjtlojri6QoezF9KS4g7ISk7LmY64qUIOqzhOyGje2VnOuLpC4=' # hk_fail
     hk_nopy = 'cHl0aG9u7J20IOyXhuyWtCDsl5DsnbTsoITtirgg7ZuF7J2AIOq3uOuMgOuhnOuLpC4gJVVTRVJQUk9GSUxFJVwuY2xhdWRlXHNldHRpbmdzLmpzb24sICVVU0VSUFJPRklMRSVcLmNvZGV4XGhvb2tzLmpzb24sICVVU0VSUFJPRklMRSVcLnF3ZW5cc2V0dGluZ3MuanNvbiDsl5DshJwgJ3NoZWx0aWUucHknIGhvb2sg7ZWt66qp7J2ELCAlVVNFUlBST0ZJTEUlXC5jb25maWdcb3BlbmNvZGVccGx1Z2luc1xzaGVsdGllLmpzIOulvCDsp4HsoJEg7KeA7JuM6528Lg==' # hk_nopy
     hk_off = 'KC1Ob0hvb2tzOiDtm4Ug65Ox66GdIOqxtOuEiOucgCk=' # hk_off
-    hk_restart = 'Q2xhdWRlIENvZGXCt0NvZGV4wrdRd2VuIENvZGXCt09wZW5Db2Rl66W8IOyDiOuhnCDsi5zsnpHtlbTslbwg7ZuF7J20IOyggeyaqeuQnOuLpChDb2RleOuKlCAvaG9va3Mg7JeQ7IScIO2VnCDrsogg7Iug66Kw7ZW07JW8IO2VnOuLpCku' # hk_restart
+    hk_restart = 'Q2xhdWRlIENvZGXCt0NvZGV4wrdRd2VuIENvZGXCt09wZW5Db2Rl66W8IOyDiOuhnCDsi5zsnpHtlbTslbwg7ZuF7J20IOyggeyaqeuQnOuLpC4=' # hk_restart
+    cx_trust_dry = 'KGRyeS1ydW4pIENvZGV47JeQIFNoZWx0aWUg7ZuFIOyLoOuisCDrk7HroZ0oY29kZXggYXBwLXNlcnZlcik=' # cx_trust_dry
+    cx_trust_fail = '6rK96rOgOiBDb2RleOyXkCBTaGVsdGllIO2bhSDsi6DrorDrpbwg65Ox66Gd7ZWY7KeAIOuqu+2WiOuLpCh7MH0pLiBDb2RleCBDTEnsl5DshJwgL2hvb2tzLCBDb2RleCDslbHsnYAg7ISk7KCV7J2YIO2bhSDtmZTrqbTsl5DshJwgU2hlbHRpZSDtm4XsnYQg7Iq57J247ZW06528Lg==' # cx_trust_fail
     help5 = 'ICAtTm9Ib29rczogQ2xhdWRlIENvZGXCt0NvZGV4wrdRd2VuIENvZGUg7ZuF6rO8IE9wZW5Db2RlIO2UjOufrOq3uOyduCDrk7HroZ0o7ZW07KCcKeydhCDqsbTrhIjrnIAuIGhj6rCAIOyXhuyWtOuPhCDshKTsuZjripQg6rOE7IaN7ZWc64ukKOqzteyLnSDtm4XsnLzroZzrp4wg64+Z7J6RKS4=' # help5
     port_busy = '7Y+s7Yq4IHswfeydhCjrpbwpIOuLpOuluCDtlITroZzqt7jrnqjsnbQg6rOE7IaNIOyTsOqzoCDsnojri6QuIOq3uCDtlITroZzqt7jrnqjsnYQg64GE6rOgIOuLpOyLnCDsi6TtlontlbTrnbwu' # port still in use
     old_health = '7JibIOyEnOuyhOqwgCDslYTsp4Eg7J2R64u17ZWc64ukLiDsg4gg7ISc67KE66W8IOq4sOuLpOumrOuKlCDspJEuLi4=' # old server answered
@@ -638,6 +640,7 @@ except Exception:
     [IO.File]::WriteAllText($script, $HOOKS_PY, (New-Object System.Text.UTF8Encoding($false)))
     $pre = ''
     if ($DRY) { $pre = '(dry-run) ' }
+    $cxHooks = $false
     try {
       foreach ($agent in @('claude', 'codex', 'qwen', 'opencode')) {
         $dir = Join-Path $env:USERPROFILE ".$agent"
@@ -662,9 +665,36 @@ except Exception:
           'broken' { [Console]::Error.WriteLine((T 'hk_broken' $file)) }
           default { [Console]::Error.WriteLine((T 'hk_fail' $agent $file)) }
         }
+        if ($agent -eq 'codex' -and $Act -eq 'install' -and @('added', 'updated', 'unchanged') -contains $res) { $cxHooks = $true }
       }
     } finally {
       Remove-Item -LiteralPath $script -Force -ErrorAction SilentlyContinue
+    }
+    if ($cxHooks) { Codex-Trust $Py }
+  }
+  # Codex runs only hooks whose trust is recorded in config.toml. Installing = consent: the server's codex-trust asks
+  # `codex app-server` and records trust for our hooks only (others untouched). Failure only warns.
+  function Codex-Trust([string]$Py) {
+    if ($DRY) { Say (T 'cx_trust_dry'); return }
+    $ErrorActionPreference = 'Continue'  # function scope: native stderr lines must not throw
+    $oldUtf8 = $env:PYTHONUTF8
+    $env:PYTHONUTF8 = '1'
+    $lines = @()
+    $rc = 1
+    try {
+      $lines = @(& $Py $SERVER 'codex-trust' 2>&1 | ForEach-Object { "$_" })
+      $rc = $LASTEXITCODE
+    } catch {
+      $lines = @("$($_.Exception.Message)")
+      $rc = 1
+    } finally {
+      $env:PYTHONUTF8 = $oldUtf8
+    }
+    $last = "$(@($lines | Where-Object { "$_".Trim() }) | Select-Object -Last 1)".Trim()
+    if ($rc -eq 0) {
+      if ($last) { Say $last }
+    } else {
+      [Console]::Error.WriteLine((T 'cx_trust_fail' $last))
     }
   }
   function Read-Config([string]$Path = $CONFIG) {

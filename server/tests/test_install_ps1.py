@@ -29,6 +29,13 @@ elif cmd == "pair":
     if os.environ.get("PAIR_FAIL"):
         sys.exit(2)
     print("PAIR-OK")
+elif cmd == "codex-trust":
+    with open(os.environ["FAKE_LOG"], "a", encoding="utf-8") as f:
+        f.write("server codex-trust\\n")
+    if os.environ.get("CODEX_TRUST_FAIL"):
+        print("codex 실행 파일을 찾지 못했다", file=sys.stderr)
+        sys.exit(1)
+    print("Codex 훅 신뢰 등록: 5개")
 elif cmd == "run":
     open(os.environ["ARGV_OUT"], "w").write(json.dumps(sys.argv[1:]))
     sys.exit(int(os.environ.get("RUN_RC", "0")))
@@ -144,7 +151,7 @@ class InstallPs1Test(unittest.TestCase):
         with open(self.helper, "w") as f:
             f.write(FAKE_HELPER)
         self.stub = os.path.join(self.tmp, "stub_server.py")
-        with open(self.stub, "w") as f:
+        with open(self.stub, "w", encoding="utf-8") as f:  # 한국어가 든다: 로케일(cp949)로 쓰지 않는다
             f.write(STUB_SERVER)
         os.makedirs(os.path.join(self.tmp, "hcdir"))  # PATH 밖: PATH에 있으면 SHELTIE_HC가 비어도 찾아버린다
         self.hc = os.path.join(self.tmp, "hcdir", "hc.exe")
@@ -364,6 +371,30 @@ class InstallPs1Test(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual(read_json(cl), {"model": "x", "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "mine"}]}]}})
         self.assertEqual(read_json(cx), {})
+
+    def test_codex_trust_after_codex_hooks(self):
+        cl, cx = self.hook_files()
+        os.makedirs(os.path.dirname(cx))
+        r = self.run_install()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.calls().count("server codex-trust"), 1)
+        self.assertIn("Codex 훅 신뢰 등록: 5개", r.stdout)
+        self.assertNotIn("\ufffd", r.stdout)
+        r = self.run_install(CODEX_TRUST_FAIL="1")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.calls().count("server codex-trust"), 2)
+        self.assertIn("신뢰를 등록하지 못했다(codex 실행 파일을 찾지 못했다)", r.stderr)
+        self.assertIn("/hooks", r.stderr)
+        r = self.run_install("-DryRun")
+        self.assertIn("(dry-run) Codex에 Sheltie 훅 신뢰 등록", r.stdout)
+        self.run_install("-NoHooks")
+        self.run_install("-Uninstall")
+        self.assertEqual(self.calls().count("server codex-trust"), 2)
+
+    def test_codex_trust_skipped_without_codex_dir(self):
+        r = self.run_install()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("server codex-trust", self.calls())
 
     def test_hooks_broken_json_and_nohooks(self):
         cl, cx = self.hook_files()
