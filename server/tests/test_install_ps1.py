@@ -361,6 +361,10 @@ class InstallPs1Test(unittest.TestCase):
         stop = c["hooks"]["Stop"]
         self.assertEqual(stop[0]["hooks"][0]["command"], "mine")
         self.assertEqual([h["command"] for g in stop for h in g["hooks"]].count(want), 1)
+        wait = '& "%s" "%s" hook-wait claude; exit $LASTEXITCODE' % (sys.executable, self.server_path())
+        self.assertEqual([h for g in stop for h in g["hooks"] if "hook-wait" in h["command"]],
+                         [{"type": "command", "command": wait, "shell": "powershell", "asyncRewake": True,
+                           "timeout": 86400}])
         self.assertEqual(c["hooks"]["PermissionRequest"][0]["hooks"][0]["shell"], "powershell")
         x = read_json(cx)
         cmd = x["hooks"]["PermissionRequest"][0]["hooks"][0]["command"]
@@ -865,7 +869,8 @@ class InstallPs1MigrateTest(InstallPs1Test):
         for p in (cl, cx):
             self.assertNotIn("herdr_remote.py", read(p), p)
         stop = [h["command"] for g in read_json(cl)["hooks"]["Stop"] for h in g["hooks"]]
-        self.assertEqual(stop, ["mine", '& "%s" "%s" hook claude' % (sys.executable, self.server_path())])
+        self.assertEqual(stop, ["mine", '& "%s" "%s" hook claude' % (sys.executable, self.server_path()),
+                                '& "%s" "%s" hook-wait claude; exit $LASTEXITCODE' % (sys.executable, self.server_path())])
         self.assertEqual(len(read_json(cx)["hooks"]["Stop"]), 1)
 
     def test_existing_new_config_is_not_overwritten(self):

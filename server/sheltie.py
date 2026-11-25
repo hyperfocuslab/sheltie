@@ -48,6 +48,7 @@ import ipaddress
 import json
 import logging
 import logging.handlers
+import math
 import mimetypes
 import ntpath
 import os
@@ -131,7 +132,7 @@ MAX_BODY = 64 * 1024
 # 이 프로세스가 뜬 시각(/api/health의 started). 설치기가 재설치 뒤 응답한 서버가 새 서버인지 대조한다.
 PROCESS_STARTED = time.time()
 # 서버 버전(/api/health의 server_version). 릴리스(ops/release-server.sh)마다 올린다. 자동 업데이트는 이보다 높은 버전만 받는다.
-SERVER_VERSION = "1.0.3"
+SERVER_VERSION = "1.0.4"
 POLL_INTERVAL = 15
 BIND_RETRY = 10
 EVENTS_MAX_BACKOFF = 30
@@ -3456,16 +3457,28 @@ INJECTED_BLOCK_RE = re.compile(
     r"<(system-reminder|side-sessions-event|ci-monitor-event|task-notification)>.*?</\1>\s*", re.S)
 
 
+# 폰에서 보낸 글(hook-wait가 Stop 훅 stderr로 넣는다, 첫 줄이 이 표시). 이 블록만 사용자 말로 살린다.
+HOOK_WAKE_MARK = "[Sheltie] 폰에서 보낸 메시지:"
+WAKE_BLOCK_RE = re.compile(
+    r'<system-reminder>\s*Stop hook blocking error from command "[^\n]*?": '
+    + re.escape(HOOK_WAKE_MARK) + r"[ \t]*\n(.*?)\s*</system-reminder>", re.S)
+
+
 def _hidden(text):
     return text.lstrip().startswith(HIDDEN_USER_PREFIXES)
 
 
 def _user_text(text):
-    """사용자 말로 보일 글. 내부 블록을 빼고, 남은 게 없거나 숨길 명령 출력이면 None."""
+    """사용자 말로 보일 글. 내부 블록을 빼고(폰에서 보낸 글 블록은 그 글만 남긴다),
+    남은 게 없거나 숨길 명령 출력이면 None."""
+    woke = [m.strip() for m in WAKE_BLOCK_RE.findall(text) if m.strip()]
+    if woke:
+        text = WAKE_BLOCK_RE.sub("", text)
     text = INJECTED_BLOCK_RE.sub("", text).strip()
-    if not text or _hidden(text):
-        return None
-    return text
+    if text and _hidden(text):
+        text = ""
+    text = "\n\n".join(woke + ([text] if text else []))
+    return text or None
 
 
 CODEX_HIDDEN_USER_PREFIXES = ("<", "# AGENTS.md instructions")
@@ -6652,7 +6665,8 @@ class BranchCache:
 # `sheltie.py hook <claude|codex|qwen|opencode>`로 이벤트 JSON을 POST /hook/<agent>에 보낸다.
 # 막힘(PermissionRequest, PreToolUse AskUserQuestion·ExitPlanMode)은 폰 답이 올 때까지 그 요청을 붙잡았다가
 # 결정을 돌려준다. 세션 하나가 터미널 하나(id "h" + session_id 영숫자 끝 12자)이고, App은 MultiBackend로
-# hc 터미널과 같은 자리에서 다룬다. 화면·키·글 보내기·새 작업은 없다(caps []).
+# hc 터미널과 같은 자리에서 다룬다. 화면·키·새 작업은 없다. 글 보내기는 Claude 세션만, Stop 훅 asyncRewake의
+# hook-wait로 깨워서 한다(caps ["send"], 아래 HOOK_WAKE_*).
 
 HOOK_AGENTS = ("claude", "codex", "qwen", "opencode")
 # 우리 훅을 빌려 부르는 다른 에이전트의 표시(Grok Build 1.0.77 실측: GROK_* 환경변수,
@@ -6679,10 +6693,37 @@ HOOK_STALE_SEC = 24 * 3600    # 이 시간 동안 이벤트가 없던 세션은 
 HOOK_REJECT_MSG = "Rejected from phone (Sheltie)"
 HOOK_PROXY_HEADERS = ("Tailscale-User-Login", "Tailscale-User-Name", "X-Forwarded-For")
 HOOK_HOLD_TOOLS = ("AskUserQuestion", "ExitPlanMode")
-HOOK_CAPS = ["read", "keys", "send"]  # hc 터미널이 지원하는 것. 훅 세션은 []
+HOOK_CAPS = ["read", "keys", "send"]  # hc 터미널이 지원하는 것. 훅 세션은 [](깨우기가 되는 Claude 세션만 ["send"])
 HOOK_FREE_TEXT = "Type something."
 HOOK_PLAN_FREE_TEXT = "Tell Claude what to change"
 HOOK_NO_REPLY = object()      # 클라이언트가 이미 끊겼다: 아무것도 쓰지 않는다
+HOOK_WRITTEN = object()       # 응답을 이미 썼다(폰 글 전달: 쓰기가 성공해야 전달 확정)
+# 폰 → 훅 세션 글 보내기(Claude만). Stop 훅 asyncRewake가 `sheltie.py hook-wait claude`를 띄워 두고, 글이 오면
+# stderr에 HOOK_WAKE_MARK + 글을 쓰고 exit 2 → Claude Code가 그 글을 system-reminder로 넣고 세션을 깨운다
+# (2.1.326 실측: `Stop hook blocking error from command "Stop": <stderr>`). 표시 HOOK_WAKE_MARK는 대화 기록 쪽에 있다.
+HOOK_WAKE_AGENTS = ("claude",)
+HOOK_WAIT_HOLD_SEC = 540      # 대기 요청 하나를 붙잡는 상한. 지나면 {"again": true} → 클라이언트가 다시 붙는다
+HOOK_WAIT_MAX_SEC = 86400 - 60  # hook-wait 프로세스 전체 수명(훅 timeout 86400보다 짧게)
+HOOK_WAIT_DOWN_SEC = 120      # 서버가 이만큼 계속 안 닿으면 hook-wait는 조용히 0으로 끝난다
+HOOK_WAIT_BACKOFF = (0.5, 1, 2, 4, 8)
+HOOK_INBOX_MAX = 20           # 세션당 전달 못 한 글 상한
+HOOK_SEND_WAIT = 1.0          # send가 바로 전달됐는지 기다려 보는 시간(초). 넘으면 queued: true
+# hook-wait가 wait 요청 본문에 넣는 자기 표시 {"started": 프로세스 시작 time.time(), "pid": pid}.
+# 서버는 세션마다 본 가장 늦은 started만 대기자로 받는다(옛 Stop의 프로세스가 재접속해 새 것을 밀어내지 않게).
+HOOK_WAIT_STAMP_KEY = "sheltie_wait"
+
+
+def hook_wait_stamp(body):
+    """wait 본문의 (started, pid). 없거나 모양이 틀리면 None(옛 클라이언트: 순서 확인 없이 받는다)."""
+    v = body.get(HOOK_WAIT_STAMP_KEY) if isinstance(body, dict) else None
+    if not isinstance(v, dict):
+        return None
+    t, pid = v.get("started"), v.get("pid")
+    if isinstance(t, bool) or not isinstance(t, (int, float)) or not math.isfinite(t):
+        return None
+    if isinstance(pid, bool) or not isinstance(pid, int):
+        return None
+    return (float(t), pid)
 
 
 def hook_session_tid(session_id):
@@ -6954,6 +6995,14 @@ def hook_plan_hold(agent, body):
                     [_hook_card_id(p, inp, secrets.token_hex(8))])
 
 
+class HookWaiter:
+    """hook-wait 요청 하나(붙잡힌 스레드). end가 정해지면 그 이유로 끝난다. event는 끝남·새 글을 알린다."""
+
+    def __init__(self):
+        self.event = threading.Event()
+        self.end = None
+
+
 class HookBackend:
     """훅 세션 저장소. Hc와 같은 ls/get 모양을 준다(read·keys·send는 MultiBackend가 거절한다)."""
 
@@ -6982,7 +7031,8 @@ class HookBackend:
                     "tid": tid, "session_id": body.get("session_id"), "agent": agent, "cwd": cwd,
                     "name": (os.path.basename(cwd.rstrip("/\\")) or cwd) if cwd else None,
                     "transcript": tp, "base": {"state": "idle", "app": HOOK_APPS[agent]}, "status_ms": int(now * 1000),
-                    "turn": 0, "holds": [], "seen": now}
+                    "turn": 0, "holds": [], "seen": now,
+                    "waiter": None, "inbox": [], "wake_ready": False}
             s["seen"] = now
             if cwd and not s["cwd"]:
                 s["cwd"] = cwd
@@ -7081,16 +7131,101 @@ class HookBackend:
     def remove(self, tid):
         with self.lock:
             s = self.sessions.pop(tid, None)
+            if s is not None:
+                self._end_waiter(s, "session_end")
+                s["inbox"] = []
         for h in (s or {}).get("holds", []):
             self.finish(h, "gone")
         return s
+
+    # --- 폰 글 보내기(깨우기): 세션당 대기자(hook-wait 요청) 하나와 보낼 글 줄
+    @staticmethod
+    def _end_waiter(s, reason):
+        w = s.get("waiter")
+        if w is not None:
+            s["waiter"] = None
+            w.end = reason
+            w.event.set()
+
+    def attach_waiter(self, tid, stamp=None):
+        """새 대기자를 붙인다. 이전 대기자는 superseded로 끝난다. 반환: HookWaiter, 또는 stamp(started, pid)가
+        이 세션에서 본 가장 늦은 것보다 오래됐으면 None(옛 Stop의 프로세스: 붙이지 않는다).
+        같은 started·pid는 같은 프로세스의 재접속이라 받는다."""
+        w = HookWaiter()
+        with self.lock:
+            s = self.sessions[tid]
+            if stamp is not None:
+                latest = s.get("wait_latest")
+                if latest is not None and stamp != latest and stamp[0] <= latest[0]:
+                    return None
+                s["wait_latest"] = stamp
+            self._end_waiter(s, "superseded")
+            s["waiter"] = w
+            s["wake_ready"] = True
+        return w
+
+    def detach_waiter(self, tid, w):
+        with self.lock:
+            s = self.sessions.get(tid)
+            if s is not None and s.get("waiter") is w:
+                s["waiter"] = None
+
+    def end_waiter(self, tid, reason):
+        with self.lock:
+            s = self.sessions.get(tid)
+            if s is not None:
+                self._end_waiter(s, reason)
+
+    def wake_ready(self, tid):
+        """폰에서 글을 보낼 수 있는 훅 세션인가(깨우기 지원 에이전트이고 대기자가 한 번이라도 붙었다)."""
+        with self.lock:
+            s = self.sessions.get(tid)
+            return bool(s and s["agent"] in HOOK_WAKE_AGENTS and s.get("wake_ready"))
+
+    def enqueue(self, tid, text):
+        """보낼 글을 줄 끝에 넣고 대기자를 깨운다. 반환: 전달되면 set되는 Event. 줄이 차면 ApiError 409 queue_full."""
+        item = {"text": text, "done": threading.Event()}
+        with self.lock:
+            s = self.sessions.get(tid)
+            if s is None:
+                raise ApiError(404, "not_found")
+            if len(s["inbox"]) >= HOOK_INBOX_MAX:
+                raise ApiError(409, "queue_full")
+            s["inbox"].append(item)
+            w = s.get("waiter")
+        if w is not None:
+            w.event.set()
+        return item["done"]
+
+    def take(self, tid, w):
+        """대기자 w에게 줄 글(맨 앞)을 꺼낸다. w가 지금 대기자가 아니거나, 줄이 비었거나, 세션이 일하는 중
+        (working이거나 붙잡힌 요청이 있음)이면 None."""
+        with self.lock:
+            s = self.sessions.get(tid)
+            if s is None or s.get("waiter") is not w or w.end or not s["inbox"]:
+                return None
+            if s["holds"] or s["base"].get("state") == "working":
+                return None
+            return s["inbox"].pop(0)
+
+    def requeue(self, tid, item):
+        """전달 실패: 글을 줄 맨 앞으로 되돌린다(세션이 끝났으면 버린다)."""
+        with self.lock:
+            s = self.sessions.get(tid)
+            if s is not None:
+                s["inbox"].insert(0, item)
+
+    def pending(self, tid):
+        with self.lock:
+            s = self.sessions.get(tid)
+            return [i["text"] for i in s["inbox"]] if s else []
 
     def prune(self, max_idle=HOOK_STALE_SEC):
         cut = self.wall() - max_idle
         with self.lock:
             old = [t for t, s in self.sessions.items() if s["seen"] < cut and not s["holds"]]
             for t in old:
-                del self.sessions[t]
+                self._end_waiter(self.sessions.pop(t), "session_end")
         return old
 
     def transcript(self, tid):
@@ -7584,6 +7719,8 @@ class App:
         self.hc = hc  # hc 터미널과 훅 세션을 id로 나눠 준다
         self.hooks = hc.hooks
         self.hook_hold_sec = HOOK_HOLD_SEC
+        self.hook_wait_sec = HOOK_WAIT_HOLD_SEC
+        self.hook_send_wait = HOOK_SEND_WAIT
         self.hook_clock = time.monotonic  # 테스트가 바꾼다(붙잡기 시간 초과)
         self.devices = devices
         self.pusher = pusher
@@ -8103,6 +8240,9 @@ class App:
             # 풀지 않는다: 병렬 도구 요청이 줄 서 있을 수 있다).
             log.info("훅 붙잡기 풀림 %s (%s: PC에서 답함)", tid, ev)
         if ev == "UserPromptSubmit":
+            # PC에서 새 프롬프트: 지난 Stop의 대기자(hook-wait)는 끝낸다. 그 프로세스가 아직 깨우기로 듣는지 모르니
+            # 거기에 주지 않고, 이번 턴의 Stop이 새 대기자를 띄우면 그때 전달한다.
+            self.hooks.end_waiter(tid, "new_turn")
             self.hooks.set_base(tid, "working")
             self._hook_observe(tid)
             return None
@@ -8133,6 +8273,67 @@ class App:
                 return {}
             return self._hook_hold(tid, hold, alive)
         return None
+
+    def hook_wait(self, agent, body, alive=lambda: True, write=None):
+        """POST /hook/<agent>/wait: Stop 훅 asyncRewake의 hook-wait가 폰 글을 기다린다.
+        반환: {"text"}는 write로 이미 썼으면 HOOK_WRITTEN, {"end": 이유}, {"again": true}(붙잡기 상한), HOOK_NO_REPLY.
+        글은 세션이 일하는 중이 아닐 때만 준다. 응답 쓰기가 성공해야 전달 확정이고, 실패·끊김이면 줄 맨 앞으로 되돌린다."""
+        if agent not in HOOK_AGENTS:
+            raise ApiError(404, "no_route")
+        if agent not in HOOK_WAKE_AGENTS:
+            return {"end": "unsupported"}
+        if any(k in body for k in FOREIGN_HOOK_KEYS):
+            return {"end": "foreign"}
+        tid = hook_session_tid(body.get("session_id"))
+        if tid is None or not ID_RE.match(tid):
+            raise ApiError(400, "bad_hook")
+        if self.hooks.has(tid) and self.hooks.get(tid)["agent"] != agent:
+            raise ApiError(409, "agent_mismatch")
+        if self.hooks.touch(tid, agent, body, self.home):
+            self._hook_observe(tid)  # 서버가 다시 뜬 뒤 처음 보는 세션: 기준선(idle)
+        w = self.hooks.attach_waiter(tid, hook_wait_stamp(body))
+        if w is None:
+            log.info("hook-wait 거절 %s: 더 최근 Stop의 대기자가 있다", tid)
+            return {"end": "superseded"}
+        end = self.hook_clock() + self.hook_wait_sec
+        try:
+            while True:
+                w.event.clear()
+                if w.end:
+                    return {"end": w.end}
+                if not alive():
+                    return HOOK_NO_REPLY
+                item = self.hooks.take(tid, w)
+                if item is not None:
+                    return self._hook_deliver(tid, item, alive, write)
+                if self.hook_clock() >= end:
+                    return {"again": True}
+                w.event.wait(HOOK_POLL)
+        finally:
+            self.hooks.detach_waiter(tid, w)
+
+    def _hook_deliver(self, tid, item, alive, write):
+        res = {"text": item["text"]}
+        if write is None:  # 직접 부른 경우(테스트): 반환이 곧 전달
+            ok = True
+        elif not alive():
+            ok = False
+        else:
+            try:
+                write(res)
+                ok = True
+            except (OSError, ValueError):
+                ok = False
+        if not ok:
+            self.hooks.requeue(tid, item)
+            log.info("폰 글 전달 실패 %s: 다시 줄에 넣음", tid)
+            return HOOK_NO_REPLY
+        item["done"].set()
+        # 세션이 깨어나 이 글로 턴을 시작한다(UserPromptSubmit이 오지 않을 수 있다): 다음 Stop까지 작업 중
+        self.hooks.set_base(tid, "working")
+        self._hook_observe(tid)
+        log.info("폰 글 전달 %s (%d자)", tid, len(item["text"]))
+        return res if write is None else HOOK_WRITTEN
 
     def _hook_observe(self, tid):
         """훅 세션의 지금 상태를 Tracker에 넣는다(막힘·끝남 알림, 재알림 일정)."""
@@ -8403,7 +8604,10 @@ class App:
                 if item["claude"]:
                     item["preview"] = (self._hook_preview(tid) if self.hooks.has(tid)
                                        else terminal_preview(info, self.home, self.runner))
-            item["caps"] = [] if self.hooks.has(tid) else list(HOOK_CAPS)
+            if self.hooks.has(tid):
+                item["caps"] = ["send"] if self.hooks.wake_ready(tid) else []
+            else:
+                item["caps"] = list(HOOK_CAPS)
             out.append(item)
         since = self.blocked_since.update(
             {i["id"]: (i["status"] or {}).get("state") == "blocked" for i in out})
@@ -8740,6 +8944,8 @@ class App:
 
     def api_send(self, tid, body):
         text = validate_text(body.get("text"))
+        if self.hooks.has(tid):
+            return self._hook_send(tid, text)
         with self.term_lock(tid):
             info = self.require_claude(tid)
             if agent_spec(agent_kind(info)).get("send_guard") \
@@ -8755,6 +8961,18 @@ class App:
             self._mark_sent_working(tid, info)
         log.info("send %s (%d자)", tid, len(text))
         return {"ok": True}
+
+    def _hook_send(self, tid, text):
+        """훅 세션에 글 보내기: 깨우기가 되는 세션(Claude, hook-wait가 붙은 적 있음)이면 줄에 넣는다.
+        잠깐 기다려 바로 전달됐으면 queued false, 아니면 true(다음 Stop 뒤 대기자에게 간다)."""
+        with self.term_lock(tid):
+            self.require_claude(tid)
+            if not self.hooks.wake_ready(tid):
+                raise ApiError(409, "unsupported")
+            done = self.hooks.enqueue(tid, text)
+        delivered = done.wait(self.hook_send_wait)
+        log.info("send %s (훅, %d자, %s)", tid, len(text), "전달" if delivered else "대기")
+        return {"ok": True, "queued": not delivered}
 
     def _mark_sent_working(self, tid, info):
         """제목으로 작업 중을 모르는 "full" 에이전트: 보낸 순간을 작업 중으로 판정해 둔다. 3초 판정 사이에 끝난 작업도
@@ -9436,6 +9654,7 @@ ROUTES = [
     ("GET", re.compile(r"^/api/push/status$"), "push_status"),
     ("POST", re.compile(r"^/api/push/test$"), "push_test"),
     ("POST", re.compile(r"^/hook/(claude|codex|qwen|opencode)$"), "hook"),
+    ("POST", re.compile(r"^/hook/(claude|codex|qwen|opencode)/wait$"), "hook_wait"),
 ]
 
 
@@ -9589,12 +9808,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     continue
                 if m != method:
                     continue
-                if name == "hook":
+                if name in ("hook", "hook_wait"):
                     # 훅은 이 PC의 에이전트만 보낸다: tailscale serve(폰 쪽 프록시)를 거쳐 온 요청은 거절
                     if any(self.headers.get(h) is not None for h in HOOK_PROXY_HEADERS):
                         self.close_connection = True
                         return self._reply(403, {"error": "forbidden"})
-                    res = app.hook_event(mt.group(1), self._body(HOOK_MAX_BODY), self._client_alive)
+                    if name == "hook_wait":
+                        res = app.hook_wait(mt.group(1), self._body(HOOK_MAX_BODY), self._client_alive,
+                                            lambda obj: self._reply(200, obj))
+                    else:
+                        res = app.hook_event(mt.group(1), self._body(HOOK_MAX_BODY), self._client_alive)
+                    if res is HOOK_WRITTEN:
+                        return None
                     if res is HOOK_NO_REPLY:
                         self.close_connection = True
                         return None
@@ -10632,6 +10857,83 @@ def cmd_hook(args, stdin=None, stdout=None, env=None, timeout=HOOK_CLIENT_TIMEOU
     return 0
 
 
+def cmd_hook_wait(args, stdin=None, stderr=None, env=None, timeout=HOOK_CLIENT_TIMEOUT, sleep=time.sleep,
+                  clock=time.monotonic, max_sec=HOOK_WAIT_MAX_SEC, down_sec=HOOK_WAIT_DOWN_SEC, started=None):
+    """`sheltie.py hook-wait claude`: Claude Code Stop 훅(asyncRewake)이 부른다. 로컬 서버의 POST /hook/claude/wait에
+    붙어 폰에서 보낸 글을 기다린다. 글이 오면 stderr에 HOOK_WAKE_MARK 줄 + 글을 쓰고 2로 끝난다(세션이 깨어난다).
+    끝(end)·빈 답·인증 오류·서버가 오래 안 닿음·herdr 안이면 아무것도 쓰지 않고 0. stdout에는 아무것도 쓰지 않는다.
+    연결이 끊기거나 붙잡기 상한(again)이면 다시 붙는다. 로그 파일은 열지 않는다."""
+    started = time.time() if started is None else started  # 프로세스 시작 때 한 번(재접속에도 같은 값)
+    env = os.environ if env is None else env
+    try:
+        if env.get("HC_TERMINAL_ID"):
+            return 0  # herdr 안: hc 터미널로 보낸다(두 번 전달 방지)
+        if any(env.get(k) for k in FOREIGN_HOOK_ENV):
+            return 0
+        agent = args[0] if args else None
+        if agent not in HOOK_WAKE_AGENTS:
+            return 0
+        raw = (stdin if stdin is not None else sys.stdin.buffer).read(HOOK_MAX_BODY + 1)
+        if not raw or len(raw) > HOOK_MAX_BODY:
+            return 0
+        body = json.loads(raw.decode("utf-8"))
+        if not isinstance(body, dict):
+            return 0
+        # 이 프로세스의 표시: 재접속해도 같은 값. 서버는 더 늦게 뜬(최근 Stop의) 프로세스만 남긴다
+        body[HOOK_WAIT_STAMP_KEY] = {"started": started, "pid": os.getpid()}
+        raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        cfg = load_config()
+        tok = cfg.get("token") or ""
+        if not tok:
+            return 0
+        host, port = cfg.get("bind") or "127.0.0.1", cfg["port"]
+    except Exception:  # noqa: BLE001
+        return 0
+    start = clock()
+    down_since = None
+    fails = 0
+    while clock() - start < max_sec:
+        try:
+            conn = http.client.HTTPConnection(host, port, timeout=timeout)
+            try:
+                conn.request("POST", "/hook/%s/wait" % agent, body=raw,
+                             headers={"Authorization": "Bearer " + tok, "Content-Type": "application/json"})
+                resp = conn.getresponse()
+                data = resp.read(HOOK_MAX_OUT)
+            finally:
+                conn.close()
+        except Exception:  # noqa: BLE001 - 서버 재시작·끊김·시간 초과·잘린 응답: 잠깐 쉬고 다시 붙는다
+            down_since = clock() if down_since is None else down_since
+            if clock() - down_since >= down_sec:
+                return 0  # 계속 안 된다(서버 제거·멈춤)
+            sleep(HOOK_WAIT_BACKOFF[min(fails, len(HOOK_WAIT_BACKOFF) - 1)])
+            fails += 1
+            continue
+        down_since = None
+        fails = 0
+        if resp.status != 200 or not data.strip():
+            return 0  # 인증 오류·옛 서버(라우트 없음)·잘못된 요청
+        try:
+            res = json.loads(data.decode("utf-8"))
+        except ValueError:
+            return 0
+        if not isinstance(res, dict):
+            return 0
+        text = res.get("text")
+        if isinstance(text, str) and text:
+            try:
+                err = stderr if stderr is not None else sys.stderr.buffer
+                err.write((HOOK_WAKE_MARK + "\n" + text + "\n").encode("utf-8"))
+                err.flush()
+            except Exception:  # noqa: BLE001
+                pass
+            return 2
+        if res.get("again"):
+            continue
+        return 0
+    return 0
+
+
 # ---------------------------------------------------------------- run (herdr 없이 평소 터미널에서)
 # `sheltie run <agent> [args]`: hc(herdr-core) 터미널에 에이전트를 띄우고 이 터미널을 거기에 붙인다(ctrl+\ 분리).
 # 서버는 평소처럼 hc를 보므로 9종 파서·답 키·대화 보기·메시지 보내기가 그대로 된다.
@@ -11026,6 +11328,8 @@ def main(argv=None):
     cmd = argv[0] if argv else "serve"
     if cmd == "hook":  # 에이전트가 부른다: 로그 설정(파일 열기) 없이 빠르게
         return cmd_hook(argv[1:])
+    if cmd == "hook-wait":  # Claude Code Stop 훅(asyncRewake)이 부른다: 로그 파일을 열지 않는다
+        return cmd_hook_wait(argv[1:])
     if cmd == "run":  # 사용자 터미널: 서버 로그 파일을 열지 않는다
         return cmd_run(argv[1:])
     if cmd == "codex-trust":  # 설치기가 부른다
@@ -11040,7 +11344,7 @@ def main(argv=None):
         return cmd_test_push()
     if cmd == "pair":
         return cmd_pair()
-    print("사용법: sheltie.py [init|serve|test-push|pair|codex-trust|hook <claude|codex|qwen|opencode>|run <에이전트> [인자…]]",
+    print("사용법: sheltie.py [init|serve|test-push|pair|codex-trust|hook <claude|codex|qwen|opencode>|hook-wait claude|run <에이전트> [인자…]]",
           file=sys.stderr)
     return 2
 

@@ -730,6 +730,9 @@ class InstallHooksTest(InstallTest):
     def cmd(self, agent):
         return '"%s" "%s" hook %s' % (self.py(), self.server, agent)
 
+    def wait_cmd(self):
+        return '"%s" "%s" hook-wait claude' % (self.py(), self.server)
+
     def py(self):
         return os.path.join(self.bin, "python3")
 
@@ -758,7 +761,9 @@ class InstallHooksTest(InstallTest):
                          [{"matcher": "*", "hooks": [{"type": "command", "command": self.cmd("claude"), "timeout": 600}]}])
         self.assertEqual(c["hooks"]["PreToolUse"][0]["matcher"], "AskUserQuestion|ExitPlanMode")
         self.assertEqual(c["hooks"]["Stop"],
-                         [{"hooks": [{"type": "command", "command": self.cmd("claude"), "timeout": 10}]}])
+                         [{"hooks": [{"type": "command", "command": self.cmd("claude"), "timeout": 10},
+                                     {"type": "command", "command": self.wait_cmd(), "asyncRewake": True,
+                                      "timeout": 86400}]}])
         x = read_json(self.hooks_json())
         self.assertEqual(set(x["hooks"]), HOOK_EVENTS_CODEX)
         self.assertEqual(x["hooks"]["PermissionRequest"][0]["hooks"][0]["command"], self.cmd("codex"))
@@ -849,7 +854,37 @@ class InstallHooksTest(InstallTest):
         # 그대로면 파일이 안 바뀐다
         self.run_install()
         self.assertEqual(len(self.ours(read_json(self.settings())["hooks"]["Stop"])), 1)
-        self.assertEqual(first.count("sheltie.py"), 6)
+        self.assertEqual(first.count("sheltie.py"), 7)  # 6개 이벤트 + Stop의 hook-wait
+        self.assertEqual(first.count("hook-wait claude"), 1)
+
+    def waits(self, doc):
+        return [h for ev, groups in doc.get("hooks", {}).items() for g in groups for h in g["hooks"]
+                if "hook-wait" in h["command"]]
+
+    def test_hook_wait_only_claude_stop_once_idempotent_and_uninstalled(self):
+        os.makedirs(self.claude)
+        os.makedirs(self.codex)
+        os.makedirs(os.path.join(self.home, ".qwen"))
+        self.run_install()
+        c = read_json(self.settings())
+        self.assertEqual(self.waits(c), [{"type": "command", "command": self.wait_cmd(), "asyncRewake": True,
+                                          "timeout": 86400}])
+        self.assertEqual([h for h in c["hooks"]["Stop"][0]["hooks"] if "hook-wait" in h["command"]],
+                         self.waits(c))  # 동기 Stop 항목과 같은 그룹
+        self.assertEqual(self.waits(read_json(self.hooks_json())), [])
+        self.assertEqual(self.waits(read_json(os.path.join(self.home, ".qwen", "settings.json"))), [])
+        # 예전 경로의 hook-wait가 따로 남아 있어도 새 것 하나로 바뀐다
+        c["hooks"]["Stop"].append({"hooks": [{"type": "command", "command": '"/old/py" "/old/sheltie.py" hook-wait claude',
+                                              "asyncRewake": True, "timeout": 86400}]})
+        self.write_json(self.settings(), c)
+        self.run_install()
+        self.run_install()
+        c = read_json(self.settings())
+        self.assertEqual([h["command"] for h in self.waits(c)], [self.wait_cmd()])
+        self.assertEqual(len(c["hooks"]["Stop"]), 1)
+        r = self.run_install("--uninstall")
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertNotIn("hook-wait", read(self.settings()))
 
     def test_broken_json_untouched_install_continues(self):
         os.makedirs(self.claude)
@@ -1566,7 +1601,7 @@ class InstallMigrateTest(InstallTest):
         new_cmd = '"%s" "%s" hook claude' % (os.path.join(self.bin, "python3"),
                                               os.path.join(self.home, ".local/share/sheltie/sheltie.py"))
         stop = [h["command"] for g in s["hooks"]["Stop"] for h in g["hooks"]]
-        self.assertEqual(stop, ["mine.sh", new_cmd])
+        self.assertEqual(stop, ["mine.sh", new_cmd, new_cmd.replace(" hook claude", " hook-wait claude")])
         self.assertEqual([h["command"] for g in s["hooks"]["PermissionRequest"] for h in g["hooks"]], [new_cmd])
         self.assertIn("훅 갱신", r.stdout)
         # 다시 설치해도 그대로

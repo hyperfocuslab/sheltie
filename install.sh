@@ -240,7 +240,7 @@ def ours(cmd):
         return False
     for m in (MARK,) + OLD_MARKS:
         i = cmd.find(m)
-        if i >= 0 and cmd[i + len(m):i + len(m) + 7] in ('" hook ', "' hook "):
+        if i >= 0 and cmd[i + len(m):].startswith(('" hook ', "' hook ", '" hook-wait ', "' hook-wait ")):
             return True
     return False
 
@@ -271,6 +271,20 @@ def handler(timeout):
     else:
         h["command"] = '"%s" "%s" hook %s' % (py, server, target)
     h["timeout"] = timeout
+    return h
+
+
+def wait_handler():
+    # Claude Stop, async: waits for a message sent from the phone; exit 2 + stderr wakes the idle session.
+    h = {"type": "command"}
+    if flavor == "windows":
+        # PowerShell -Command would turn a native exit code 2 into 1: pass it through.
+        h["command"] = '& "%s" "%s" hook-wait claude; exit $LASTEXITCODE' % (py, server)
+        h["shell"] = "powershell"
+    else:
+        h["command"] = '"%s" "%s" hook-wait claude' % (py, server)
+    h["asyncRewake"] = True
+    h["timeout"] = 86400
     return h
 
 
@@ -512,6 +526,8 @@ def main():
             if matcher is not None:
                 grp["matcher"] = matcher
             grp["hooks"] = [handler(timeout)]
+            if target == "claude" and ev == "Stop":
+                grp["hooks"].append(wait_handler())
             groups.insert(len(groups) if pos is None else pos, grp)
             hooks[ev] = groups
         doc["hooks"] = hooks
