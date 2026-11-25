@@ -7002,6 +7002,19 @@ class HookBackend:
             hold.event.set()
             return True
 
+    def release(self, tid):
+        """턴이 끝났거나(Stop) 새 프롬프트가 왔다(UserPromptSubmit): 남은 붙잡기는 PC에서 이미 풀렸다.
+        목록에서 모두 빼고 waiting은 gone으로 끝낸다(붙잡던 스레드는 HOOK_NO_REPLY). 반환: 뺀 개수."""
+        with self.lock:
+            s = self.sessions.get(tid)
+            if s is None or not s["holds"]:
+                return 0
+            holds, s["holds"] = s["holds"], []
+            s["status_ms"] = int(self.wall() * 1000)
+        for h in holds:
+            self.finish(h, "gone")
+        return len(holds)
+
     def pop_hold(self, tid, hold, base="working"):
         with self.lock:
             s = self.sessions.get(tid)
@@ -8055,6 +8068,11 @@ class App:
         new = self.hooks.touch(tid, agent, body, self.home)
         if new:
             self._hook_observe(tid)  # 기준선(idle): 알림 없음
+        if ev in ("UserPromptSubmit", "Stop") and self.hooks.release(tid):
+            # 붙잡힌 권한 요청이 남아 있는데 턴이 끝났거나 새 프롬프트가 왔다: PC(데스크톱 앱 등)에서 먼저 답해
+            # 훅 프로세스가 살아 있는 채로 풀린 것이다. 막힘으로 남기지 않는다(PermissionRequest·PreToolUse로는
+            # 풀지 않는다: 병렬 도구 요청이 줄 서 있을 수 있다).
+            log.info("훅 붙잡기 풀림 %s (%s: PC에서 답함)", tid, ev)
         if ev == "UserPromptSubmit":
             self.hooks.set_base(tid, "working")
             self._hook_observe(tid)
@@ -8822,7 +8840,10 @@ class App:
             ok = e.get("last_success_at")
         failing = (err is not None and (ok is None or err > ok)
                    and self.push_log.now_ms() - err <= PUSH_FAILING_WINDOW_MS and bool(self.devices.list()))
-        return {"last_success_at": ok, "relay_limited_at": s["relay_limited_at"], "failing": failing}
+        limited = s["relay_limited_at"]
+        if limited is not None and ok is not None and limited < ok:
+            limited = None  # 한도에 걸린 뒤 이미 성공했다: 지난 경고를 앱이 1시간 동안 띄우지 않게
+        return {"last_success_at": ok, "relay_limited_at": limited, "failing": failing}
 
     @staticmethod
     def _device_id_arg(did):

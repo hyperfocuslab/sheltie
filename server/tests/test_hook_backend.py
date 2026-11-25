@@ -293,6 +293,90 @@ class PermissionTests(HookBase):
         self.hook("claude", load("claude-stop-2.1.329.json", session_id=body["session_id"]))
         self.assertEqual(self.status(tid)["state"], "done")
 
+    def hold_bg(self, body):
+        """붙잡히는 Claude 권한 요청. PC에서 풀리면 서버가 아무것도 쓰지 않고 끊는다: box["err"]에 예외."""
+        box = {}
+
+        def run():
+            try:
+                box["r"] = self.hook("claude", body)
+            except Exception as e:  # noqa: BLE001 - 응답 없이 끊김(HOOK_NO_REPLY)
+                box["err"] = e
+        th = threading.Thread(target=run, daemon=True)
+        th.start()
+        box["th"] = th
+        return box
+
+    def assert_released_by(self, event_fixture):
+        """붙잡은 채로 PC에서 승인(훅 프로세스는 살아 있음) → 다음 이벤트가 붙잡기를 gone으로 끝낸다."""
+        body = load("claude-permission-bash-2.1.329.json")
+        tid = self.tid_of(body)
+        box = self.hold_bg(body)
+        p = self.blocked(tid)
+        hold = self.app.hooks.active(tid)
+        self.assertEqual(self.status(tid)["state"], "blocked")
+        n = len(self.pusher.payloads)
+        self.assertEqual(self.hook("claude", load(event_fixture, session_id=body["session_id"])), (200, None))
+        box["th"].join(5)
+        self.assertFalse(box["th"].is_alive(), "hook still held")
+        self.assertNotIn("r", box)  # HOOK_NO_REPLY: 응답 없이 끊는다
+        self.assertEqual(hold.state, "gone")
+        self.assertEqual(self.app.hooks.queued(tid), 0)
+        self.assertIsNone(self.app.hooks.current_prompt(tid))
+        self.assertEqual(self.answer(tid, {"action": "approve", "prompt_id": p["id"]})[1]["error"], "prompt_changed")
+        return tid, n
+
+    def test_stop_releases_hold_answered_on_pc(self):
+        tid, n = self.assert_released_by("claude-stop-2.1.329.json")
+        self.assertEqual(self.status(tid)["state"], "done")
+        time.sleep(0.3)  # 붙잡던 스레드의 관측까지 끝난 뒤
+        self.assertEqual(self.status(tid)["state"], "done")
+        cats = [p["aps"]["category"] for p in self.pusher.payloads[n:]]
+        self.assertEqual(cats.count("HR_DONE"), 1, cats)
+        self.assertEqual([c for c in cats if c.startswith("HR_PERMISSION")], [])
+
+    def test_user_prompt_submit_releases_hold_answered_on_pc(self):
+        tid, n = self.assert_released_by("claude-user-prompt-submit-2.1.329.json")
+        time.sleep(0.3)
+        self.assertEqual(self.status(tid)["state"], "working")
+        self.assertEqual([p["aps"]["category"] for p in self.pusher.payloads[n:]
+                          if p["aps"].get("category", "").startswith("HR_PERMISSION")], [])
+
+    def test_stop_drops_expired_hold(self):
+        now = [100.0]
+        self.app.hook_clock = lambda: now[0]
+        body = load("claude-permission-bash-2.1.329.json")
+        tid = self.tid_of(body)
+        box = self.hook_bg("claude", body)
+        self.blocked(tid)
+        now[0] += hr.HOOK_HOLD_SEC + 1
+        self.assertEqual(self.result(box), (200, {}))
+        self.assertEqual(self.status(tid)["state"], "blocked")
+        n = len(self.pusher.payloads)
+        self.hook("claude", load("claude-stop-2.1.329.json", session_id=body["session_id"]))
+        self.assertEqual(self.status(tid)["state"], "done")
+        self.assertEqual([p["aps"]["category"] for p in self.pusher.payloads[n:]].count("HR_DONE"), 1)
+
+    def test_new_permission_request_keeps_queued_holds(self):
+        body = load("claude-permission-bash-2.1.329.json")
+        tid = self.tid_of(body)
+        b1 = self.hook_bg("claude", body)
+        p1 = self.blocked(tid)
+        b2 = self.hook_bg("claude", dict(body, tool_input={"command": "touch two"}))
+        wait_for(lambda: self.app.hooks.queued(tid) == 2)
+        b3 = self.hook_bg("claude", dict(body, tool_input={"command": "touch three"}))
+        wait_for(lambda: self.app.hooks.queued(tid) == 3)
+        holds = list(self.app.hooks.sessions[tid]["holds"])
+        self.assertEqual([h.state for h in holds], ["waiting"] * 3)
+        self.assertEqual(self.app.hooks.current_prompt(tid)["id"], p1["id"])
+        for b in (b1, b2, b3):
+            self.assertTrue(b["th"].is_alive())
+        for _ in range(3):
+            self.answer(tid, {"action": "reject"})
+            wait_for(lambda: not self.app.hooks.active(tid) or self.app.hooks.active(tid).state == "waiting")
+        for b in (b1, b2, b3):
+            self.assertEqual(self.result(b)[1]["hookSpecificOutput"]["decision"]["behavior"], "deny")
+
     def test_queued_requests_answer_in_order(self):
         body = load("claude-permission-bash-2.1.329.json")
         tid = self.tid_of(body)

@@ -489,6 +489,33 @@ class PushHttpTests(unittest.TestCase):
         self.assertTrue(push("?device=" + did(TOK_B))["failing"])
         self.assertTrue(push("?device=zz")["failing"])  # 형식이 틀리면 전체 기준
 
+    def test_health_relay_limit_cleared_by_later_success(self):
+        """한도(429)에 걸린 뒤 성공했으면 relay_limited_at을 내보내지 않는다(앱이 지난 경고를 1시간 띄우지 않게).
+        did를 주면 그 기기의 마지막 성공 기준."""
+        def push(q=""):
+            return self.req("GET", "/api/health" + q)[1]["push"]
+        self.app.devices.add(TOK_A, "sandbox", relay_sig=SIG)
+        self.app.devices.add(TOK_B, "sandbox", relay_sig=SIG)
+        self.app.push_log.relay_limited()
+        t_lim = self.wall.t * 1000
+        self.assertEqual(push()["relay_limited_at"], t_lim)  # 성공 기록 없음: 그대로
+        self.wall.t += 60
+        self.app.push_log.record(TOK_B, 200, "")  # B만 성공
+        self.wall.t += 22 * 60
+        self.app.push_log.relay_limited()
+        t_lim2 = self.wall.t * 1000
+        self.wall.t += 21 * 60
+        self.app.push_log.record(TOK_A, 200, "")  # 한도 21분 뒤 A 성공
+        self.assertIsNone(push()["relay_limited_at"])
+        self.assertIsNone(push("?device=" + did(TOK_A))["relay_limited_at"])
+        self.assertEqual(push("?device=" + did(TOK_B))["relay_limited_at"], t_lim2)  # B의 성공은 한도 전
+        self.assertNotEqual(t_lim, t_lim2)
+        self.wall.t += 1
+        self.app.push_log.relay_limited()  # 성공 뒤 또 걸리면 다시 보인다
+        self.assertEqual(push()["relay_limited_at"], self.wall.t * 1000)
+        # /api/push/status는 기록 그대로(설정 화면 표시용, 경고 판정에 안 쓰인다)
+        self.assertEqual(self.req("GET", "/api/push/status")[1]["relay_limited_at"], self.wall.t * 1000)
+
 
 class BuildAppTests(unittest.TestCase):
     def test_build_app_shares_push_log_file(self):
