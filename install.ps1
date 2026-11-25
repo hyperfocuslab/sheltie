@@ -1,4 +1,12 @@
-# Sheltie installer (Windows). Usage: powershell -File install.ps1 [-DryRun] [-Uninstall] [-NoHooks] [-NoHc] [-NoAutoUpdate] [-Help]
+# Sheltie installer (Windows). Usage: powershell -File install.ps1 [-DryRun] [-Uninstall] [-NoHooks] [-NoHc] [-NoAutoUpdate] [-NoWrapClaude] [-Help]
+#   -NoWrapClaude / SHELTIE_NO_WRAP_CLAUDE=1: do not put a claude function in the PowerShell profiles (Windows PowerShell 5.1
+#   always, PowerShell 7 when pwsh is installed or its profile exists; under the Documents folder from
+#   [Environment]::GetFolderPath('MyDocuments'), SHELTIE_DOCUMENTS overrides it for tests). The function runs `sheltie run claude`
+#   so typing claude gives the phone send/view features. Default: ask on a console (Y), apply when there is none. -NoWrapClaude is
+#   kept as config wrap_claude: false: reinstall then neither asks nor adds, and removes an old block (delete the key to be asked again).
+#   The function lives only between `# >>> sheltie: claude >>>` and `# <<< sheltie: claude <<<` and -Uninstall removes just that.
+#   Symlinked profiles are not touched. Original claude once: $env:SHELTIE_NO_WRAP=1 or & (Get-Command claude -CommandType Application).
+#   -Update (auto-update) never touches the profiles.
 #   -NoAutoUpdate: turn off server auto-update (config auto_update: false; kept on reinstall).
 #   -Update: called by the server's auto-update, not by people. Replaces the server with SHELTIE_SRC keeping config, token
 #   and devices, skips tailscale/pairing/hc install, re-registers hooks, restarts the task. If the new version does not
@@ -61,6 +69,7 @@
   $NOHOOKS = $false
   $NOHC = $false
   $NOAUTO = $false
+  $NOWRAP = $false
   $CMD_DIR = Join-Path $DATA 'bin'
   $CMD_PATH = Join-Path $CMD_DIR 'sheltie.cmd'
   $CMD_MARK = 'rem sheltie-command'
@@ -193,6 +202,17 @@
     upd_task_fail = '6rK96rOgOiDsnpHsl4Ug7KCV7J2Y66W8IOuwlOq+uOyngCDrqrvtlojri6QoezB9KS4g6rSA66as7J6QIOq2jO2VnOycvOuhnCDshKTsuZjtlZwg7J6R7JeF7J28IOyImCDsnojri6QuIOyEpOy5mOq4sOulvCDsnbzrsJggUG93ZXJTaGVsbOyXkOyEnCDtlZwg67KIIOuLpOyLnCDsi6TtlontlZjrqbQg67CU64CQ64ukLg==' # task XML not changed (admin-created task)
     upd_err = '7JeF642w7J207Yq4IOykkSDsmKTrpZg6IHswfQ==' # error during update
     help7 = 'ICAtTm9BdXRvVXBkYXRlOiDshJzrsoQg7J6Q64+ZIOyXheuNsOydtO2KuOulvCDrgYjri6Qo7ISk7KCVIGF1dG9fdXBkYXRlOiBmYWxzZSwg64uk7IucIOyEpOy5mO2VtOuPhCDqt7jrjIDroZwpLiAtVXBkYXRl64qUIOyekOuPmSDsl4XrjbDsnbTtirjqsIAg67aA66W464ukKOyCrOuejOydtCDsk7Dsp4Ag7JWK64qU64ukKS4=' # help line 7
+    wrap_ask = 'Y2xhdWRl66W8IFNoZWx0aWXroZwg6rCQ7IyA6rmM7JqUPyDtj7Dsl5DshJwg6riAIOuztOuCtOq4sMK37ZmU66m0IOuztOq4sOq5jOyngCDrkKnri4jri6QgW1kvbl0g' # wrap_ask
+    wrap_added = 'ezB9IOyXkCBjbGF1ZGUg7ZWo7IiY66W8IOuEo+yXiOuLpC4=' # wrap_added
+    wrap_removed = 'ezB9IOyXkOyEnCBjbGF1ZGUg7ZWo7IiY66W8IOyngOyboOuLpC4=' # wrap_removed
+    wrap_dry_add = 'KyB7MH0g7JeQIGNsYXVkZSDtlajsiJgg67iU66GdIOuEo+q4sA==' # wrap_dry_add
+    wrap_dry_rm = 'KyB7MH0g7JeQ7IScIGNsYXVkZSDtlajsiJgg67iU66GdIOyngOyasOq4sA==' # wrap_dry_rm
+    wrap_link = 'ezB9IOuKlCDsi6zrs7zrpq0g66eB7YGs6528IOqxtOuTnOumrOyngCDslYrslZjri6QuIGNsYXVkZSDtlajsiJjripQg7KeB7KCRIOuEo+yWtOudvCjrgrTsmqnsnYAgaW5zdGFsbC5wczHsnZggV1JBUF9CTE9DSyku' # wrap_link
+    wrap_noend = '6rK96rOgOiB7MH0g7JeQIOyLnOyekSDtkZzsi5zrp4wg7J6I6rOgIOuBnSDtkZzsi5zqsIAg7JeG7Ja0IOqxtOuTnOumrOyngCDslYrslZjri6Qu' # wrap_noend
+    wrap_fail = '6rK96rOgOiB7MH0g66W8IOqzoOy5mOyngCDrqrvtlojri6QoezF9KS4g7ISk7LmY64qUIOqzhOyGje2VnOuLpC4=' # wrap_fail
+    wrap_cfg_fail = '6rK96rOgOiDshKTsoJXsl5Agd3JhcF9jbGF1ZGXrpbwg64Ko6riw7KeAIOuqu+2WiOuLpCh7MH0pLg==' # wrap_cfg_fail
+    wrap_done = 'Y2xhdWRlIO2VqOyImOuKlCDsg4ggUG93ZXJTaGVsbCDssL3rtoDthLAg7KCB7Jqp65Cc64ukKOyngOq4iCDssL3snYAgLiAkUFJPRklMRSkuIOybkOuemCBjbGF1ZGXroZwg652E7Jqw66Ck66m0ICRlbnY6U0hFTFRJRV9OT19XUkFQPTEg7ISk7KCVIO2bhCDsi6TtlontlZjqsbDrgpggJiAoR2V0LUNvbW1hbmQgY2xhdWRlIC1Db21tYW5kVHlwZSBBcHBsaWNhdGlvbiku' # wrap_done
+    help8 = 'ICAtTm9XcmFwQ2xhdWRlOiBQb3dlclNoZWxsIO2UhOuhnO2VhOyXkCBjbGF1ZGXrpbwgc2hlbHRpZSBydW4gY2xhdWRl66GcIOqwkOyLuOuKlCDtlajsiJjrpbwg64Sj7KeAIOyViuuKlOuLpCjshKTsoJUgd3JhcF9jbGF1ZGU6IGZhbHNlLCDri6Tsi5wg7ISk7LmY7ZW064+EIOq3uOuMgOuhnCkuIO2ZmOqyveuzgOyImCBTSEVMVElFX05PX1dSQVBfQ0xBVURFPTEuIOq4sOuzuOydgCDthLDrr7jrhJDsl5DshJwg66y76rOgIOuEo+uKlOuLpC4=' # help8
   }
   # messages end
   function T([string]$Key) {
@@ -590,7 +610,7 @@ except Exception:
 # ---- hooks_merge.py end
 '@
 
-  $HELP_TEXT = @((T 'help1'), (T 'help2'), (T 'help3'), (T 'help4'), (T 'help5'), (T 'help6'), (T 'help7'))
+  $HELP_TEXT = @((T 'help1'), (T 'help2'), (T 'help3'), (T 'help4'), (T 'help5'), (T 'help6'), (T 'help7'), (T 'help8'))
 
   function Say([string]$Msg) { Write-Host $Msg }
   function Die([int]$Code, [string]$Msg) {
@@ -881,6 +901,182 @@ except Exception:
       [void](Remove-UserPath $CMD_DIR)
       Remove-Item -LiteralPath $CMD_DIR -Force -ErrorAction SilentlyContinue
     } catch {}
+  }
+  # claude function in the PowerShell profiles: typing claude runs `sheltie run claude` (phone send/view). Mirrors wrap_block in install.sh.
+  $WRAP_BEGIN = '# >>> sheltie: claude >>>'
+  $WRAP_END = '# <<< sheltie: claude <<<'
+  # ASCII only on purpose: Windows PowerShell 5.1 reads a BOM-less profile as ANSI.
+  $WRAP_BLOCK = @'
+# >>> sheltie: claude >>>
+# Added by the Sheltie installer; install.ps1 -Uninstall removes it. Lines up to the end marker are overwritten on the next install.
+# Turn off: install.ps1 -NoWrapClaude. Run the original claude once: $env:SHELTIE_NO_WRAP = '1' or & (Get-Command claude -CommandType Application)
+function claude {
+  $real = Get-Command claude -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+  if (-not $real) {
+    [Console]::Error.WriteLine('claude: command not found')
+    $global:LASTEXITCODE = 127
+    return
+  }
+  $wrap = $true
+  if ($env:SHELTIE_NO_WRAP -or $env:HC_TERMINAL_ID) { $wrap = $false }
+  if ($wrap -and ([Console]::IsInputRedirected -or [Console]::IsOutputRedirected)) { $wrap = $false }
+  if ($wrap -and ($MyInvocation.ExpectingInput -or $MyInvocation.PipelineLength -gt 1)) { $wrap = $false }
+  if ($wrap -and -not (Get-Command sheltie -CommandType Application -ErrorAction SilentlyContinue)) { $wrap = $false }
+  if ($wrap) {
+    $hc = $false
+    if ($env:LOCALAPPDATA -and (Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA 'Programs\herdr-core\hc.exe') -PathType Leaf)) { $hc = $true }
+    if (-not $hc -and (Get-Command hc.exe, herdr-core.exe -CommandType Application -ErrorAction SilentlyContinue)) { $hc = $true }
+    if (-not $hc) { $wrap = $false }
+  }
+  if ($wrap -and $args.Count -gt 0) {
+    $subs = 'agents', 'attach', 'auth', 'auto-mode', 'config', 'doctor', 'gateway', 'import', 'install', 'logs', 'mcp', 'migrate-installer', 'plugin', 'plugins', 'purge', 'respawn', 'rm', 'setup-token', 'stop', 'kill', 'ultrareview', 'update', 'upgrade'
+    if ($subs -ccontains [string]$args[0]) { $wrap = $false }
+  }
+  if ($wrap) {
+    $flags = '-p', '--print', '-v', '--version', '-h', '--help', '--bg', '--background'
+    foreach ($a in $args) {
+      if ([string]$a -ceq '--') { break }
+      if ($flags -ccontains [string]$a) { $wrap = $false; break }
+    }
+  }
+  if ($wrap) { sheltie run claude @args } else { & $real.Source @args }
+}
+# <<< sheltie: claude <<<
+'@
+  function Wrap-Profiles {
+    # Profiles of Windows PowerShell 5.1 (always) and PowerShell 7 (pwsh installed or the file exists), under the real Documents folder (OneDrive-aware).
+    $docs = $env:SHELTIE_DOCUMENTS
+    if (-not $docs) { try { $docs = [Environment]::GetFolderPath('MyDocuments') } catch { $docs = '' } }
+    if (-not $docs) { $docs = Join-Path $env:USERPROFILE 'Documents' }
+    $ps7 = Join-Path $docs 'PowerShell\Microsoft.PowerShell_profile.ps1'
+    $has7 = [bool](Get-Command pwsh -CommandType Application -ErrorAction SilentlyContinue)
+    if (-not $has7 -and $env:ProgramFiles) { $has7 = Test-Path -LiteralPath (Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe') -PathType Leaf }
+    return @(
+      @{ Path = (Join-Path $docs 'WindowsPowerShell\Microsoft.PowerShell_profile.ps1'); Make = $true },
+      @{ Path = $ps7; Make = $has7 }
+    )
+  }
+  function Wrap-One([string]$Path, [string]$Act, [bool]$Make) {
+    # Put (replace) or remove the block in one profile. Text outside the block, its encoding (BOM or not, UTF-16) and its newlines stay.
+    # Written to a temp file in the same folder and swapped in. A symlinked profile is left alone.
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    $latin1 = [Text.Encoding]::GetEncoding(28591)
+    if ($item -and $item.PSIsContainer) { return }
+    if ($item -and $item.LinkType -eq 'SymbolicLink') {
+      $has = $false
+      try { $has = [IO.File]::ReadAllText($Path, $latin1).Contains($WRAP_BEGIN) } catch {}
+      if ($Act -eq 'install' -or $has) { Say (T 'wrap_link' $Path) }
+      return
+    }
+    $exists = [bool]$item
+    if (-not $exists -and -not ($Act -eq 'install' -and $Make)) { return }
+    $bytes = New-Object byte[] 0
+    if ($exists) {
+      try { $bytes = [IO.File]::ReadAllBytes($Path) } catch { [Console]::Error.WriteLine((T 'wrap_fail' $Path $_.Exception.Message)); return }
+    }
+    $pre = New-Object byte[] 0
+    $enc = $latin1
+    if ($bytes.Length -ge 4 -and $bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE -and $bytes[2] -eq 0 -and $bytes[3] -eq 0) {
+      [Console]::Error.WriteLine((T 'wrap_fail' $Path 'UTF-32')); return
+    }
+    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+      $pre = [byte[]]$bytes[0..2]
+    } elseif ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) {
+      $pre = [byte[]]$bytes[0..1]; $enc = [Text.Encoding]::Unicode
+    } elseif ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFE -and $bytes[1] -eq 0xFF) {
+      $pre = [byte[]]$bytes[0..1]; $enc = [Text.Encoding]::BigEndianUnicode
+    } elseif (-not $exists) {
+      $pre = [byte[]](0xEF, 0xBB, 0xBF)  # new file: UTF-8 BOM so 5.1 reads it as UTF-8
+    }
+    $text = ''
+    if ($exists) { $text = $enc.GetString($bytes, $pre.Length, $bytes.Length - $pre.Length) }
+    $crlf = $text.Contains("`r`n") -or -not $text.Contains("`n")
+    $cr = ''
+    if ($crlf) { $cr = "`r" }
+    $blk = @($WRAP_BLOCK.Replace("`r`n", "`n").Split("`n") | ForEach-Object { $_ + $cr })
+    $lines = $text.Split("`n")
+    $out = New-Object 'System.Collections.Generic.List[string]'
+    $i = 0; $placed = $false; $bad = $false
+    while ($i -lt $lines.Length) {
+      $ln = $lines[$i]
+      if ($ln.TrimEnd("`r") -ceq $WRAP_BEGIN) {
+        $j = $i + 1
+        while ($j -lt $lines.Length -and $lines[$j].TrimEnd("`r") -cne $WRAP_END) { $j++ }
+        if ($j -ge $lines.Length) { $bad = $true; break }  # no end marker: we cannot tell what is ours, leave the file alone
+        if ($Act -eq 'install') {
+          if (-not $placed) { $out.AddRange([string[]]$blk); $placed = $true }
+        } elseif ($out.Count -gt 1 -and $out[$out.Count - 1].TrimEnd("`r") -eq '') {
+          $out.RemoveAt($out.Count - 1)  # also take the blank line put before the block
+        }
+        $i = $j + 1
+        continue
+      }
+      $out.Add($ln)
+      $i++
+    }
+    if ($bad) { [Console]::Error.WriteLine((T 'wrap_noend' $Path)); return }
+    if ($Act -eq 'install' -and -not $placed) {
+      if ($out.Count -gt 0 -and $out[$out.Count - 1] -eq '') { $out.RemoveAt($out.Count - 1) }
+      if ($out.Count -gt 0) {
+        if ($crlf -and -not $out[$out.Count - 1].EndsWith("`r")) { $out[$out.Count - 1] += "`r" }  # last line had no newline yet
+        $out.Add($cr)
+      }
+      $out.AddRange([string[]]$blk)
+      $out.Add('')
+    }
+    $new = [string]::Join("`n", $out.ToArray())
+    if ($new -ceq $text) { return }
+    if ($DRY) {
+      if ($Act -eq 'install') { Say (T 'wrap_dry_add' $Path) } else { Say (T 'wrap_dry_rm' $Path) }
+      return
+    }
+    $body = $enc.GetBytes($new)
+    $all = New-Object byte[] ($pre.Length + $body.Length)
+    [Buffer]::BlockCopy($pre, 0, $all, 0, $pre.Length)
+    [Buffer]::BlockCopy($body, 0, $all, $pre.Length, $body.Length)
+    $dir = Split-Path -Parent $Path
+    $tmp = Join-Path $dir ('.' + (Split-Path -Leaf $Path) + '.' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.tmp')
+    try {
+      if (-not (Test-Path -LiteralPath $dir -PathType Container)) { [void](New-Item -ItemType Directory -Force -Path $dir) }
+      [IO.File]::WriteAllBytes($tmp, $all)
+      if ($exists) {
+        try { [IO.File]::Replace($tmp, $Path, $null) } catch { Move-Item -LiteralPath $tmp -Destination $Path -Force }
+      } else {
+        Move-Item -LiteralPath $tmp -Destination $Path -Force
+      }
+    } catch {
+      [Console]::Error.WriteLine((T 'wrap_fail' $Path $_.Exception.Message))
+      return
+    } finally {
+      Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    }
+    if ($Act -eq 'install') { Say (T 'wrap_added' $Path) } else { Say (T 'wrap_removed' $Path) }
+  }
+  function Wrap-Apply([string]$Act) {
+    foreach ($e in (Wrap-Profiles)) { Wrap-One $e.Path $Act ([bool]$e.Make) }
+  }
+  function Wrap-Main {
+    # Decide (-NoWrapClaude: no and remember, config wrap_claude false: no, console: ask with default Y, else yes), then add or remove. Returns $true when added.
+    $wrap = $true; $save = $false
+    $c = Read-Config
+    if ($NOWRAP) { $wrap = $false; $save = $true }
+    elseif ($c -and $c.wrap_claude -eq $false) { $wrap = $false }
+    elseif (-not $DRY -and [Environment]::UserInteractive -and -not [Console]::IsInputRedirected) {
+      $ans = ''
+      try { $ans = [string](Read-Host (T 'wrap_ask').TrimEnd()) } catch { $ans = '' }
+      if ($ans -match '^[nN]') { $wrap = $false; $save = $true }
+    }
+    if ($wrap) { Wrap-Apply 'install'; return $true }
+    if ($save -and -not $DRY) {
+      try {
+        $c = Read-Config
+        $c | Add-Member -NotePropertyName wrap_claude -NotePropertyValue $false -Force
+        [IO.File]::WriteAllText("$CONFIG.tmp", ($c | ConvertTo-Json -Depth 10), (New-Object System.Text.UTF8Encoding($false)))
+        Move-Item -LiteralPath "$CONFIG.tmp" -Destination $CONFIG -Force
+      } catch { [Console]::Error.WriteLine((T 'wrap_cfg_fail' $CONFIG)) }
+    }
+    Wrap-Apply 'remove'
+    return $false
   }
   function Funnel-On {
     # True if Funnel (public internet) is on for this port. False if it cannot be determined.
@@ -1248,6 +1444,7 @@ if n != c:
         '^--?no-?hooks$' { $NOHOOKS = $true }
         '^--?no-?hc$' { $NOHC = $true }
         '^--?no-?auto-?update$' { $NOAUTO = $true }
+        '^--?no-?wrap-?claude$' { $NOWRAP = $true }
         '^--?update$' { $MODE = 'update' }
         '^(--?help|-h|-\?)$' { foreach ($l in $HELP_TEXT) { Say $l }; return }
         default { Die 2 (T 'unknown_opt' $a) }
@@ -1256,6 +1453,7 @@ if n != c:
     if ($env:SHELTIE_UNINSTALL -eq '1') { $MODE = 'uninstall' }
     if ($env:SHELTIE_DRY_RUN -eq '1') { $DRY = $true }
     if ($env:SHELTIE_NO_HOOKS -eq '1') { $NOHOOKS = $true }
+    if ($env:SHELTIE_NO_WRAP_CLAUDE -eq '1') { $NOWRAP = $true }
     if ($TASK -notmatch '^[A-Za-z0-9 ._-]+$') { Die 2 (T 'task_bad' $TASK) }
 
     $PORT = $env:SHELTIE_PORT
@@ -1287,6 +1485,7 @@ if n != c:
       if ($DRY) { Say (T 'dry_delete' $SERVER $TASK_COPY) }
       else { Remove-Item -LiteralPath $SERVER, $TASK_COPY -Force -ErrorAction SilentlyContinue }
       Uninstall-Command
+      Wrap-Apply 'remove'
       if (-not $NOHOOKS) {
         $upy = Find-Python
         if ($upy) { Apply-Hooks 'uninstall' $upy } else { Say (T 'hk_nopy') }
@@ -1417,6 +1616,9 @@ if n != c:
     # ---- 2c. sheltie command
     Install-Command
 
+    # ---- 2d. claude function in the PowerShell profiles (-Update never gets here)
+    $wrapDone = Wrap-Main
+
     # ---- 3. Task Scheduler
     if ($DRY) {
       Say (T 'dry_xml' $TASK_COPY $PYW $SERVER $LOGFILE)
@@ -1503,6 +1705,7 @@ if n != c:
       Say (T 'pair_skipped')
     }
     if (-not $NOHOOKS) { Say (T 'hk_restart') }
+    if ($wrapDone -and -not $DRY) { Say (T 'wrap_done') }
   } catch {
     if ($_.Exception.Message -ne 'HRExit') {
       [Console]::Error.WriteLine((T 'unexpected' $_.Exception.Message)); if ($env:SHELTIE_DEBUG -eq '1') { [Console]::Error.WriteLine($_.InvocationInfo.PositionMessage) }

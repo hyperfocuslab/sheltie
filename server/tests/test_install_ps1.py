@@ -136,6 +136,8 @@ class InstallPs1Test(unittest.TestCase):
             os.makedirs(d)
         self.log = os.path.join(self.tmp, "calls.log")
         open(self.log, "w").close()
+        # PowerShell 프로필이 든 Documents 대역(진짜 사용자 프로필을 건드리지 않게 항상 임시 폴더로 돌린다)
+        self.docs = os.path.join(self.tmp, "docs")
         self.xml = os.path.join(self.tmp, "task.xml")
         self.pids = os.path.join(self.tmp, "pids.txt")
         self.helper = os.path.join(self.tmp, "fake_helper.py")
@@ -206,7 +208,7 @@ class InstallPs1Test(unittest.TestCase):
             "FAKE_PY": sys.executable, "TS_SERVE_FILE": self.ts_serve_file, "TS_SERVE_JSON": self.ts_serve_json,
             "SHELTIE_SRC": self.stub, "SHELTIE_PYTHON": sys.executable, "SHELTIE_HC": self.hc,
             "SHELTIE_PORT": self.port, "SHELTIE_HEALTH_TRIES": "3",
-            "SHELTIE_ENV_KEY": "HKCU:\\" + self.subkey, "SHELTIE_HC_URL": self.hc_zip,
+            "SHELTIE_ENV_KEY": "HKCU:\\" + self.subkey, "SHELTIE_HC_URL": self.hc_zip, "SHELTIE_DOCUMENTS": self.docs,
             "SHELTIE_HC_SHA256": self.hc_zip_sha,
         })
         env.update(extra)
@@ -1177,6 +1179,223 @@ for _n in [n for n in dir(InstallPs1Test) if n.startswith("test_")]:
     setattr(InstallPs1UpdateTest, _n, None)  # 상속된 기존 테스트는 InstallPs1Test에서 이미 돈다
 
 
+WRAP_BEGIN = "# >>> sheltie: claude >>>"
+WRAP_END = "# <<< sheltie: claude <<<"
+FAKE_ECHO_CMD = '@echo off\r\necho %~n0 %*>>"%FAKE_LOG%"\r\nexit /b %FAKE_RC%\r\n'
+
+
+@unittest.skipUnless(PS and os.name == "nt", "Windows PowerShell이 없다(Windows에서만 돈다)")
+class InstallPs1WrapClaudeTest(InstallPs1Test):
+    """PowerShell 프로필의 claude 함수: 넣기·교체·거절·해제, 넣은 함수가 어디로 보내는지. 부모 테스트는 상속만 하므로 비운다."""
+
+    def p5(self):
+        return os.path.join(self.docs, "WindowsPowerShell", "Microsoft.PowerShell_profile.ps1")
+
+    def p7(self):
+        return os.path.join(self.docs, "PowerShell", "Microsoft.PowerShell_profile.ps1")
+
+    def rb(self, p):
+        with open(p, "rb") as f:
+            return f.read()
+
+    def wb(self, p, data):
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "wb") as f:
+            f.write(data)
+
+    def count(self, text):
+        return text.count(WRAP_BEGIN), text.count(WRAP_END)
+
+    def test_install_creates_5_1_profile_with_bom_and_ascii_block(self):
+        r = self.run_install()
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        raw = self.rb(self.p5())
+        self.assertTrue(raw.startswith(b"\xef\xbb\xbf"))
+        text = raw[3:].decode("ascii")
+        self.assertEqual(self.count(text), (1, 1))
+        self.assertIn("sheltie run claude", text)
+        self.assertFalse(os.path.exists(self.p7()))  # pwsh가 없고 파일도 없으면 7용은 만들지 않는다
+        self.assertIn("새 PowerShell 창부터", r.stdout)
+        self.assertNotIn("wrap_claude", read_json(self.cfg_path()))
+        self.assertEqual([n for n in os.listdir(os.path.dirname(self.p5())) if n.endswith(".tmp")], [])
+
+    def test_existing_profiles_keep_content_encoding_and_newlines(self):
+        orig5 = b"\xef\xbb\xbf$a = 1\r\n# \xed\x95\x9c\xea\xb8\x80\r\nlast line without newline"
+        orig7 = b"x = 1\nno bom \xed\x95\x9c\n"  # BOM 없는 UTF-8, LF
+        self.wb(self.p5(), orig5)
+        self.wb(self.p7(), orig7)
+        self.assertEqual(self.run_install().returncode, 0)
+        n5, n7 = self.rb(self.p5()), self.rb(self.p7())
+        self.assertTrue(n5.startswith(orig5))
+        self.assertTrue(n7.startswith(orig7))
+        self.assertEqual(self.count(n5.decode("utf-8")), (1, 1))
+        self.assertEqual(self.count(n7.decode("utf-8")), (1, 1))
+        self.assertFalse(n7.startswith(b"\xef\xbb\xbf"))
+        self.assertNotIn(b"\r\n", n7)  # LF 파일은 LF로
+        self.assertNotIn(b"\n", n5.replace(b"\r\n", b""))  # CRLF 파일은 CRLF로
+        self.assertEqual(self.run_install("-Uninstall").returncode, 0)
+        self.assertEqual(self.rb(self.p5()).rstrip(), orig5.rstrip())
+        self.assertEqual(self.rb(self.p7()).rstrip(), orig7.rstrip())
+
+    def test_utf16_profile_stays_utf16(self):
+        orig = "$a = '\ud55c\uae00'\r\n".encode("utf-16")  # BOM 포함 UTF-16LE
+        self.wb(self.p5(), orig)
+        self.assertEqual(self.run_install().returncode, 0)
+        raw = self.rb(self.p5())
+        self.assertTrue(raw.startswith(b"\xff\xfe"))
+        text = raw.decode("utf-16")
+        self.assertTrue(text.startswith("$a = '\ud55c\uae00'\r\n"))
+        self.assertEqual(self.count(text), (1, 1))
+        self.assertEqual(self.run_install("-Uninstall").returncode, 0)
+        self.assertEqual(self.rb(self.p5()).decode("utf-16").rstrip(), "$a = '\ud55c\uae00'")
+
+    def test_reinstall_replaces_without_duplicates(self):
+        self.wb(self.p5(), ("before=1\r\n" + WRAP_BEGIN + "\r\nfunction claude { 'OLD' }\r\n" + WRAP_END + "\r\nafter=1\r\n").encode())
+        self.assertEqual(self.run_install().returncode, 0)
+        text = self.rb(self.p5()).decode()
+        self.assertEqual(self.count(text), (1, 1))
+        self.assertNotIn("'OLD'", text)
+        self.assertTrue(text.startswith("before=1\r\n"))
+        self.assertEqual((text.count("before=1"), text.count("after=1")), (1, 1))
+        again = self.rb(self.p5())
+        self.assertEqual(self.run_install().returncode, 0)
+        self.assertEqual(self.rb(self.p5()), again)
+
+    def test_block_without_end_marker_left_alone(self):
+        body = ("x=1\r\n" + WRAP_BEGIN + "\r\nuser stuff\r\n").encode()
+        self.wb(self.p5(), body)
+        r = self.run_install()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.rb(self.p5()), body)
+        self.assertIn("끝 표시가 없어", r.stderr)
+
+    def test_symlinked_profile_not_touched(self):
+        real = os.path.join(self.tmp, "dotfiles_profile.ps1")
+        with open(real, "w") as f:
+            f.write("dot=1\n")
+        os.makedirs(os.path.dirname(self.p5()))
+        try:
+            os.symlink(real, self.p5())
+        except OSError:
+            self.skipTest("심볼릭 링크를 만들 권한이 없다")
+        r = self.run_install()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(read(real), "dot=1\n")
+        self.assertIn("심볼릭 링크", r.stdout)
+
+    def test_no_wrap_option_records_false_and_sticks(self):
+        self.assertEqual(self.run_install().returncode, 0)
+        self.assertEqual(self.count(self.rb(self.p5()).decode("utf-8-sig")), (1, 1))
+        r = self.run_install("-NoWrapClaude")
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertEqual(self.count(self.rb(self.p5()).decode("utf-8-sig")), (0, 0))  # 있던 블록도 지운다
+        self.assertIs(read_json(self.cfg_path())["wrap_claude"], False)
+        self.assertNotIn("새 PowerShell 창부터", r.stdout)
+        os.remove(self.p5())
+        self.assertEqual(self.run_install().returncode, 0)  # 옵션 없이도 다시 넣지 않는다
+        self.assertFalse(os.path.exists(self.p5()))
+
+    def test_no_wrap_by_env(self):
+        self.assertEqual(self.run_install(SHELTIE_NO_WRAP_CLAUDE="1").returncode, 0)
+        self.assertFalse(os.path.exists(self.p5()))
+        self.assertIs(read_json(self.cfg_path())["wrap_claude"], False)
+
+    def test_uninstall_removes_only_block(self):
+        self.wb(self.p5(), b"keep=1\r\n")
+        self.run_install()
+        r = self.run_install("-Uninstall")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.rb(self.p5()), b"keep=1\r\n")
+
+    def test_wrap_dry_run_changes_nothing(self):
+        self.wb(self.p5(), b"keep=1\r\n")
+        r = self.run_install("-DryRun")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.rb(self.p5()), b"keep=1\r\n")
+        self.assertIn(self.p5(), r.stdout)
+        self.run_install()
+        before = self.rb(self.p5())
+        self.run_install("-Uninstall", "-DryRun")
+        self.assertEqual(self.rb(self.p5()), before)
+
+    # ---- 함수 동작: 블록을 꺼내 가짜 claude.cmd·sheltie.cmd·hc.exe 자리로 돌린다.
+    def fn_run(self, cmd, with_claude=True, with_sheltie=True, with_hc=True, hc_default=False, env_extra=None, redirected=False):
+        """블록의 진짜 콘솔 판정(입출력 리다이렉트)은 자동 시험에서 늘 참이라, redirected=False면 그 한 조건만 뺀다."""
+        text = read(INSTALL)
+        m = re.search(r"\$WRAP_BLOCK = @'\r?\n(.*?)\r?\n'@", text, re.S)
+        block = m.group(1)
+        if not redirected:
+            old = "([Console]::IsInputRedirected -or [Console]::IsOutputRedirected)"
+            self.assertIn(old, block)
+            block = block.replace(old, "$false")
+        fb = os.path.join(self.tmp, "fakebin")
+        shutil.rmtree(fb, ignore_errors=True)
+        os.makedirs(fb)
+        names = (["claude.cmd"] if with_claude else []) + (["sheltie.cmd"] if with_sheltie else []) + (["hc.exe"] if with_hc and not hc_default else [])
+        for n in names:
+            with open(os.path.join(fb, n), "w", newline="") as f:
+                f.write(FAKE_ECHO_CMD if n.endswith(".cmd") else "x")
+        local = os.path.join(self.tmp, "la")
+        if hc_default:
+            os.makedirs(os.path.join(local, "Programs", "herdr-core"), exist_ok=True)
+            open(os.path.join(local, "Programs", "herdr-core", "hc.exe"), "w").close()
+        prof = os.path.join(self.tmp, "fn_profile.ps1")
+        with open(prof, "w", encoding="ascii", newline="") as f:
+            f.write(block + "\r\n")
+        open(self.log, "w").close()
+        sysroot = os.environ.get("SystemRoot", r"C:\Windows")
+        env = {k: v for k, v in os.environ.items() if k not in ("HC_TERMINAL_ID", "SHELTIE_NO_WRAP", "LOCALAPPDATA")}
+        env.update({"PATH": os.pathsep.join([fb, os.path.join(sysroot, "System32"), sysroot,
+                                             os.path.join(sysroot, "System32", "WindowsPowerShell", "v1.0")]),
+                    "LOCALAPPDATA": local, "FAKE_LOG": self.log, "FAKE_RC": "0"})
+        env.update(env_extra or {})
+        script = ". '%s'; %s; exit $LASTEXITCODE" % (prof.replace("'", "''"), cmd)
+        r = subprocess.run([PS, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
+                           env=env, capture_output=True, timeout=60, stdin=subprocess.DEVNULL)
+        self.last = r
+        return [l.rstrip() for l in self.calls()]
+
+    def test_function_wraps_plain_claude(self):
+        self.assertEqual(self.fn_run("claude"), ["sheltie run claude"])
+        self.assertEqual(self.fn_run("claude 'fix it' --model opus"), ['sheltie run claude "fix it" --model opus'])
+        self.assertEqual(self.fn_run("claude -c"), ["sheltie run claude -c"])
+        self.assertEqual(self.fn_run("claude x", with_hc=False, hc_default=True), ["sheltie run claude x"])
+
+    def test_function_passes_through_noninteractive(self):
+        for cmd in ("-p hi", "--print hi", "hi -p", "-v", "--version", "--help", "-h", "--bg x", "mcp list", "config",
+                    "update", "doctor", "install", "setup-token", "auth login", "plugin list"):
+            self.assertEqual(self.fn_run("claude " + cmd), ["claude " + cmd], cmd)
+        # PowerShell이 함수 인자에서 `--`를 먼저 걷어 가므로 `claude -- -p`의 -p는 플래그로 보인다(맥과 다른 점, 안전한 쪽)
+        self.assertEqual(self.fn_run("claude -- -p"), ["claude -p"])
+
+    def test_function_passes_through_when_unwrappable(self):
+        self.assertEqual(self.fn_run("claude x", env_extra={"HC_TERMINAL_ID": "t1"}), ["claude x"])
+        self.assertEqual(self.fn_run("claude x", env_extra={"SHELTIE_NO_WRAP": "1"}), ["claude x"])
+        self.assertEqual(self.fn_run("claude x", with_sheltie=False), ["claude x"])
+        self.assertEqual(self.fn_run("claude x", with_hc=False), ["claude x"])
+        self.assertEqual(self.fn_run("claude x", redirected=True), ["claude x"])  # 입출력이 콘솔이 아님
+        self.assertEqual(self.fn_run("claude x | Out-Null"), ["claude x"])  # 파이프라인으로 출력
+        self.assertEqual(self.fn_run("'in' | claude x"), ["claude x"])  # 파이프라인으로 입력
+
+    def test_function_keeps_exit_code(self):
+        self.fn_run("claude x", env_extra={"FAKE_RC": "7"})
+        self.assertEqual(self.last.returncode, 7)
+        self.fn_run("claude -p x", env_extra={"FAKE_RC": "9"})
+        self.assertEqual(self.last.returncode, 9)
+
+    def test_function_without_claude_reports_not_found(self):
+        self.fn_run("claude x", with_claude=False)
+        self.assertEqual(self.last.returncode, 127)
+        self.assertEqual(self.calls(), [])
+
+    def test_original_claude_via_application_lookup(self):
+        self.assertEqual(self.fn_run("& (Get-Command claude -CommandType Application) y"), ["claude y"])
+
+
+for _n in [n for n in dir(InstallPs1Test) if n.startswith("test_")]:
+    setattr(InstallPs1WrapClaudeTest, _n, None)  # 상속된 기존 테스트는 InstallPs1Test에서 이미 돈다
+
+
 class InstallPs1StaticTest(unittest.TestCase):
     """PowerShell이 없는 맥에서도 도는 파일 검사."""
 
@@ -1266,6 +1485,36 @@ class InstallPs1StaticTest(unittest.TestCase):
         t = read(INSTALL)
         self.assertNotIn(""".Replace("'", "'")""", t)
         self.assertIn("base64.b64decode", t)
+
+    def test_wrap_claude_block_matches_mac_installer(self):
+        # 맥 설치기(install.sh)와 같은 표시 줄·하위 명령·옵션 목록을 쓴다.
+        ps = read(INSTALL)
+        sh = read(os.path.join(ROOT, "install.sh"))
+        for marker in ("# >>> sheltie: claude >>>", "# <<< sheltie: claude <<<"):
+            self.assertIn(marker, ps)
+            self.assertIn(marker, sh)
+        m = re.search(r"^\s*(agents\|[a-z|-]+)\)\s*$", sh, re.M)
+        self.assertIsNotNone(m)
+        subs = m.group(1).split("|")
+        m2 = re.search(r"\$subs = ([^\n]+)", ps)
+        self.assertIsNotNone(m2)
+        self.assertEqual(re.findall(r"'([^']+)'", m2.group(1)), subs)
+        m3 = re.search(r"^\s*(-p\|--print[^)]*)\)", sh, re.M)
+        self.assertIsNotNone(m3)
+        m4 = re.search(r"\$flags = ([^\n]+)", ps)
+        self.assertEqual(re.findall(r"'([^']+)'", m4.group(1)), m3.group(1).split("|"))
+
+    def test_update_mode_returns_before_wrap_step(self):
+        t = read(INSTALL)
+        self.assertLess(t.index("if ($MODE -eq 'update') { Update-Main; return }"), t.index("$wrapDone = Wrap-Main"))
+
+    def test_wrap_claude_options_documented(self):
+        t = read(INSTALL)
+        for want in ("-NoWrapClaude", "SHELTIE_NO_WRAP_CLAUDE", "SHELTIE_DOCUMENTS", "wrap_claude", "SHELTIE_NO_WRAP", "HC_TERMINAL_ID",
+                     "MyDocuments", "WindowsPowerShell\\Microsoft.PowerShell_profile.ps1", "PowerShell\\Microsoft.PowerShell_profile.ps1"):
+            self.assertIn(want, t, want)
+        self.assertIn("-NoWrapClaude", messages()["help8"])
+        self.assertEqual(messages()["wrap_ask"], "claude를 Sheltie로 감쌀까요? 폰에서 글 보내기·화면 보기까지 됩니다 [Y/n] ")
 
     def test_no_ps7_only_syntax(self):
         t = read(INSTALL)
