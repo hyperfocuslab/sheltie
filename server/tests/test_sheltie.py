@@ -374,11 +374,26 @@ class ApnsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             hr.der_to_raw(der + b"\x00")
 
+    def test_question_key_off_by_default(self):
+        # 옛 iOS 앱은 push.subtitle.question을 몰라 키 문자열이 보인다: 기본은 blocked 키
+        self.assertFalse(hr.PUSH_KIND_KEYS)
+        self.assertIsNone(hr.blocked_variant({"state": "blocked", "kind": "question"}) if hr.PUSH_KIND_KEYS else None)
+
     def test_payload_loc_keys(self):
+        orig = hr.PUSH_KIND_KEYS
+        hr.PUSH_KIND_KEYS = True  # 질문·계획 키는 새 앱이 퍼진 뒤 켠다: 켰을 때의 동작
+        self.addCleanup(setattr, hr, "PUSH_KIND_KEYS", orig)
         def alert(*a, **k):
             return hr.build_payload("t1", "n", *a, **k)["aps"]["alert"]
         a = alert("blocked", {"kind": "question"})
-        self.assertEqual((a["subtitle-loc-key"], a["loc-key"]), ("push.subtitle.blocked", "push.body.blocked"))
+        self.assertEqual((a["subtitle-loc-key"], a["subtitle"]), ("push.subtitle.question", "Question"))
+        self.assertEqual(a["loc-key"], "push.body.blocked")
+        a = alert("blocked", {"kind": "plan"})
+        self.assertEqual((a["subtitle-loc-key"], a["subtitle"]), ("push.subtitle.plan", "Review plan"))
+        a = alert("blocked", {"kind": "dialog"})
+        self.assertEqual((a["subtitle-loc-key"], a["subtitle"]), ("push.subtitle.blocked", "Needs you"))
+        a = alert("blocked", {})
+        self.assertEqual(a["subtitle-loc-key"], "push.subtitle.blocked")
         self.assertEqual(alert("blocked", PERM)["subtitle-loc-key"], "push.subtitle.permission")
         a = alert("done", {})
         self.assertEqual((a["subtitle-loc-key"], a["loc-key"], a["body"]),
@@ -421,7 +436,7 @@ class ApnsTests(unittest.TestCase):
         self.assertEqual(hr.push_category("done", {}), "HR_DONE")
         p = hr.build_payload("t12", "hrtest", "blocked", dict(PERM, msg="approve " + "x" * 500))
         self.assertEqual(p["aps"]["alert"]["title"], "hrtest")
-        self.assertEqual(p["aps"]["alert"]["subtitle"], "Needs permission")
+        self.assertEqual(p["aps"]["alert"]["subtitle"], "Permission needed")
         self.assertEqual(p["aps"]["alert"]["subtitle-loc-key"], "push.subtitle.permission")
         self.assertNotIn("loc-key", p["aps"]["alert"])  # 에이전트가 쓴 msg는 번역하지 않는다
         self.assertEqual(len(p["aps"]["alert"]["body"]), 200)

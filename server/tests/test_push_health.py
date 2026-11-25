@@ -251,7 +251,7 @@ class ReminderTests(unittest.TestCase):
         r = self.at(300)
         self.assertEqual(len(r), 1)
         self.assertEqual(r[0]["reminder"], 1)
-        self.assertEqual(r[0]["aps"]["alert"]["subtitle"], "Reminder · Needs permission")
+        self.assertEqual(r[0]["aps"]["alert"]["subtitle"], "Reminder · Permission needed")
         self.assertEqual(r[0]["aps"]["alert"]["subtitle-loc-key"], "push.subtitle.reminder.permission")
         self.assertEqual(r[0]["aps"]["thread-id"], "t1")
         self.assertEqual(r[0]["aps"]["alert"]["title"], "hrtest")
@@ -286,10 +286,13 @@ class ReminderTests(unittest.TestCase):
         self.assertEqual([p for p in self.pusher.payloads if "reminder" in p], [])
 
     def test_blocked_reminder_loc_key(self):
+        orig = hr.PUSH_KIND_KEYS
+        hr.PUSH_KIND_KEYS = True  # 질문·계획 키는 새 앱이 퍼진 뒤 켠다: 켰을 때의 동작
+        self.addCleanup(setattr, hr, "PUSH_KIND_KEYS", orig)
         self.block({"app": "claude-code", "kind": "question", "msg": "which one?", "state": "blocked"})
         r = self.at(300)
         a = r[0]["aps"]["alert"]
-        self.assertEqual((a["subtitle"], a["subtitle-loc-key"]), ("Reminder · Needs reply", "push.subtitle.reminder.blocked"))
+        self.assertEqual((a["subtitle"], a["subtitle-loc-key"]), ("Reminder · Question", "push.subtitle.reminder.question"))
 
     def test_msg_change_restarts(self):
         self.block()

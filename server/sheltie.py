@@ -5852,8 +5852,10 @@ TIME_SENSITIVE_CATEGORIES = {"HR_PERMISSION", "HR_PERMISSION_ALWAYS", "HR_BLOCKE
 
 # 알림 문구는 앱의 String Catalog 키(loc-key)로 보내 기기 언어로 보이게 한다.
 # 평문 subtitle/body(영어)는 키를 모르는 구버전 앱과 로그용이다.
-SUBTITLES = {"HR_PERMISSION": "Needs permission", "HR_PERMISSION_ALWAYS": "Needs permission",
-             "HR_BLOCKED": "Needs reply", "HR_DONE": "Done", "HR_EXITED": "Exited"}
+SUBTITLES = {"HR_PERMISSION": "Permission needed", "HR_PERMISSION_ALWAYS": "Permission needed",
+             "HR_BLOCKED": "Needs you", "HR_DONE": "Idle", "HR_EXITED": "Exited"}
+# HR_BLOCKED는 요청 종류에 따라 제목을 나눈다(질문·계획 확인). 종류를 모르면 "Needs you".
+BLOCKED_SUBTITLES = {"question": "Question", "plan": "Review plan"}
 SUBTITLE_KEYS = {"HR_PERMISSION": "push.subtitle.permission", "HR_PERMISSION_ALWAYS": "push.subtitle.permission",
                  "HR_BLOCKED": "push.subtitle.blocked", "HR_DONE": "push.subtitle.done",
                  "HR_EXITED": "push.subtitle.exited"}
@@ -5878,6 +5880,19 @@ def push_ttl(payload):
 REMINDER_SUBTITLE_KEYS = {"HR_PERMISSION": "push.subtitle.reminder.permission",
                           "HR_PERMISSION_ALWAYS": "push.subtitle.reminder.permission",
                           "HR_BLOCKED": "push.subtitle.reminder.blocked"}
+
+
+# 질문·계획 전용 부제 키(push.subtitle.question/plan). 옛 iOS 앱은 이 키를 몰라 키 문자열이 그대로 보인다.
+# 새 앱(iOS 1.0.6 (19)·Android 1.0.7)이 충분히 퍼진 뒤 True로 바꾼다. 그 전에는 blocked 키(새 앱 "확인 요청")를 보낸다.
+PUSH_KIND_KEYS = False
+
+
+def blocked_variant(status, prompt=None):
+    """HR_BLOCKED 알림 제목의 종류: "question" | "plan" | None(종류를 모름). 카드 종류가 먼저, 없으면 status.kind."""
+    kind = prompt["kind"] if prompt else None
+    if kind not in BLOCKED_SUBTITLES:
+        kind = (status or {}).get("kind")
+    return kind if kind in BLOCKED_SUBTITLES else None
 
 
 def test_alert():
@@ -5905,8 +5920,12 @@ def build_payload(tid, name, state, status, prompt=None, exit_code=None):
         body = msg or "Needs your reply"
         loc_key = None if msg else "push.body.blocked"
     body = body[:200]
-    alert = {"title": name or "Untitled terminal", "subtitle": SUBTITLES[cat], "body": body,
-             "subtitle-loc-key": SUBTITLE_KEYS[cat]}
+    subtitle, subtitle_key = SUBTITLES[cat], SUBTITLE_KEYS[cat]
+    variant = blocked_variant(status, prompt) if cat == "HR_BLOCKED" and PUSH_KIND_KEYS else None
+    if variant:
+        subtitle, subtitle_key = BLOCKED_SUBTITLES[variant], "push.subtitle." + variant
+    alert = {"title": name or "Untitled terminal", "subtitle": subtitle, "body": body,
+             "subtitle-loc-key": subtitle_key}
     if not name:
         alert["title-loc-key"] = "push.title.untitled"  # id를 제목으로 보이지 않는다
     if loc_key:
@@ -8263,7 +8282,7 @@ class App:
                 payload["reminder"] = n
                 alert = payload["aps"]["alert"]
                 alert["subtitle"] = "Reminder · " + alert["subtitle"]
-                alert["subtitle-loc-key"] = REMINDER_SUBTITLE_KEYS[payload["aps"]["category"]]
+                alert["subtitle-loc-key"] = alert["subtitle-loc-key"].replace("push.subtitle.", "push.subtitle.reminder.", 1)
                 log.info("다시 알림 %s %d번째", tid, n)
                 self._notify(payload)
             self._detected = None
