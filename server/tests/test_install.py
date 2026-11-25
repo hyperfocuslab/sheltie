@@ -80,7 +80,8 @@ class InstallTest(unittest.TestCase):
                "SHELTIE_HEALTH_TRIES": "2", "TS_SERVE_JSON": self.ts_serve_json,
                "SHELTIE_SYS_AGENTS_DIR": self.sys_dir}
         env.update(extra)
-        return subprocess.run(["sh", INSTALL] + list(args), env=env, capture_output=True, text=True, timeout=60)
+        return subprocess.run(["sh", INSTALL] + list(args), env=env, capture_output=True, text=True, timeout=60,
+                              start_new_session=True)  # 제어 터미널을 끊는다: 설치기가 /dev/tty로 묻다 멈추지 않게
 
     def calls(self):
         with open(self.log) as f:
@@ -1110,6 +1111,19 @@ class InstallUpdateTest(InstallTest):
     def status(self):
         return read_json(self.status_path)
 
+    def test_update_does_not_touch_shell_rc(self):
+        self.install_old()
+        rc = os.path.join(self.home, ".zshrc")
+        self.assertIn("sheltie: claude", read(rc))  # 설치 때는 들어간다
+        with open(rc, "w") as f:
+            f.write("mine=1\n")
+        r = self.update()
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertEqual(read(rc), "mine=1\n")
+        os.remove(rc)
+        self.assertEqual(self.update(self.write_src("newer.py", versioned_stub("1.0.2"))).returncode, 0)
+        self.assertFalse(os.path.exists(rc))
+
     def test_update_replaces_server_and_keeps_config_tokens_devices(self):
         self.install_old()
         before = self.cfg_files()
@@ -1696,10 +1710,237 @@ class InstallMigrateTest(InstallTest):
         self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
         self.assertEqual(self.snapshot(), before)
 
+WRAP_BEGIN = "# >>> sheltie: claude >>>"
+WRAP_END = "# <<< sheltie: claude <<<"
+
+
+class InstallWrapClaudeTest(InstallTest):
+    """claude 셸 함수(~/.zshrc 등): 넣기·교체·거절·해제와, 넣은 함수가 zsh·bash에서 어디로 보내는지(진짜 tty로)."""
+
+    def rc(self, name=".zshrc"):
+        return os.path.join(self.home, name)
+
+    def block_in(self, text):
+        return text.count(WRAP_BEGIN), text.count(WRAP_END)
+
+    def test_install_creates_zshrc_with_block(self):
+        r = self.run_install()
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        text = read(self.rc())
+        self.assertEqual(self.block_in(text), (1, 1))
+        self.assertIn("sheltie run claude", text)
+        self.assertEqual(stat.S_IMODE(os.stat(self.rc()).st_mode), 0o644)
+        self.assertIn("새 터미널부터", r.stdout)
+        self.assertIn("SHELTIE_NO_WRAP=1 claude", r.stdout)
+        self.assertFalse(os.path.exists(self.rc(".bashrc")))  # 없던 bash 파일은 만들지 않는다
+        self.assertFalse(os.path.exists(self.rc(".bash_profile")))
+        self.assertNotIn("wrap_claude", read_json(os.path.join(self.home, ".config/sheltie/config.json")))
+
+    def test_install_keeps_existing_content_and_mode(self):
+        orig = "export A=1\nalias x='echo \"hi\"'\n# 한글 주석\nlast line without newline"
+        with open(self.rc(), "w", encoding="utf-8") as f:
+            f.write(orig)
+        os.chmod(self.rc(), 0o600)
+        with open(self.rc(".bashrc"), "w") as f:
+            f.write("b=1\n")
+        self.assertEqual(self.run_install().returncode, 0)
+        for name, head in ((".zshrc", orig), (".bashrc", "b=1\n")):
+            text = read(self.rc(name))
+            self.assertTrue(text.startswith(head), name)
+            self.assertEqual(self.block_in(text), (1, 1), name)
+        self.assertEqual(stat.S_IMODE(os.stat(self.rc()).st_mode), 0o600)
+        leftovers = [n for n in os.listdir(self.home) if n.startswith(".zshrc.") or n.startswith(".bashrc.")]
+        self.assertEqual(leftovers, [])
+        self.assertEqual(self.run_install("--uninstall").returncode, 0)
+        self.assertEqual(read(self.rc(".bashrc")), "b=1\n")
+        self.assertEqual(read(self.rc()).rstrip("\n"), orig.rstrip("\n"))
+
+    def test_reinstall_replaces_without_duplicates(self):
+        self.run_install()
+        text = read(self.rc())
+        # 오래된 내용으로 바꿔 둔 블록(앞뒤에 사용자 줄)
+        old = "before=1\n" + WRAP_BEGIN + "\nclaude() { echo OLD; }\n" + WRAP_END + "\nafter=1\n"
+        with open(self.rc(), "w") as f:
+            f.write(old)
+        self.assertEqual(self.run_install().returncode, 0)
+        text = read(self.rc())
+        self.assertEqual(self.block_in(text), (1, 1))
+        self.assertNotIn("echo OLD", text)
+        self.assertTrue(text.startswith("before=1\n"))
+        self.assertTrue(text.rstrip("\n").endswith(WRAP_END + "\nafter=1") or "after=1" in text)
+        self.assertEqual(text.count("before=1"), 1)
+        self.assertEqual(text.count("after=1"), 1)
+        again = text
+        self.run_install()
+        self.assertEqual(read(self.rc()), again)  # 두 번째는 바뀌는 게 없다
+
+    def test_block_without_end_marker_left_alone(self):
+        body = "x=1\n" + WRAP_BEGIN + "\nuser stuff\n"
+        with open(self.rc(), "w") as f:
+            f.write(body)
+        r = self.run_install()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(read(self.rc()), body)
+        self.assertIn("끝 표시가 없어", r.stderr)
+
+    def test_symlinked_rc_not_touched(self):
+        real = os.path.join(self.tmp, "dotfiles_zshrc")
+        with open(real, "w") as f:
+            f.write("dot=1\n")
+        os.symlink(real, self.rc())
+        r = self.run_install()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(os.path.islink(self.rc()))
+        self.assertEqual(read(real), "dot=1\n")
+        self.assertIn("심볼릭 링크", r.stdout)
+
+    def test_no_wrap_option_records_false_and_sticks(self):
+        r = self.run_install("--no-wrap-claude")
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertFalse(os.path.exists(self.rc()))
+        cfg = read_json(os.path.join(self.home, ".config/sheltie/config.json"))
+        self.assertIs(cfg["wrap_claude"], False)
+        self.assertNotIn("새 터미널부터", r.stdout)
+        # 다음 설치는 옵션 없이도 넣지 않는다
+        self.assertEqual(self.run_install().returncode, 0)
+        self.assertFalse(os.path.exists(self.rc()))
+
+    def test_declined_install_removes_existing_block(self):
+        self.run_install()
+        self.assertEqual(self.block_in(read(self.rc())), (1, 1))
+        self.run_install("--no-wrap-claude")
+        self.assertEqual(self.block_in(read(self.rc())), (0, 0))
+
+    def test_uninstall_removes_only_block(self):
+        with open(self.rc(), "w") as f:
+            f.write("keep=1\n")
+        self.run_install()
+        r = self.run_install("--uninstall")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(read(self.rc()), "keep=1\n")
+
+    def test_dry_run_changes_no_rc_and_does_not_ask(self):
+        with open(self.rc(), "w") as f:
+            f.write("keep=1\n")
+        r = self.run_install("--dry-run")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(read(self.rc()), "keep=1\n")
+        self.assertIn(self.rc(), r.stdout)
+        r = self.run_install("--uninstall", "--dry-run")
+        self.assertEqual(read(self.rc()), "keep=1\n")
+
+    def install_on_tty(self, answer):
+        """진짜 tty(script) 위에서 설치기를 돌리고, 물음이 뜬 뒤에 answer를 친다. stdin은 curl | sh처럼 파이프."""
+        env = dict(os.environ, HOME=self.home, PATH=self.bin + ":/usr/bin:/bin", FAKE_LOG=self.log,
+                   TS_SERVE_FILE=self.ts_serve_file, SHELTIE_SRC=self.stub, SHELTIE_HEALTH_TRIES="2",
+                   TS_SERVE_JSON=self.ts_serve_json, SHELTIE_SYS_AGENTS_DIR=self.sys_dir)
+        p = subprocess.Popen(["script", "-q", "/dev/null", "sh", INSTALL], env=env, stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        seen = b""
+        try:
+            while b"[Y/n]" not in seen:
+                ch = os.read(p.stdout.fileno(), 4096)
+                if not ch:
+                    break
+                seen += ch
+            p.stdin.write(answer.encode())
+            p.stdin.flush()
+            rest, _ = p.communicate(timeout=60)
+        finally:
+            p.kill()
+            p.wait()
+        return p.returncode, (seen + rest).decode("utf-8", "replace")
+
+    def test_prompt_no_via_tty_records_false(self):
+        rc, out = self.install_on_tty("n\n")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("claude를 Sheltie로 감쌀까요?", out)
+        self.assertFalse(os.path.exists(self.rc()))
+        cfg = read_json(os.path.join(self.home, ".config/sheltie/config.json"))
+        self.assertIs(cfg["wrap_claude"], False)
+
+    def test_prompt_enter_via_tty_installs(self):
+        rc, out = self.install_on_tty("\n")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.block_in(read(self.rc())), (1, 1))
+
+    # ---- 함수 동작
+    def shell_run(self, shell, cmd, with_sheltie=True, with_hc=True, hc_in_home=False, env_extra=None, tty=True):
+        """블록을 넣은 ~/.zshrc를 source하고 cmd를 실행. 가짜 claude·sheltie·hc는 받은 인자를 로그에 남긴다."""
+        fb = os.path.join(self.tmp, "fakebin")
+        shutil.rmtree(fb, ignore_errors=True)
+        os.makedirs(fb)
+
+        def mk(name, d=fb):
+            q = os.path.join(d, name)
+            with open(q, "w") as f:
+                f.write(FAKE_SH % ":")
+            os.chmod(q, 0o755)
+
+        stale = os.path.join(self.home, ".local/bin/hc")
+        if os.path.exists(stale):
+            os.remove(stale)
+        mk("claude")
+        if with_sheltie:
+            mk("sheltie")
+        if with_hc:
+            if hc_in_home:
+                os.makedirs(os.path.join(self.home, ".local/bin"), exist_ok=True)
+                mk("hc", os.path.join(self.home, ".local/bin"))
+            else:
+                mk("hc")
+        open(self.log, "w").close()
+        self.assertEqual(self.run_install().returncode, 0)
+        open(self.log, "w").close()
+        env = {"HOME": self.home, "PATH": fb + ":/usr/bin:/bin", "FAKE_LOG": self.log}
+        env.update(env_extra or {})
+        argv = [shell] + (["-f"] if shell == "zsh" else ["--norc", "--noprofile"]) + ["-c", '. "$HOME/.zshrc"; ' + cmd]
+        if tty:
+            argv = ["script", "-q", "/dev/null"] + argv
+            subprocess.run(argv, env=env, input="", capture_output=True, text=True, timeout=30)
+        else:
+            subprocess.run(argv, env=env, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
+        return self.calls()
+
+    def each_shell(self):
+        for sh in ("zsh", "bash"):
+            if shutil.which(sh, path="/bin:/usr/bin:/usr/local/bin:/opt/homebrew/bin"):
+                yield sh
+
+    def test_function_wraps_plain_claude(self):
+        for sh in self.each_shell():
+            self.assertEqual(self.shell_run(sh, "claude"), ["sheltie run claude"], sh)
+            self.assertEqual(self.shell_run(sh, 'claude "fix it" --model opus'),
+                             ["sheltie run claude fix it --model opus"], sh)
+            self.assertEqual(self.shell_run(sh, "claude -c"), ["sheltie run claude -c"], sh)
+
+    def test_function_passes_through_noninteractive(self):
+        for sh in self.each_shell():
+            for cmd in ("claude -p hi", "claude --print hi", "claude hi -p", "claude -v", "claude --version",
+                        "claude --help", "claude -h", "claude --bg x", "claude mcp list", "claude config", "claude update",
+                        "claude doctor", "claude install", "claude setup-token", "claude auth login", "claude plugin list"):
+                got = self.shell_run(sh, cmd)
+                self.assertEqual(got, ["claude " + cmd[len("claude "):]], (sh, cmd))
+
+    def test_function_passes_through_when_unwrappable(self):
+        for sh in self.each_shell():
+            self.assertEqual(self.shell_run(sh, "claude x", env_extra={"HC_TERMINAL_ID": "t1"}), ["claude x"], sh)
+            self.assertEqual(self.shell_run(sh, "claude x", env_extra={"SHELTIE_NO_WRAP": "1"}), ["claude x"], sh)
+            self.assertEqual(self.shell_run(sh, "claude x", with_sheltie=False), ["claude x"], sh)
+            self.assertEqual(self.shell_run(sh, "claude x", with_hc=False), ["claude x"], sh)
+            self.assertEqual(self.shell_run(sh, "claude x", tty=False), ["claude x"], sh)  # stdin·stdout이 터미널이 아님
+            self.assertEqual(self.shell_run(sh, "claude x | cat", ), ["claude x"], sh)  # stdout만 파이프
+            self.assertEqual(self.shell_run(sh, "claude x", with_hc=True, hc_in_home=True), ["sheltie run claude x"], sh)
+
+    def test_command_claude_bypasses_function(self):
+        for sh in self.each_shell():
+            self.assertEqual(self.shell_run(sh, "command claude y"), ["claude y"], sh)
+
 for _n in [n for n in dir(InstallTest) if n.startswith("test_")]:
     setattr(InstallHooksTest, _n, None)  # 상속된 기존 테스트는 InstallTest에서 이미 돈다
     setattr(InstallMigrateTest, _n, None)
     setattr(InstallUpdateTest, _n, None)
+    setattr(InstallWrapClaudeTest, _n, None)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,9 @@
 #!/bin/sh
-# Sheltie 설치기(macOS). 사용: sh install.sh [--dry-run] [--uninstall] [--no-hooks] [--no-hc] [--no-auto-update] [--update]
+# Sheltie 설치기(macOS). 사용: sh install.sh [--dry-run] [--uninstall] [--no-hooks] [--no-hc] [--no-auto-update] [--no-wrap-claude] [--update]
+#   --no-wrap-claude: 셸 설정(~/.zshrc, 있으면 ~/.bashrc·~/.bash_profile)에 `claude`를 `sheltie run claude`로 감싸는 셸 함수를 넣지 않는다.
+#   기본은 터미널에서 묻고(Y), 터미널이 없으면 넣는다. 끄면 설정 wrap_claude: false로 남아 다시 설치해도 묻지도 넣지도 않는다(설정에서 지우면 다시 묻는다).
+#   함수는 `# >>> sheltie: claude >>>` ~ `# <<< sheltie: claude <<<` 사이에만 있고 해제(--uninstall) 때 지운다. 심볼릭 링크인 rc 파일은 건드리지 않는다.
+#   원래 claude로 띄우려면 `command claude` 또는 `SHELTIE_NO_WRAP=1 claude`. --update(자동 업데이트)는 셸 설정을 건드리지 않는다.
 #   --no-auto-update: 서버 자동 업데이트를 끈다(설정 auto_update: false). 한 번 끄면 다시 설치해도 그대로다(설정에서 지우면 켜진다).
 #   --update: 서버 자동 업데이트가 부른다(사람이 쓰지 않는다). SHELTIE_SRC의 새 서버로 바꾸고, 설정·토큰·기기는 그대로 두고,
 #   tailscale·QR·hc 설치를 건너뛰고, 훅을 다시 등록하고, 서비스를 다시 시작한다. SHELTIE_UPDATE_WAIT초(기본 120) 안에
@@ -57,6 +61,7 @@ MODE=install
 NOHOOKS=0
 NOHC=0
 NOAUTO=0
+NOWRAP=0
 PYTHON=""
 CMD_DIR="$HOME/.local/bin"
 CMD_PATH="$CMD_DIR/sheltie"
@@ -70,9 +75,10 @@ for a in "$@"; do
     --no-hooks) NOHOOKS=1 ;;
     --no-hc) NOHC=1 ;;
     --no-auto-update) NOAUTO=1 ;;
+    --no-wrap-claude) NOWRAP=1 ;;
     --update) MODE=update ;;
-    -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
-    *) echo "알 수 없는 옵션: $a (--dry-run, --uninstall, --no-hooks, --no-hc, --no-auto-update)" >&2; exit 2 ;;
+    -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
+    *) echo "알 수 없는 옵션: $a (--dry-run, --uninstall, --no-hooks, --no-hc, --no-auto-update, --no-wrap-claude, --update)" >&2; exit 2 ;;
   esac
 done
 
@@ -594,6 +600,167 @@ install_command() {
     *) say "$CMD_DIR 가 PATH에 없다. 터미널에서 sheltie 명령을 쓰려면 한 번 실행해라: echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.zshrc" ;;
   esac
 }
+# claude 셸 함수(~/.zshrc 등). 터미널에서 평소처럼 `claude`만 쳐도 `sheltie run claude`로 떠서 폰에서 글 보내기·화면 보기까지 된다.
+WRAP_BEGIN="# >>> sheltie: claude >>>"
+WRAP_END="# <<< sheltie: claude <<<"
+wrap_block() { # 표시 줄 포함 블록 전문. 따옴표 here-doc이라 내용은 그대로 나간다(zsh·bash 공통, POSIX에 가깝게)
+  cat <<'WRAPEOF'
+# >>> sheltie: claude >>>
+# Sheltie 설치기가 넣고 해제(--uninstall) 때 지운다. 이 줄과 끝 표시 줄 사이를 고치면 다음 설치 때 덮어쓴다.
+# 끄기: 설치기에 --no-wrap-claude. 한 번만 원래대로: `command claude` 또는 `SHELTIE_NO_WRAP=1 claude`
+claude() {
+  if [ -n "${SHELTIE_NO_WRAP:-}" ] || [ -n "${HC_TERMINAL_ID:-}" ] || ! [ -t 0 ] || ! [ -t 1 ] \
+    || ! command -v sheltie >/dev/null 2>&1 \
+    || ! { [ -x "$HOME/.local/bin/hc" ] || command -v hc >/dev/null 2>&1; }; then
+    command claude "$@"
+    return
+  fi
+  case "${1:-}" in
+    agents|attach|auth|auto-mode|config|doctor|gateway|import|install|logs|mcp|migrate-installer|plugin|plugins|purge|respawn|rm|setup-token|stop|kill|ultrareview|update|upgrade)
+      command claude "$@"
+      return ;;
+  esac
+  for _sheltie_a in "$@"; do
+    case "$_sheltie_a" in
+      --) break ;;
+      -p|--print|-v|--version|-h|--help|--bg|--background)
+        command claude "$@"
+        return ;;
+    esac
+  done
+  sheltie run claude "$@"
+}
+# <<< sheltie: claude <<<
+WRAPEOF
+}
+# wrap_rc <install|remove> <python>: 대상 rc 파일의 블록을 넣거나(있으면 교체) 지운다. 블록 밖 내용·권한은 그대로,
+# 같은 폴더 임시 파일에 쓰고 rename으로 바꾼다. 심볼릭 링크인 rc 파일은 건드리지 않고 안내만 한다
+# (링크 대상은 dotfiles 저장소일 수 있어 몰래 고치는 것보다 사용자가 직접 붙이는 쪽이 안전하다).
+# 대상: ~/.zshrc(install은 없으면 만든다), ~/.bashrc·~/.bash_profile(있을 때만).
+wrap_rc() {
+  _wb=$(wrap_block)
+  HR_BLOCK=$_wb HR_BEGIN=$WRAP_BEGIN HR_END=$WRAP_END HR_DRY=$DRY "$2" -c '
+import os, shutil, sys, tempfile
+action = sys.argv[1]
+home = os.environ["HOME"]
+block = os.environ["HR_BLOCK"].encode("utf-8")
+begin, end = os.environ["HR_BEGIN"].encode("utf-8"), os.environ["HR_END"].encode("utf-8")
+dry = os.environ["HR_DRY"] == "1"
+rc = 0
+for name in (".zshrc", ".bashrc", ".bash_profile"):
+    p = os.path.join(home, name)
+    if os.path.islink(p):
+        try:
+            has = begin in open(p, "rb").read()
+        except OSError:
+            has = False
+        if action == "install" or has:
+            print("%s 는 심볼릭 링크라 건드리지 않았다. claude 셸 함수는 직접 넣어라(내용은 install.sh의 wrap_block)." % p)
+        continue
+    exists = os.path.isfile(p)
+    if not exists and not (action == "install" and name == ".zshrc"):
+        continue
+    try:
+        data = open(p, "rb").read() if exists else b""
+    except OSError as e:
+        print("경고: %s 를 읽지 못했다(%s)." % (p, e), file=sys.stderr); rc = 1; continue
+    lines = data.split(b"\n")
+    out, i, placed, bad = [], 0, False, False
+    while i < len(lines):
+        ln = lines[i]
+        if ln.rstrip(b"\r") == begin:
+            j = i + 1
+            while j < len(lines) and lines[j].rstrip(b"\r") != end:
+                j += 1
+            if j >= len(lines):  # 끝 표시가 없다: 어디까지가 우리 것인지 모르니 파일을 그대로 둔다
+                bad = True
+                break
+            if action == "install":
+                if not placed:
+                    out.extend(block.split(b"\n"))
+                    placed = True
+            elif out and out[-1] == b"" and len(out) > 1:  # 넣을 때 앞에 둔 빈 줄도 같이 거둔다
+                out.pop()
+            i = j + 1
+            continue
+        out.append(ln)
+        i += 1
+    if bad:
+        print("경고: %s 에 시작 표시만 있고 끝 표시가 없어 건드리지 않았다." % p, file=sys.stderr); rc = 1; continue
+    if action == "install" and not placed:
+        if out and out[-1] == b"":
+            out.pop()
+        if out:
+            out.append(b"")
+        out.extend(block.split(b"\n"))
+        out.append(b"")
+    new = b"\n".join(out)
+    if new == data:
+        continue
+    if dry:
+        print("+ %s %s claude 셸 함수 블록" % (p, "에 넣기:" if action == "install" else "에서 지우기:"))
+        continue
+    try:
+        fd, tmp = tempfile.mkstemp(prefix="." + name + ".", dir=home)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(new)
+            if exists:
+                shutil.copymode(p, tmp)
+            else:
+                os.chmod(tmp, 0o644)
+            os.replace(tmp, p)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except OSError as e:
+        print("경고: %s 를 고치지 못했다(%s)." % (p, e), file=sys.stderr); rc = 1; continue
+    print("%s 에 claude 셸 함수를 %s." % (p, "넣었다" if action == "install" else "지웠다"))
+sys.exit(rc)
+' "$1" || say "경고: 셸 설정(claude 함수) 처리에 실패했다. 설치는 계속한다." >&2
+}
+# 감쌀지 정한다: --no-wrap-claude → 아니오(설정에 남김), 설정 wrap_claude가 false → 아니오, 터미널이 있으면 묻고(기본 Y), 없으면 예.
+# curl | sh에서는 stdin이 파이프라 /dev/tty에서 읽는다. dry-run은 묻지 않고 예로 본다.
+wrap_decide() { # 결과는 WRAP(1/0)과 WRAP_SAVE(1이면 설정에 false를 남긴다)
+  WRAP=1; WRAP_SAVE=0
+  if [ "$NOWRAP" = 1 ]; then WRAP=0; WRAP_SAVE=1; return 0; fi
+  if [ "$(config_value wrap_claude)" = false ]; then WRAP=0; return 0; fi
+  [ "$DRY" != 1 ] || return 0
+  if ( : </dev/tty ) 2>/dev/null; then
+    printf 'claude를 Sheltie로 감쌀까요? 폰에서 글 보내기·화면 보기까지 됩니다 [Y/n] ' >/dev/tty
+    _wa=""
+    read -r _wa </dev/tty || _wa=""
+    case "$_wa" in
+      [nN]*) WRAP=0; WRAP_SAVE=1 ;;
+    esac
+  fi
+}
+wrap_save_false() { # 설정에 wrap_claude: false를 남긴다(다른 키는 그대로)
+  HR_CONFIG=$CONFIG "$PYTHON" -c '
+import json, os
+p = os.environ["HR_CONFIG"]
+c = json.load(open(p))
+c["wrap_claude"] = False
+tmp = p + ".tmp"
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as f:
+    json.dump(c, f, indent=2)
+os.replace(tmp, p)
+' || say "경고: 설정에 wrap_claude를 남기지 못했다($CONFIG)." >&2
+}
+wrap_main() { # 설치 단계: 정하고, 넣거나 지운다
+  wrap_decide
+  if [ "$WRAP" = 1 ]; then
+    wrap_rc install "$PYTHON"
+    WRAP_DONE=1
+  else
+    [ "$WRAP_SAVE" != 1 ] || [ "$DRY" = 1 ] || wrap_save_false
+    wrap_rc remove "$PYTHON"
+  fi
+}
 # LaunchAgent plist. deploy/user-launchagent.plist.in과 같아야 한다(테스트가 비교). 템플릿 파일이 옆에 없으면(curl | sh) 이 사본.
 PLIST_BUILTIN='<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -654,6 +821,8 @@ if [ "$MODE" = uninstall ]; then
     run "$TS" serve "--https=$PORT" off || say "tailscale serve 해제 실패(이미 없을 수 있다)"
   fi
   if [ -f "$CMD_PATH" ] && grep -F "$CMD_MARK" "$CMD_PATH" >/dev/null 2>&1; then run rm -f "$CMD_PATH"; fi
+  if UPY2=$(command -v python3 2>/dev/null) && [ -n "$UPY2" ]; then wrap_rc remove "$UPY2"
+  else say "python3가 없어 셸 설정의 claude 함수는 그대로다. ~/.zshrc 등에서 '$WRAP_BEGIN' ~ '$WRAP_END' 줄 사이를 직접 지워라."; fi
   [ ! -e "$SYS_PLIST" ] || say "/Library/LaunchAgents에도 설치돼 있다. 지우려면: sudo rm $SYS_PLIST"
   if [ "$NOHOOKS" != 1 ]; then
     if UPY=$(command -v python3 2>/dev/null) && [ -n "$UPY" ]; then hooks_apply uninstall "$UPY"
@@ -1041,6 +1210,10 @@ if [ "$NOHOOKS" = 1 ]; then say "(--no-hooks: 훅 등록 건너뜀)"; else hooks
 # ---- 2c. sheltie 명령(~/.local/bin/sheltie)
 install_command
 
+# ---- 2d. claude 셸 함수(~/.zshrc 등). --update는 여기까지 오지 않는다(셸 설정을 건드리지 않는다).
+WRAP_DONE=0
+wrap_main
+
 # ---- 3. LaunchAgent
 TEMPLATE=
 SYS_INSTALLED=0
@@ -1132,4 +1305,7 @@ else
 fi
 if [ "$NOHOOKS" != 1 ]; then
   say "Claude Code·Codex·Qwen Code·OpenCode를 새로 시작해야 훅이 적용된다(Codex는 /hooks 에서 한 번 신뢰해야 한다)."
+fi
+if [ "$WRAP_DONE" = 1 ] && [ "$DRY" != 1 ]; then
+  say "claude 셸 함수는 새 터미널부터 적용된다(지금 터미널은 source ~/.zshrc). 원래 claude로 띄우려면 command claude 또는 SHELTIE_NO_WRAP=1 claude."
 fi
