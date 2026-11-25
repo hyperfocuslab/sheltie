@@ -132,7 +132,7 @@ MAX_BODY = 64 * 1024
 # 이 프로세스가 뜬 시각(/api/health의 started). 설치기가 재설치 뒤 응답한 서버가 새 서버인지 대조한다.
 PROCESS_STARTED = time.time()
 # 서버 버전(/api/health의 server_version). 릴리스(ops/release-server.sh)마다 올린다. 자동 업데이트는 이보다 높은 버전만 받는다.
-SERVER_VERSION = "1.0.6"
+SERVER_VERSION = "1.0.7"
 POLL_INTERVAL = 15
 BIND_RETRY = 10
 EVENTS_MAX_BACKOFF = 30
@@ -143,6 +143,7 @@ RELAY_RETRY_WAIT = 1.0  # 중계 5xx 뒤 한 번 다시 보내기 전 쉬는 시
 PRESENCE_QUIET_SEC = 120  # PC 입력이 이 초 안에 있었으면 끝남 알림을 보내지 않는다. config presence_quiet_sec(0이면 끔)
 PRESENCE_CACHE_SEC = 5  # PC 입력 시각을 다시 읽지 않고 쓰는 시간(초). 끝남이 몰려도 ioreg를 여러 번 띄우지 않게
 PRESENCE_CMD_TIMEOUT = 2
+IOREG_PATH = "/usr/sbin/ioreg"
 REMINDER_AFTER_SEC = (300, 1800)  # 막힘 첫 알림 뒤 다시 알릴 시점(초). config reminder_after_sec로 바꾼다
 PUSH_STATUS_FILE = "push_status.json"
 PUSH_FAILING_WINDOW_MS = 24 * 3600 * 1000
@@ -6537,8 +6538,10 @@ def win_idle_ms(tick64, last_input):
 
 
 def mac_idle_sec(runner=None):
+    # launchd PATH에는 /usr/sbin이 없다(2026-11-25 1.0.6 실측: 늘 모름이 되어 끝남 알림이 그대로 나갔다): 절대 경로로 부른다
+    exe = IOREG_PATH if os.path.exists(IOREG_PATH) else "ioreg"
     try:
-        p = (runner or subprocess.run)(["ioreg", "-c", "IOHIDSystem", "-d", "4"], capture_output=True, text=True,
+        p = (runner or subprocess.run)([exe, "-c", "IOHIDSystem", "-d", "4"], capture_output=True, text=True,
                                        timeout=PRESENCE_CMD_TIMEOUT)
     except (OSError, subprocess.SubprocessError):
         return None

@@ -146,7 +146,7 @@ class ParseTests(unittest.TestCase):
             calls.append((args, kw.get("timeout")))
             return subprocess.CompletedProcess(args, 0, IOREG_SAMPLE.replace("82482958", "45000000000"), "")
         self.assertAlmostEqual(hr.mac_idle_sec(runner), 45.0)
-        self.assertEqual(calls, [(["ioreg", "-c", "IOHIDSystem", "-d", "4"], hr.PRESENCE_CMD_TIMEOUT)])
+        self.assertEqual(calls, [([hr.IOREG_PATH, "-c", "IOHIDSystem", "-d", "4"], hr.PRESENCE_CMD_TIMEOUT)])
 
     def test_mac_idle_failures(self):
         def bad(args, **kw):
@@ -207,3 +207,20 @@ class IdleProbeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class IoregPathTest(unittest.TestCase):
+    def test_uses_absolute_ioreg_path(self):
+        # launchd PATH에는 /usr/sbin이 없다: ioreg를 이름만으로 부르면 못 찾는다
+        seen = []
+
+        class P:
+            returncode = 0
+            stdout = '    | |   "HIDIdleTime" = 5000000000\n'
+
+        def runner(argv, **kw):
+            seen.append(argv[0])
+            return P()
+        self.assertEqual(hr.mac_idle_sec(runner=runner), 5.0)
+        if os.path.exists(hr.IOREG_PATH):
+            self.assertEqual(seen[0], "/usr/sbin/ioreg")
