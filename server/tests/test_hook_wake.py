@@ -331,6 +331,19 @@ class TranscriptWakeTests(unittest.TestCase):
         turns, _ = hr.parse_transcript([self.user([{"type": "text", "text": real}])], 50)
         self.assertEqual(turns[0]["parts"], [{"kind": "text", "text": "이어서 해\n둘째 줄"}])
 
+    def test_new_and_old_marks_shown_as_user_text(self):
+        self.assertTrue(hr.HOOK_WAKE_MARK.startswith("[Sheltie] Message the user sent from their phone"))
+        for mark in (hr.HOOK_WAKE_MARK, "[Sheltie] 폰에서 보낸 메시지:"):
+            t = ('<system-reminder>\nStop hook blocking error from command "Stop": %s\n이어서 해\n</system-reminder>'
+                 % mark)
+            self.assertEqual(hr._user_text(t), "이어서 해", mark)
+            turns, _ = hr.parse_transcript([self.user(t)], 50)
+            self.assertEqual(turns[0]["parts"], [{"kind": "text", "text": "이어서 해"}], mark)
+        # 표시가 다르면(다른 Stop 훅의 피드백) 숨긴다
+        t = ('<system-reminder>\nStop hook blocking error from command "Stop": [Sheltie] other:\nx\n'
+             '</system-reminder>')
+        self.assertIsNone(hr._user_text(t))
+
     def test_full_command_string_in_header(self):
         t = ('<system-reminder>\nStop hook blocking error from command "\\"/usr/bin/python3\\" \\"/x/sheltie.py\\" '
              'hook-wait claude": %s\nhi\n</system-reminder>' % hr.HOOK_WAKE_MARK)

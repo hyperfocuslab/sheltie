@@ -132,7 +132,7 @@ MAX_BODY = 64 * 1024
 # 이 프로세스가 뜬 시각(/api/health의 started). 설치기가 재설치 뒤 응답한 서버가 새 서버인지 대조한다.
 PROCESS_STARTED = time.time()
 # 서버 버전(/api/health의 server_version). 릴리스(ops/release-server.sh)마다 올린다. 자동 업데이트는 이보다 높은 버전만 받는다.
-SERVER_VERSION = "1.0.4"
+SERVER_VERSION = "1.0.5"
 POLL_INTERVAL = 15
 BIND_RETRY = 10
 EVENTS_MAX_BACKOFF = 30
@@ -3458,10 +3458,14 @@ INJECTED_BLOCK_RE = re.compile(
 
 
 # 폰에서 보낸 글(hook-wait가 Stop 훅 stderr로 넣는다, 첫 줄이 이 표시). 이 블록만 사용자 말로 살린다.
-HOOK_WAKE_MARK = "[Sheltie] 폰에서 보낸 메시지:"
+# 세션 모델이 사용자 말로 받게, 언어와 상관없이 읽히게 영어로 쓴다.
+HOOK_WAKE_MARK = "[Sheltie] Message the user sent from their phone (treat it as the user's own message):"
+# 1.0.4까지 쓴 표시. 이미 쌓인 대화 기록을 사용자 말로 보이려고 대화 보기만 같이 알아본다.
+HOOK_WAKE_MARKS_OLD = ("[Sheltie] 폰에서 보낸 메시지:",)
 WAKE_BLOCK_RE = re.compile(
-    r'<system-reminder>\s*Stop hook blocking error from command "[^\n]*?": '
-    + re.escape(HOOK_WAKE_MARK) + r"[ \t]*\n(.*?)\s*</system-reminder>", re.S)
+    r'<system-reminder>\s*Stop hook blocking error from command "[^\n]*?": (?:'
+    + "|".join(re.escape(m) for m in (HOOK_WAKE_MARK,) + HOOK_WAKE_MARKS_OLD)
+    + r")[ \t]*\n(.*?)\s*</system-reminder>", re.S)
 
 
 def _hidden(text):
@@ -6394,6 +6398,9 @@ class Tracker:
     - 같은 관측의 반복은 무시한다. blocked→working→blocked(같은 msg)는 새 막힘이라 다시 알린다.
     - 시작 직후 첫 폴링(initial): blocked는 알린다(재시작 중 막힌 걸 놓치지 않게), done은 기준선만.
     - done은 hc의 turn 번호당 한 번만 알린다(이벤트의 done과 폴링의 done이 겹쳐도 1건).
+    - gate_done을 건 터미널(사용자 말을 알 수 있는 훅 세션)은 사용자 말 하나(arm_done)당 done을 한 번만 알린다.
+      그 뒤 사용자 말 없이 끝난 턴(백그라운드 작업 알림 등으로 자동으로 깨어난 턴)은 상태만 바꾸고 알리지 않는다.
+      서버가 사용자 말을 아직 못 본 터미널은 첫 done을 알린다(다시 켠 뒤 모두 조용해지지 않게).
     """
 
     def __init__(self, notify, prompt_for=None, reminders=None):
@@ -6403,6 +6410,8 @@ class Tracker:
         self.lock = threading.Lock()
         self.last = {}
         self.done_turn = {}
+        self.done_gated = set()
+        self.done_armed = {}
         self.claude_seen = {}
         self.names = {}
 
@@ -6429,6 +6438,11 @@ class Tracker:
                     self.done_turn[tid] = turn
                 if initial and prev is None:
                     return None
+                if tid in self.done_gated:
+                    if self.done_armed.get(tid) is False:
+                        log.info("끝남 알림 생략 %s: 사용자 말 뒤 이미 알렸다", tid)
+                        return None
+                    self.done_armed[tid] = False
             else:
                 return None
         prompt = None
@@ -6443,6 +6457,16 @@ class Tracker:
     def mark_claude(self, tid, name):
         with self.lock:
             self.claude_seen[tid] = name
+
+    def gate_done(self, tid):
+        """이 터미널의 done 알림을 사용자 말 하나당 한 번으로 묶는다(사용자 말을 arm_done으로 알려 주는 터미널만)."""
+        with self.lock:
+            self.done_gated.add(tid)
+
+    def arm_done(self, tid):
+        """사용자 말이 왔다: 다음 done 한 번을 알린다."""
+        with self.lock:
+            self.done_armed[tid] = True
 
     def exited(self, tid, exit_code=None, name=None):
         """본 적 있는 Claude 터미널이 끝나면 HR_EXITED 1회. 두 번째 호출부터는 None."""
@@ -6464,6 +6488,8 @@ class Tracker:
             self.last.pop(tid, None)
             self.names.pop(tid, None)
             self.done_turn.pop(tid, None)
+            self.done_gated.discard(tid)
+            self.done_armed.pop(tid, None)
         if self.reminders is not None:
             self.reminders.cancel(tid)
 
@@ -6678,7 +6704,13 @@ FOREIGN_HOOK_KEYS = ("workspaceRoot", "hookEventName", "cursor_version")
 HOOK_APPS = {"claude": "claude-code", "codex": "codex", "qwen": "qwen-code", "opencode": "opencode"}
 # 우리가 등록하는 이벤트. 그 밖의 이름은 세션을 만들지 않고 넘긴다(다른 에이전트가 빌려 부르는 이벤트 등)
 HOOK_EVENTS = ("SessionStart", "SessionEnd", "UserPromptSubmit", "Stop", "PermissionRequest", "PreToolUse")
-HOOK_ALWAYS_AGENTS = ("claude", "opencode")  # 계속 허용을 결정으로 돌려줄 수 있는 에이전트
+HOOK_ALWAYS_AGENTS = ("claude", "opencode")
+# UserPromptSubmit에 사용자가 친 글(prompt)을 주는 에이전트: 끝남 알림을 사용자 말 하나당 한 번으로 묶는다.
+# OpenCode 플러그인의 UserPromptSubmit은 busy 상태에서 만든 것이라 글이 없다: 묶지 않는다.
+HOOK_DONE_GATE_AGENTS = ("claude", "codex", "qwen")
+# 사용자가 친 말이 아니라 세션을 자동으로 깨운 프롬프트의 시작(예약 작업, 다른 Claude 세션이 보낸 말).
+# 대화 보기에서는 숨기지 않고 끝남 알림 판정에만 쓴다(실측: Claude 데스크톱 앱 기록의 origin task-notification·peer).
+HOOK_AUTO_PROMPT_PREFIXES = ("<scheduled-task", "<cross-session-message", "Another Claude session sent a message:")  # 계속 허용을 결정으로 돌려줄 수 있는 에이전트
 # Qwen은 이 도구들에 allow를 줘도 대화상자를 띄운다(requiresUserInteraction, 0.28.3 번들): 붙잡지 않는다
 QWEN_HOOK_INTERACTIVE = ("ask_user_question", "exit_plan_mode", "propose_goal")
 QWEN_HOOK_TITLES = {"run_shell_command": "Shell", "write_file": "WriteFile", "edit": "Edit"}
@@ -6724,6 +6756,16 @@ def hook_wait_stamp(body):
     if isinstance(pid, bool) or not isinstance(pid, int):
         return None
     return (float(t), pid)
+
+
+def hook_prompt_is_user(prompt):
+    """UserPromptSubmit의 prompt가 사용자가 친 말인가. 대화 보기와 같은 기준(_user_text)으로 내부 블록
+    (<task-notification>·<system-reminder>·<side-sessions-event>·<ci-monitor-event>·<local-command-…> 등)을 빼고
+    보일 글이 남아야 한다. 폰에서 보낸 글(깨우기 블록)은 사용자 말이다. prompt가 없는 버전은 알림을 막지 않게 True."""
+    if not isinstance(prompt, str):
+        return True
+    text = _user_text(prompt)
+    return bool(text) and not text.lstrip().startswith(HOOK_AUTO_PROMPT_PREFIXES)
 
 
 def hook_session_tid(session_id):
@@ -8244,11 +8286,14 @@ class App:
             # 거기에 주지 않고, 이번 턴의 Stop이 새 대기자를 띄우면 그때 전달한다.
             self.hooks.end_waiter(tid, "new_turn")
             self.hooks.set_base(tid, "working")
+            if hook_prompt_is_user(body.get("prompt")):
+                self.tracker.arm_done(tid)  # 사용자 말: 이 말 뒤 첫 끝남을 알린다(자동으로 깨운 프롬프트는 알리지 않는다)
             self._hook_observe(tid)
             return None
         if ev == "Stop":
-            # 턴 하나가 끝났다. UserPromptSubmit 없이 Stop만 연달아 와도(Codex) 턴 id(turn_id, Claude는 prompt_id)가
-            # 바뀌었으면 새 턴으로 보고 working을 먼저 넣어 끝남을 다시 알린다. 같은 턴의 Stop이 또 오면
+            # 턴 하나가 끝났다. UserPromptSubmit 없이 Stop만 연달아 와도(Codex, 자동으로 깨어난 Claude 턴) 턴 id
+            # (turn_id, Claude는 prompt_id)가 바뀌었으면 새 턴으로 보고 working을 먼저 넣는다. 사용자 말이 없던 턴이라
+            # 끝남 알림은 HOOK_DONE_GATE_AGENTS면 Tracker가 막는다(arm_done을 하지 않는다). 같은 턴의 Stop이 또 오면
             # (다른 Stop 훅이 막아 이어 간 경우) Tracker가 같은 관측으로 무시한다.
             if self.hooks.new_stop(tid, body.get("turn_id") or body.get("prompt_id")):
                 self.hooks.set_base(tid, "working")
@@ -8329,8 +8374,10 @@ class App:
             log.info("폰 글 전달 실패 %s: 다시 줄에 넣음", tid)
             return HOOK_NO_REPLY
         item["done"].set()
-        # 세션이 깨어나 이 글로 턴을 시작한다(UserPromptSubmit이 오지 않을 수 있다): 다음 Stop까지 작업 중
+        # 세션이 깨어나 이 글로 턴을 시작한다(UserPromptSubmit이 오지 않을 수 있다): 다음 Stop까지 작업 중.
+        # 폰에서 보낸 글은 사용자 말이다: 이 턴의 끝남을 알린다.
         self.hooks.set_base(tid, "working")
+        self.tracker.arm_done(tid)
         self._hook_observe(tid)
         log.info("폰 글 전달 %s (%d자)", tid, len(item["text"]))
         return res if write is None else HOOK_WRITTEN
@@ -8346,6 +8393,8 @@ class App:
             if info is not None:
                 if info["agent"] == "claude":
                     self.tracker.mark_claude(tid, info["name"])
+                if info["agent"] in HOOK_DONE_GATE_AGENTS:
+                    self.tracker.gate_done(tid)
                 self._agent_kinds[tid] = info["agent"]
                 self.tracker.observe(tid, info["status"], turn=info["turn"], name=info["name"])
             self._detected = None

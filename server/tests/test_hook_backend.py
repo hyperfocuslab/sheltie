@@ -633,9 +633,13 @@ class LifecycleTests(HookBase):
         self.assertEqual(self.hook("claude", body)[0], 409)  # 같은 세션을 다른 에이전트로
         n = len(self.pusher.payloads)
         self.hook("codex", load("codex-stop-doc.json"))
-        # UserPromptSubmit 없이 다음 턴의 Stop만 와도(turn_id가 다르다) 끝남을 다시 알린다. 같은 turn_id는 한 번
+        # UserPromptSubmit 없이 다음 턴의 Stop만 오면(turn_id가 다르다) 새 턴으로 보지만, 사용자 말이 없던 턴이라
+        # 끝남은 다시 알리지 않는다(사용자 말 하나당 한 번). 새 사용자 말 뒤에는 다시 한 번
         self.hook("codex", load("codex-stop-doc.json", turn_id="01a1fd04-0000-7000-8000-000000000002"))
-        self.hook("codex", load("codex-stop-doc.json", turn_id="01a1fd04-0000-7000-8000-000000000002"))
+        self.assertEqual(self.status(tid)["state"], "done")
+        self.hook("codex", load("codex-user-prompt-submit-0.171.0.json", turn_id="01a1fd04-0000-7000-8000-000000000003"))
+        self.hook("codex", load("codex-stop-doc.json", turn_id="01a1fd04-0000-7000-8000-000000000003"))
+        self.hook("codex", load("codex-stop-doc.json", turn_id="01a1fd04-0000-7000-8000-000000000003"))
         self.assertEqual([p["aps"]["category"] for p in self.pusher.payloads[n:]], ["HR_DONE", "HR_DONE"])
         n = len(self.pusher.payloads)
         self.hook("codex", load("codex-session-end-0.171.0.json"))
@@ -890,7 +894,9 @@ class QwenHookTests(HookBase):
         stop = load("qwen-stop-0.28.3.json")
         self.hook("qwen", stop)
         self.hook("qwen", stop)  # 같은 prompt_id의 Stop: 다시 알리지 않는다
-        self.hook("qwen", dict(stop, prompt_id=sid + "########2"))  # 다음 턴: 다시 알린다
+        self.hook("qwen", dict(stop, prompt_id=sid + "########2"))  # 사용자 말 없는 다음 턴: 알리지 않는다
+        self.hook("qwen", load("qwen-user-prompt-submit-0.28.3.json", prompt_id=sid + "########3"))
+        self.hook("qwen", dict(stop, prompt_id=sid + "########3"))  # 사용자 말 뒤 다음 턴: 다시 알린다
         self.assertEqual([p["aps"]["category"] for p in self.pusher.payloads[n:]], ["HR_DONE", "HR_DONE"])
         self.assertEqual(self.hook("claude", stop)[1]["error"], "agent_mismatch")
         n = len(self.pusher.payloads)
