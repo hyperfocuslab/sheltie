@@ -316,7 +316,10 @@ def spec():
     # (event, matcher or None, timeout seconds)
     if target == "claude":
         return [("PermissionRequest", "*", 600), ("PreToolUse", "AskUserQuestion|ExitPlanMode", 600),
-                ("SessionStart", None, 10), ("SessionEnd", None, 10), ("UserPromptSubmit", None, 10), ("Stop", None, 10)]
+                ("SessionStart", None, 10), ("SessionEnd", None, 10), ("UserPromptSubmit", None, 10), ("Stop", None, 10),
+                # Tool-finished signals: Claude Code keeps the PermissionRequest hook alive after the PC answers,
+                # so the server frees the held request when the same tool ends (short timeout, no output).
+                ("PostToolUse", "*", 5), ("PostToolUseFailure", "*", 5)]
     if target == "qwen":
         # Qwen Code reads hook timeouts in seconds (default 60): PermissionRequest must outlast the server hold.
         return [("PermissionRequest", "*", 600), ("SessionStart", None, 10), ("SessionEnd", None, 10),

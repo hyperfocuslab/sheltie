@@ -132,7 +132,7 @@ MAX_BODY = 64 * 1024
 # 이 프로세스가 뜬 시각(/api/health의 started). 설치기가 재설치 뒤 응답한 서버가 새 서버인지 대조한다.
 PROCESS_STARTED = time.time()
 # 서버 버전(/api/health의 server_version). 릴리스(ops/release-server.sh)마다 올린다. 자동 업데이트는 이보다 높은 버전만 받는다.
-SERVER_VERSION = "1.0.13"
+SERVER_VERSION = "1.0.14"
 POLL_INTERVAL = 15
 BIND_RETRY = 10
 EVENTS_MAX_BACKOFF = 30
@@ -6842,7 +6842,11 @@ FOREIGN_HOOK_KEYS = ("workspaceRoot", "hookEventName", "cursor_version")
 # app 값은 hc status가 그 에이전트에 쓰는 이름(Qwen "qwen-code")이나 에이전트 이름 그대로
 HOOK_APPS = {"claude": "claude-code", "codex": "codex", "qwen": "qwen-code", "opencode": "opencode", "agy": "agy"}
 # 우리가 등록하는 이벤트. 그 밖의 이름은 세션을 만들지 않고 넘긴다(다른 에이전트가 빌려 부르는 이벤트 등)
-HOOK_EVENTS = ("SessionStart", "SessionEnd", "UserPromptSubmit", "Stop", "PermissionRequest", "PreToolUse")
+HOOK_EVENTS = ("SessionStart", "SessionEnd", "UserPromptSubmit", "Stop", "PermissionRequest", "PreToolUse",
+               "PostToolUse", "PostToolUseFailure")
+# Claude의 도구 실행 끝 이벤트(PostToolUse 성공, PostToolUseFailure 실패·중단): 붙잡힌 같은 요청이 PC에서 이미 승인돼
+# 실행됐다는 신호다. PC에서 "거절"하면 어떤 신호도 오지 않는다(실측 2.1.332: PermissionDenied는 자동 모드 분류기 전용).
+HOOK_TOOL_DONE_EVENTS = ("PostToolUse", "PostToolUseFailure")
 HOOK_ALWAYS_AGENTS = ("claude", "opencode")
 # UserPromptSubmit에 사용자가 친 글(prompt)을 주는 에이전트: 끝남 알림을 사용자 말 하나당 한 번으로 묶는다.
 # OpenCode 플러그인의 UserPromptSubmit은 busy 상태에서 만든 것이라 글이 없다: 묶지 않는다.
@@ -7433,6 +7437,24 @@ class HookBackend:
         for h in holds:
             self.finish(h, "gone")
         return len(holds)
+
+    def release_tool(self, tid, tool_name, tool_input):
+        """도구 실행이 끝났다(PostToolUse): 같은 도구·같은 입력으로 붙잡힌 요청 하나는 PC에서 이미 답해 실행된 것이다.
+        목록에서 빼고 waiting이면 gone으로 끝낸다(시간 초과로 남은 expired 카드도 같이 치운다). 병렬로 줄 선 다른 요청은
+        남긴다. 같은 요청이 여럿이면 가장 먼저 붙잡은 것 하나만(실행도 한 번이다). 반환: 뺐으면 True."""
+        if not isinstance(tool_input, dict):
+            return False
+        with self.lock:
+            s = self.sessions.get(tid)
+            if s is None or not s["holds"]:
+                return False
+            hold = next((h for h in s["holds"] if h.tool_name == tool_name and h.tool_input == tool_input), None)
+            if hold is None:
+                return False
+            s["holds"].remove(hold)
+            s["status_ms"] = int(self.wall() * 1000)
+        self.finish(hold, "gone")
+        return True
 
     def pop_hold(self, tid, hold, base="working"):
         with self.lock:
@@ -8591,6 +8613,12 @@ class App:
             raise ApiError(400, "bad_hook")
         if ev not in HOOK_EVENTS:
             return None  # 우리가 등록하지 않은 이벤트: 세션을 만들지 않는다
+        if ev in HOOK_TOOL_DONE_EVENTS:
+            # 모든 도구마다 온다: 세션을 만들거나 건드리지 않고, 붙잡힌 같은 요청이 있을 때만 푼다. 출력은 없다.
+            if agent == "claude" and self.hooks.release_tool(tid, body.get("tool_name"), body.get("tool_input")):
+                log.info("훅 붙잡기 풀림 %s (%s %s: PC에서 답함)", tid, ev, body.get("tool_name"))
+                self._hook_observe(tid)
+            return None
         if self.hooks.has(tid) and self.hooks.get(tid)["agent"] != agent:
             raise ApiError(409, "agent_mismatch")
         if ev == "SessionEnd":

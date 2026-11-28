@@ -357,6 +357,93 @@ class PermissionTests(HookBase):
         self.assertEqual(self.status(tid)["state"], "done")
         self.assertEqual([p["aps"]["category"] for p in self.pusher.payloads[n:]].count("HR_DONE"), 1)
 
+    def test_post_tool_use_releases_same_tool_hold(self):
+        """PC에서 승인해 실행된 요청: 같은 도구·입력의 PostToolUse가 붙잡기를 풀고 카드·다시 알림이 사라진다."""
+        body = load("claude-permission-bash-2.1.329.json")
+        tid = self.tid_of(body)
+        box = self.hold_bg(body)
+        p = self.blocked(tid)
+        n = len(self.pusher.payloads)
+        post = load("claude-posttooluse-bash-2.1.332.json", session_id=body["session_id"])
+        self.assertEqual(self.hook("claude", post), (200, None))  # 출력 없음
+        box["th"].join(5)
+        self.assertFalse(box["th"].is_alive())
+        self.assertNotIn("r", box)
+        self.assertEqual(self.app.hooks.queued(tid), 0)
+        self.assertIsNone(self.app.hooks.current_prompt(tid))
+        wait_for(lambda: self.status(tid)["state"] == "idle")  # 세션 기준선(이 세션엔 UserPromptSubmit이 없었다)
+        self.assertEqual(self.answer(tid, {"action": "approve", "prompt_id": p["id"]})[1]["error"], "prompt_changed")
+        self.app.reminders.clock = lambda: 10_000.0
+        self.app.check_reminders()
+        self.assertEqual([x for x in self.pusher.payloads[n:] if x["aps"].get("category", "").startswith("HR_PERMISSION")], [])
+
+    def test_post_tool_use_failure_releases_hold(self):
+        body = load("claude-permission-bash-2.1.329.json")
+        tid = self.tid_of(body)
+        box = self.hold_bg(body)
+        self.blocked(tid)
+        post = load("claude-posttooluse-failure-bash-2.1.332.json", session_id=body["session_id"])
+        self.assertEqual(self.hook("claude", post), (200, None))
+        box["th"].join(5)
+        self.assertFalse(box["th"].is_alive())
+        self.assertEqual(self.app.hooks.queued(tid), 0)
+
+    def test_post_tool_use_other_input_keeps_hold(self):
+        body = load("claude-permission-bash-2.1.329.json")
+        tid = self.tid_of(body)
+        box = self.hold_bg(body)
+        self.blocked(tid)
+        post = load("claude-posttooluse-bash-2.1.332.json", session_id=body["session_id"],
+                    tool_input={"command": "ls"})
+        self.assertEqual(self.hook("claude", post), (200, None))
+        post = load("claude-posttooluse-bash-2.1.332.json", session_id=body["session_id"], tool_name="Read")
+        self.assertEqual(self.hook("claude", post), (200, None))
+        time.sleep(0.5)
+        self.assertTrue(box["th"].is_alive())
+        self.assertEqual(self.status(tid)["state"], "blocked")
+        self.answer(tid, {"action": "reject"})
+        self.result(box)
+
+    def test_post_tool_use_releases_only_matching_parallel_hold(self):
+        body = load("claude-permission-bash-2.1.329.json")
+        tid = self.tid_of(body)
+        b1 = self.hold_bg(body)
+        self.blocked(tid)
+        b2 = self.hold_bg(dict(body, tool_input={"command": "touch two"}))
+        wait_for(lambda: self.app.hooks.queued(tid) == 2)
+        # 두 번째 요청만 PC에서 승인돼 실행됐다
+        post = load("claude-posttooluse-bash-2.1.332.json", session_id=body["session_id"],
+                    tool_input={"command": "touch two"})
+        self.hook("claude", post)
+        b2["th"].join(5)
+        self.assertFalse(b2["th"].is_alive())
+        self.assertTrue(b1["th"].is_alive())
+        self.assertEqual(self.app.hooks.queued(tid), 1)
+        self.assertEqual(self.status(tid)["state"], "blocked")
+        self.assertIn("made_by_hook", self.app.hooks.current_prompt(tid)["body"])
+        self.answer(tid, {"action": "reject"})
+        self.result(b1)
+
+    def test_post_tool_use_clears_expired_hold(self):
+        """시간 초과로 {}를 돌려준 뒤에도 PC에서 승인되면 카드가 사라진다."""
+        now = [100.0]
+        self.app.hook_clock = lambda: now[0]
+        body = load("claude-permission-bash-2.1.329.json")
+        tid = self.tid_of(body)
+        box = self.hook_bg("claude", body)
+        self.blocked(tid)
+        now[0] += hr.HOOK_HOLD_SEC + 1
+        self.assertEqual(self.result(box), (200, {}))
+        self.assertEqual(self.status(tid)["state"], "blocked")
+        self.hook("claude", load("claude-posttooluse-bash-2.1.332.json", session_id=body["session_id"]))
+        self.assertEqual(self.status(tid)["state"], "idle")
+        self.assertEqual(self.app.hooks.queued(tid), 0)
+
+    def test_post_tool_use_without_session_creates_nothing(self):
+        post = load("claude-posttooluse-bash-2.1.332.json", session_id="5e5e5e5e-0000-4000-8000-000000000001")
+        self.assertEqual(self.hook("claude", post), (200, None))
+        self.assertFalse(self.app.hooks.has(self.tid_of(post)))
+
     def test_new_permission_request_keeps_queued_holds(self):
         body = load("claude-permission-bash-2.1.329.json")
         tid = self.tid_of(body)

@@ -712,7 +712,7 @@ class InstallTest(unittest.TestCase):
         self.assertFalse(os.path.exists(self.cmd_path()))
 
 
-HOOK_EVENTS_CLAUDE = {"PermissionRequest", "PreToolUse", "SessionStart", "SessionEnd", "UserPromptSubmit", "Stop"}
+HOOK_EVENTS_CLAUDE = {"PermissionRequest", "PreToolUse", "PostToolUse", "PostToolUseFailure", "SessionStart", "SessionEnd", "UserPromptSubmit", "Stop"}
 HOOK_EVENTS_CODEX = {"PermissionRequest", "SessionStart", "SessionEnd", "UserPromptSubmit", "Stop"}
 HOOK_EVENTS_QWEN = HOOK_EVENTS_CODEX
 
@@ -760,6 +760,9 @@ class InstallHooksTest(InstallTest):
         self.assertEqual(c["hooks"]["PermissionRequest"],
                          [{"matcher": "*", "hooks": [{"type": "command", "command": self.cmd("claude"), "timeout": 600}]}])
         self.assertEqual(c["hooks"]["PreToolUse"][0]["matcher"], "AskUserQuestion|ExitPlanMode")
+        for ev in ("PostToolUse", "PostToolUseFailure"):  # PC에서 이미 답한 붙잡기를 푸는 신호: 짧은 timeout
+            self.assertEqual(c["hooks"][ev],
+                             [{"matcher": "*", "hooks": [{"type": "command", "command": self.cmd("claude"), "timeout": 5}]}])
         self.assertEqual(c["hooks"]["Stop"],
                          [{"hooks": [{"type": "command", "command": self.cmd("claude"), "timeout": 10},
                                      {"type": "command", "command": self.wait_cmd(), "asyncRewake": True,
@@ -854,7 +857,7 @@ class InstallHooksTest(InstallTest):
         # 그대로면 파일이 안 바뀐다
         self.run_install()
         self.assertEqual(len(self.ours(read_json(self.settings())["hooks"]["Stop"])), 1)
-        self.assertEqual(first.count("sheltie.py"), 7)  # 6개 이벤트 + Stop의 hook-wait
+        self.assertEqual(first.count("sheltie.py"), 9)  # 8개 이벤트 + Stop의 hook-wait
         self.assertEqual(first.count("hook-wait claude"), 1)
 
     def waits(self, doc):
