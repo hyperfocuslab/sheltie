@@ -95,12 +95,24 @@ class DesktopTitlesTest(unittest.TestCase):
     def test_sessions_dir_per_platform(self):
         from unittest import mock
         with mock.patch.object(hr.sys, "platform", "darwin"):
-            self.assertEqual(hr.desktop_sessions_dir("/h", {}),
-                             "/h/Library/Application Support/Claude/claude-code-sessions")
+            self.assertEqual(hr.desktop_sessions_dirs("/h", {}),
+                             ["/h/Library/Application Support/Claude/claude-code-sessions"])
+        pk = os.path.join(self.root, "local", "Packages")
+        os.makedirs(os.path.join(pk, "Claude_pzs8sxrjxfjjc"))
+        os.makedirs(os.path.join(pk, "Other_123"))
         with mock.patch.object(hr.sys, "platform", "win32"):
-            self.assertEqual(hr.desktop_sessions_dir("/h", {"APPDATA": "/ad"}),
-                             os.path.join("/ad", "Claude", "claude-code-sessions"))
+            self.assertEqual(hr.desktop_sessions_dirs("/h", {"APPDATA": "/ad", "LOCALAPPDATA": os.path.join(self.root, "local")}),
+                             [os.path.join("/ad", "Claude", "claude-code-sessions"),
+                              os.path.join(pk, "Claude_pzs8sxrjxfjjc", "LocalCache", "Roaming", "Claude",
+                                           "claude-code-sessions")])
 
+    def test_several_roots(self):
+        other = os.path.join(self.root, "msix")
+        os.makedirs(os.path.join(other, "a", "o"))
+        with open(os.path.join(other, "a", "o", "local_z.json"), "w", encoding="utf-8") as f:
+            json.dump({"cliSessionId": "win-id", "title": "윈도우 세션"}, f, ensure_ascii=False)
+        t = hr.DesktopTitles([os.path.join(self.root, "missing"), other], clock=self.clock)
+        self.assertEqual(t.title("win-id"), "윈도우 세션")
 
 if __name__ == "__main__":
     unittest.main()

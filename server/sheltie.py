@@ -132,7 +132,7 @@ MAX_BODY = 64 * 1024
 # 이 프로세스가 뜬 시각(/api/health의 started). 설치기가 재설치 뒤 응답한 서버가 새 서버인지 대조한다.
 PROCESS_STARTED = time.time()
 # 서버 버전(/api/health의 server_version). 릴리스(ops/release-server.sh)마다 올린다. 자동 업데이트는 이보다 높은 버전만 받는다.
-SERVER_VERSION = "1.0.10"
+SERVER_VERSION = "1.0.11"
 POLL_INTERVAL = 15
 BIND_RETRY = 10
 EVENTS_MAX_BACKOFF = 30
@@ -7188,18 +7188,29 @@ DESKTOP_TITLES_TTL = 15.0  # 데스크톱 앱 세션 제목을 다시 읽는 간
 DESKTOP_TITLES_MAX = 400  # 제목으로 쓸 최대 글자 수
 
 
-def desktop_sessions_dir(home=None, env=None):
-    """Claude 데스크톱 앱(Code 탭)이 세션 메타데이터를 두는 폴더. 맥 ~/Library/Application Support/Claude,
-    윈도우 %APPDATA%\\Claude 아래 claude-code-sessions/<계정>/<조직>/local_*.json."""
+def desktop_sessions_dirs(home=None, env=None):
+    """Claude 데스크톱 앱(Code 탭)이 세션 메타데이터를 두는 폴더 후보. 맥 ~/Library/Application Support/Claude,
+    윈도우 %APPDATA%\\Claude와 MSIX 설치(스토어·winget)의 %LOCALAPPDATA%\\Packages\\Claude_*\\LocalCache\\Roaming\\Claude
+    (MSIX 앱의 %APPDATA% 쓰기는 이곳으로 옮겨져 패키지 밖 프로세스인 서버에는 여기로 보인다)
+    아래 claude-code-sessions/<계정>/<조직>/local_*.json."""
     env = os.environ if env is None else env
     home = home or os.path.expanduser("~")
     if sys.platform == "win32":
-        base = env.get("APPDATA") or os.path.join(home, "AppData", "Roaming")
-    elif sys.platform == "darwin":
+        roaming = env.get("APPDATA") or os.path.join(home, "AppData", "Roaming")
+        local = env.get("LOCALAPPDATA") or os.path.join(home, "AppData", "Local")
+        out = [os.path.join(roaming, "Claude", "claude-code-sessions")]
+        pkgs = os.path.join(local, "Packages")
+        try:
+            names = sorted(n for n in os.listdir(pkgs) if n.startswith("Claude_"))
+        except OSError:
+            names = []
+        out += [os.path.join(pkgs, n, "LocalCache", "Roaming", "Claude", "claude-code-sessions") for n in names]
+        return out
+    if sys.platform == "darwin":
         base = os.path.join(home, "Library", "Application Support")
     else:
         base = env.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
-    return os.path.join(base, "Claude", "claude-code-sessions")
+    return [os.path.join(base, "Claude", "claude-code-sessions")]
 
 
 class DesktopTitles:
@@ -7207,8 +7218,8 @@ class DesktopTitles:
     local_*.json의 cliSessionId·lastAssistantCliSessionId가 id, title이 제목. 파일은 mtime·크기가 바뀐 것만 다시 읽고
     폴더 훑기는 ttl마다 한 번(목록 요청 때). 폴더가 없거나 못 읽으면 None(폴더 이름을 쓴다)."""
 
-    def __init__(self, root, ttl=DESKTOP_TITLES_TTL, clock=time.monotonic):
-        self.root = root
+    def __init__(self, roots, ttl=DESKTOP_TITLES_TTL, clock=time.monotonic):
+        self.roots = [roots] if isinstance(roots, str) else list(roots)
         self.ttl = ttl
         self.clock = clock
         self.lock = threading.Lock()
@@ -7218,46 +7229,47 @@ class DesktopTitles:
 
     def _scan(self):
         files = {}
-        try:
-            accts = os.listdir(self.root)
-        except OSError:
-            accts = []
-        for a in accts:
+        dirs = []
+        for root in self.roots:
             try:
-                orgs = os.listdir(os.path.join(self.root, a))
+                accts = os.listdir(root)
             except OSError:
                 continue
-            for o in orgs:
-                d = os.path.join(self.root, a, o)
+            for a in accts:
                 try:
-                    names = os.listdir(d)
+                    dirs += [os.path.join(root, a, o) for o in os.listdir(os.path.join(root, a))]
                 except OSError:
                     continue
-                for n in names:
-                    if not (n.startswith("local_") and n.endswith(".json")):
-                        continue
-                    p = os.path.join(d, n)
-                    try:
-                        st = os.stat(p)
-                    except OSError:
-                        continue
-                    key = (st.st_mtime_ns, st.st_size)
-                    old = self._files.get(p)
-                    if old is not None and old[0] == key:
-                        files[p] = old
-                        continue
-                    try:
-                        with open(p, encoding="utf-8") as f:
-                            meta = json.load(f)
-                    except (OSError, ValueError, UnicodeDecodeError):
-                        continue
-                    if not isinstance(meta, dict):
-                        continue
-                    title = meta.get("title")
-                    title = " ".join(title.split())[:DESKTOP_TITLES_MAX] if isinstance(title, str) else ""
-                    ids = [v for v in (meta.get("cliSessionId"), meta.get("lastAssistantCliSessionId"))
-                           if isinstance(v, str) and v]
-                    files[p] = (key, ids, title)
+        for d in dirs:
+            try:
+                names = os.listdir(d)
+            except OSError:
+                continue
+            for n in names:
+                if not (n.startswith("local_") and n.endswith(".json")):
+                    continue
+                p = os.path.join(d, n)
+                try:
+                    st = os.stat(p)
+                except OSError:
+                    continue
+                key = (st.st_mtime_ns, st.st_size)
+                old = self._files.get(p)
+                if old is not None and old[0] == key:
+                    files[p] = old
+                    continue
+                try:
+                    with open(p, encoding="utf-8") as f:
+                        meta = json.load(f)
+                except (OSError, ValueError, UnicodeDecodeError):
+                    continue
+                if not isinstance(meta, dict):
+                    continue
+                title = meta.get("title")
+                title = " ".join(title.split())[:DESKTOP_TITLES_MAX] if isinstance(title, str) else ""
+                ids = [v for v in (meta.get("cliSessionId"), meta.get("lastAssistantCliSessionId"))
+                       if isinstance(v, str) and v]
+                files[p] = (key, ids, title)
         by_id = {}
         # 같은 CLI id가 여러 파일에 있으면(포크 등) 최근에 바뀐 파일의 제목
         for p, (key, ids, title) in sorted(files.items(), key=lambda kv: kv[1][0][0]):
@@ -10963,7 +10975,7 @@ def build_app(cfg):
         pusher = RelayPusher(cfg, devices, push_log=push_log)
     else:
         pusher = ApnsPusher(cfg, devices, push_log=push_log)
-    hooks = HookBackend(titles=DesktopTitles(desktop_sessions_dir()))
+    hooks = HookBackend(titles=DesktopTitles(desktop_sessions_dirs()))
     return App(cfg, MultiBackend(Hc(cfg["hc_path"]), hooks), devices, pusher, push_log=push_log)
 
 
