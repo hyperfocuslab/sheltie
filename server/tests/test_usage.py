@@ -292,7 +292,9 @@ class RouteTests(HomeCase):
         self.assertEqual(self.get("/api/usage", token="bad")[0], 401)
 
     def test_200_shape_and_bad_range(self):
-        self.write_log("a.jsonl", [line("claude-sonnet-4-5", iso(0), "m1", "r1", i=10, o=10)])
+        # 라우트는 실제 시계로 7일을 자른다: 고정 날짜(NOW)가 아니라 지금 시각으로 쓴다.
+        now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        self.write_log("a.jsonl", [line("claude-sonnet-4-5", now, "m1", "r1", i=10, o=10)])
         with mock.patch.object(hr, "_usage_keychain_read", return_value=("missing", None)):
             code, body = self.get("/api/usage")
         self.assertEqual(code, 200)
