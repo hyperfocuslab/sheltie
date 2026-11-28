@@ -132,7 +132,7 @@ MAX_BODY = 64 * 1024
 # 이 프로세스가 뜬 시각(/api/health의 started). 설치기가 재설치 뒤 응답한 서버가 새 서버인지 대조한다.
 PROCESS_STARTED = time.time()
 # 서버 버전(/api/health의 server_version). 릴리스(ops/release-server.sh)마다 올린다. 자동 업데이트는 이보다 높은 버전만 받는다.
-SERVER_VERSION = "1.0.9"
+SERVER_VERSION = "1.0.10"
 POLL_INTERVAL = 15
 BIND_RETRY = 10
 EVENTS_MAX_BACKOFF = 30
@@ -7184,11 +7184,109 @@ class HookWaiter:
         self.end = None
 
 
+DESKTOP_TITLES_TTL = 15.0  # 데스크톱 앱 세션 제목을 다시 읽는 간격(초). 사이드바에서 제목을 바꾸면 이만큼 뒤에 따라간다
+DESKTOP_TITLES_MAX = 400  # 제목으로 쓸 최대 글자 수
+
+
+def desktop_sessions_dir(home=None, env=None):
+    """Claude 데스크톱 앱(Code 탭)이 세션 메타데이터를 두는 폴더. 맥 ~/Library/Application Support/Claude,
+    윈도우 %APPDATA%\\Claude 아래 claude-code-sessions/<계정>/<조직>/local_*.json."""
+    env = os.environ if env is None else env
+    home = home or os.path.expanduser("~")
+    if sys.platform == "win32":
+        base = env.get("APPDATA") or os.path.join(home, "AppData", "Roaming")
+    elif sys.platform == "darwin":
+        base = os.path.join(home, "Library", "Application Support")
+    else:
+        base = env.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
+    return os.path.join(base, "Claude", "claude-code-sessions")
+
+
+class DesktopTitles:
+    """CLI 세션 id(훅 본문의 session_id) → 데스크톱 앱 사이드바 제목. 읽기만 한다.
+    local_*.json의 cliSessionId·lastAssistantCliSessionId가 id, title이 제목. 파일은 mtime·크기가 바뀐 것만 다시 읽고
+    폴더 훑기는 ttl마다 한 번(목록 요청 때). 폴더가 없거나 못 읽으면 None(폴더 이름을 쓴다)."""
+
+    def __init__(self, root, ttl=DESKTOP_TITLES_TTL, clock=time.monotonic):
+        self.root = root
+        self.ttl = ttl
+        self.clock = clock
+        self.lock = threading.Lock()
+        self._files = {}  # path → ((mtime_ns, size), [ids], title)
+        self._by_id = {}
+        self._at = None
+
+    def _scan(self):
+        files = {}
+        try:
+            accts = os.listdir(self.root)
+        except OSError:
+            accts = []
+        for a in accts:
+            try:
+                orgs = os.listdir(os.path.join(self.root, a))
+            except OSError:
+                continue
+            for o in orgs:
+                d = os.path.join(self.root, a, o)
+                try:
+                    names = os.listdir(d)
+                except OSError:
+                    continue
+                for n in names:
+                    if not (n.startswith("local_") and n.endswith(".json")):
+                        continue
+                    p = os.path.join(d, n)
+                    try:
+                        st = os.stat(p)
+                    except OSError:
+                        continue
+                    key = (st.st_mtime_ns, st.st_size)
+                    old = self._files.get(p)
+                    if old is not None and old[0] == key:
+                        files[p] = old
+                        continue
+                    try:
+                        with open(p, encoding="utf-8") as f:
+                            meta = json.load(f)
+                    except (OSError, ValueError, UnicodeDecodeError):
+                        continue
+                    if not isinstance(meta, dict):
+                        continue
+                    title = meta.get("title")
+                    title = " ".join(title.split())[:DESKTOP_TITLES_MAX] if isinstance(title, str) else ""
+                    ids = [v for v in (meta.get("cliSessionId"), meta.get("lastAssistantCliSessionId"))
+                           if isinstance(v, str) and v]
+                    files[p] = (key, ids, title)
+        by_id = {}
+        # 같은 CLI id가 여러 파일에 있으면(포크 등) 최근에 바뀐 파일의 제목
+        for p, (key, ids, title) in sorted(files.items(), key=lambda kv: kv[1][0][0]):
+            if title:
+                for i in ids:
+                    by_id[i] = title
+        self._files = files
+        self._by_id = by_id
+
+    def title(self, session_id):
+        if not isinstance(session_id, str) or not session_id:
+            return None
+        with self.lock:
+            now = self.clock()
+            if self._at is None or now - self._at >= self.ttl:
+                self._at = now
+                try:
+                    self._scan()
+                except Exception:  # 앱 파일 모양이 바뀌어도 목록은 폴더 이름으로 계속 나와야 한다
+                    log.warning("데스크톱 세션 제목 읽기 실패", exc_info=True)
+            return self._by_id.get(session_id)
+
+
 class HookBackend:
     """훅 세션 저장소. Hc와 같은 ls/get 모양을 준다(read·keys·send는 MultiBackend가 거절한다)."""
 
-    def __init__(self, wall=time.time):
+    def __init__(self, wall=time.time, titles=None):
         self.wall = wall
+        self.titles = titles  # DesktopTitles 또는 None(제목 없이 폴더 이름)
         self.lock = threading.Lock()
         self.sessions = {}
 
@@ -7419,18 +7517,32 @@ class HookBackend:
             return dict(s["holds"][0].status)
         return dict(s["base"])
 
+    def _name(self, agent, session_id, folder):
+        """Claude 세션은 데스크톱 앱 사이드바 제목, 없으면 폴더 이름. 잠금 밖에서 부른다(파일을 읽을 수 있다)."""
+        if agent == "claude" and self.titles is not None:
+            t = self.titles.title(session_id)
+            if t:
+                return t
+        return folder
+
     def ls(self):
         with self.lock:
-            return [{"address": s["tid"], "name": s["name"], "cwd": s["cwd"], "agent": s["agent"], "state": "live",
-                     "turn": s["turn"]} for s in self.sessions.values()]
+            rows = [({"address": s["tid"], "name": s["name"], "cwd": s["cwd"], "agent": s["agent"], "state": "live",
+                      "turn": s["turn"]}, s["session_id"]) for s in self.sessions.values()]
+        for r, sid in rows:
+            r["name"] = self._name(r["agent"], sid, r["name"])
+        return [r for r, _ in rows]
 
     def get(self, tid):
         with self.lock:
             s = self.sessions.get(tid)
             if s is None:
                 raise HcError("no hook session")
-            return {"address": tid, "name": s["name"], "cwd": s["cwd"], "agent": s["agent"], "state": "live",
-                    "status": self._status(s), "status_ms": s["status_ms"], "title": None, "turn": s["turn"]}
+            r = {"address": tid, "name": s["name"], "cwd": s["cwd"], "agent": s["agent"], "state": "live",
+                 "status": self._status(s), "status_ms": s["status_ms"], "title": None, "turn": s["turn"]}
+            sid = s["session_id"]
+        r["name"] = self._name(r["agent"], sid, r["name"])
+        return r
 
 
 class MultiBackend:
@@ -10851,7 +10963,8 @@ def build_app(cfg):
         pusher = RelayPusher(cfg, devices, push_log=push_log)
     else:
         pusher = ApnsPusher(cfg, devices, push_log=push_log)
-    return App(cfg, Hc(cfg["hc_path"]), devices, pusher, push_log=push_log)
+    hooks = HookBackend(titles=DesktopTitles(desktop_sessions_dir()))
+    return App(cfg, MultiBackend(Hc(cfg["hc_path"]), hooks), devices, pusher, push_log=push_log)
 
 
 # hc 버전: 설치기는 이 버전만 받는다(install.sh·install.ps1의 HC_PIN_VERSION과 같아야 한다, 테스트가 비교).
