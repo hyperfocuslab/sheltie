@@ -1,0 +1,14 @@
+{
+  "artifactDirectoryPath": "/Users/me/.gemini/antigravity-cli/brain/1c09bec5-4e8a-4f27-ae4d-2033b6312b3d",
+  "conversationId": "1c09bec5-4e8a-4f27-ae4d-2033b6312b3d",
+  "cwd": "/Users/me/proj",
+  "hookEventName": "PreInvocation",
+  "initialNumSteps": 1,
+  "invocationNum": 0,
+  "lastUserInput": "ls 한 번 실행하고 끝내",
+  "modelName": "gemini-4-neon-high",
+  "transcriptPath": "/Users/me/.gemini/antigravity-cli/brain/1c09bec5-4e8a-4f27-ae4d-2033b6312b3d/.system_generated/logs/transcript_full.jsonl",
+  "workspacePaths": [
+    "/Users/me/proj"
+  ]
+}

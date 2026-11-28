@@ -9,7 +9,7 @@ hc는 항상 argv 리스트(shell=False)로 부르며, 임의 명령을 실행�
   python3 sheltie.py serve      서버 실행(기본 동작).
   python3 sheltie.py test-push  등록된 모든 기기에 시험 푸시 1건.
   python3 sheltie.py pair       앱 연결용 QR과 sheltie:// 주소 출력(설정 public_url, 없으면 Tailscale 이름).
-  python3 sheltie.py hook claude|codex|qwen|opencode  에이전트 훅이 부른다(stdin 훅 JSON → 로컬 서버 → stdout 결정 JSON).
+  python3 sheltie.py hook claude|codex|qwen|opencode|agy  에이전트 훅이 부른다(stdin 훅 JSON → 로컬 서버 → stdout 결정 JSON).
 
 폰 접속: 맥미니 방화벽이 Homebrew Python의 들어오는 연결을 막으므로 127.0.0.1에만 열고
 tailscale serve로 tailnet 안에만 HTTPS로 내보낸다(다른 맥미니 서비스와 같은 방식, Funnel 아님):
@@ -132,7 +132,7 @@ MAX_BODY = 64 * 1024
 # 이 프로세스가 뜬 시각(/api/health의 started). 설치기가 재설치 뒤 응답한 서버가 새 서버인지 대조한다.
 PROCESS_STARTED = time.time()
 # 서버 버전(/api/health의 server_version). 릴리스(ops/release-server.sh)마다 올린다. 자동 업데이트는 이보다 높은 버전만 받는다.
-SERVER_VERSION = "1.0.11"
+SERVER_VERSION = "1.0.12"
 POLL_INTERVAL = 15
 BIND_RETRY = 10
 EVENTS_MAX_BACKOFF = 30
@@ -6827,7 +6827,7 @@ class BranchCache:
 # hc 터미널과 같은 자리에서 다룬다. 화면·키·새 작업은 없다. 글 보내기는 Claude 세션만, Stop 훅 asyncRewake의
 # hook-wait로 깨워서 한다(caps ["send"], 아래 HOOK_WAKE_*).
 
-HOOK_AGENTS = ("claude", "codex", "qwen", "opencode")
+HOOK_AGENTS = ("claude", "codex", "qwen", "opencode", "agy")
 # 우리 훅을 빌려 부르는 다른 에이전트의 표시(Grok Build 1.0.77 실측: GROK_* 환경변수,
 # camelCase 필드 hookEventName·sessionId·workspaceRoot를 snake_case와 같이 보낸다. Cursor 2026.11.19는
 # ~/.claude/settings.json 훅을 claude-code 호환으로 부르며 cursor_version·conversation_id를 넣는다).
@@ -6840,13 +6840,13 @@ def headless_claude(env):
     return str(env.get("CLAUDE_CODE_ENTRYPOINT") or "").startswith("sdk-")
 FOREIGN_HOOK_KEYS = ("workspaceRoot", "hookEventName", "cursor_version")
 # app 값은 hc status가 그 에이전트에 쓰는 이름(Qwen "qwen-code")이나 에이전트 이름 그대로
-HOOK_APPS = {"claude": "claude-code", "codex": "codex", "qwen": "qwen-code", "opencode": "opencode"}
+HOOK_APPS = {"claude": "claude-code", "codex": "codex", "qwen": "qwen-code", "opencode": "opencode", "agy": "agy"}
 # 우리가 등록하는 이벤트. 그 밖의 이름은 세션을 만들지 않고 넘긴다(다른 에이전트가 빌려 부르는 이벤트 등)
 HOOK_EVENTS = ("SessionStart", "SessionEnd", "UserPromptSubmit", "Stop", "PermissionRequest", "PreToolUse")
 HOOK_ALWAYS_AGENTS = ("claude", "opencode")
 # UserPromptSubmit에 사용자가 친 글(prompt)을 주는 에이전트: 끝남 알림을 사용자 말 하나당 한 번으로 묶는다.
 # OpenCode 플러그인의 UserPromptSubmit은 busy 상태에서 만든 것이라 글이 없다: 묶지 않는다.
-HOOK_DONE_GATE_AGENTS = ("claude", "codex", "qwen")
+HOOK_DONE_GATE_AGENTS = ("claude", "codex", "qwen", "agy")
 # 사용자가 친 말이 아니라 세션을 자동으로 깨운 프롬프트의 시작(예약 작업, 다른 Claude 세션이 보낸 말).
 # 대화 보기에서는 숨기지 않고 끝남 알림 판정에만 쓴다(실측: Claude 데스크톱 앱 기록의 origin task-notification·peer).
 HOOK_AUTO_PROMPT_PREFIXES = ("<scheduled-task", "<cross-session-message", "Another Claude session sent a message:")  # 계속 허용을 결정으로 돌려줄 수 있는 에이전트
@@ -6855,6 +6855,15 @@ QWEN_HOOK_INTERACTIVE = ("ask_user_question", "exit_plan_mode", "propose_goal")
 QWEN_HOOK_TITLES = {"run_shell_command": "Shell", "write_file": "WriteFile", "edit": "Edit"}
 OPENCODE_HOOK_TITLES = {"bash": "Shell command", "edit": "Edit file", "write": "Write file"}
 OPENCODE_HOOK_MAX_ALWAYS = 50
+# Antigravity CLI(agy 1.5.8)의 훅: 이벤트 JSON이 camelCase(hookEventName·conversationId·toolCall)이고 세션 끝 이벤트가 없다.
+# PreToolUse는 모든 도구(읽기 포함)마다 오고, 출력에 decision이 없으면(`{}`) 거부된다(빈 출력·exit 0은 허용, 실측).
+# 그래서 붙잡는 도구는 실행·쓰기뿐이고 나머지는 출력 없이 넘긴다. 못 붙잡으면 {"decision": "ask"}(agy 평소 승인).
+AGY_HOLD_TOOLS = ("run_command", "write_file", "edit_file", "replace_file_content", "multi_replace_file_content",
+                  "send_command_input")
+AGY_HOOK_TITLES = {"run_command": "Shell command", "write_file": "Write file", "edit_file": "Edit file",
+                   "replace_file_content": "Edit file", "multi_replace_file_content": "Edit file",
+                   "send_command_input": "Command input"}
+AGY_ARG_KEYS = {"CommandLine": "command", "Path": "file_path", "Content": "content", "toolSummary": "description"}
 HOOK_HOLD_SEC = 540           # 훅 타임아웃(600초)보다 짧게. 지나면 결정 없이 {} → 터미널 대화상자로
 HOOK_CLIENT_TIMEOUT = 590     # hook 하위 명령이 서버 답을 기다리는 상한(초)
 HOOK_POLL = 0.2               # 붙잡은 동안 폰 답·연결 끊김을 보는 간격(초)
@@ -6914,6 +6923,39 @@ def hook_session_tid(session_id):
         return None
     s = re.sub(r"[^A-Za-z0-9]", "", session_id)[-12:]
     return "h" + s if s else None
+
+
+def agy_hook_body(raw):
+    """agy 훅 본문 → Claude 훅 모양(hook_event_name·session_id·cwd·tool_name·tool_input·prompt). 쓰지 않는 이벤트는 None,
+    세션을 알 수 없는 본문은 {}. PreInvocation은 턴마다 invocationNum 0으로 시작한다(Claude의 UserPromptSubmit),
+    Stop은 턴 끝, SessionStart는 대화의 첫 턴에 한 번."""
+    ev = raw.get("hookEventName")
+    cid = raw.get("conversationId")
+    if not isinstance(ev, str) or not isinstance(cid, str) or not cid:
+        return {}
+    ws = raw.get("workspacePaths")
+    cwd = raw.get("cwd") if isinstance(raw.get("cwd"), str) and raw.get("cwd") else (
+        ws[0] if isinstance(ws, list) and ws and isinstance(ws[0], str) else None)
+    out = {"session_id": cid, "cwd": cwd}
+    if ev == "PreInvocation":
+        if raw.get("invocationNum") != 0:
+            return None
+        out["hook_event_name"] = "UserPromptSubmit"
+        out["prompt"] = raw.get("lastUserInput") if isinstance(raw.get("lastUserInput"), str) else None
+    elif ev in ("SessionStart", "Stop"):
+        out["hook_event_name"] = ev
+    elif ev == "PreToolUse":
+        tc = raw.get("toolCall") if isinstance(raw.get("toolCall"), dict) else {}
+        args = tc.get("args") if isinstance(tc.get("args"), dict) else {}
+        inp = dict(args)
+        for k, v in AGY_ARG_KEYS.items():
+            if isinstance(args.get(k), str) and args[k]:
+                inp[v] = args[k]
+        out.update({"hook_event_name": ev, "tool_name": tc.get("name") if isinstance(tc.get("name"), str) else "tool",
+                    "tool_input": inp})
+    else:
+        return None
+    return out
 
 
 def hook_transcript_path(path, home):
@@ -7054,6 +7096,8 @@ class HookHold:
         return self.prompts[min(self.qi, len(self.prompts) - 1)]
 
     def allow(self, updated_input=None, perms=None):
+        if self.agent == "agy":
+            return {"decision": "allow"}
         if self.event_name == "PreToolUse":
             out = {"hookEventName": "PreToolUse", "permissionDecision": "allow"}
             if updated_input is not None:
@@ -7066,6 +7110,8 @@ class HookHold:
         return {"hookSpecificOutput": out}
 
     def deny(self, message=HOOK_REJECT_MSG):
+        if self.agent == "agy":
+            return {"decision": "deny", "reason": message}
         if self.event_name == "PreToolUse":
             return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                            "permissionDecisionReason": message}}
@@ -7102,6 +7148,9 @@ def hook_permission_hold(agent, body):
         title = QWEN_HOOK_TITLES.get(tool, tool)
         question = "Do you want to proceed?"
         yes = QWEN_APPROVE_FIRST
+    elif agent == "agy":
+        title = AGY_HOOK_TITLES.get(tool, tool)
+        question = "Do you want to proceed?"
     elif agent == "opencode":
         title = OPENCODE_HOOK_TITLES.get(tool, tool)
         question = "Permission required"
@@ -7764,8 +7813,12 @@ AGENTS = {
             "preview": None,
             "push_wait": lambda: PUSH_PROMPT_BUDGET, "retry": False, "screen": None, "card_status": True,
             "approve_keys": _amp_status_approve, "reject_status_keys": _amp_status_reject, "send_guard": True},
+    # Antigravity CLI(agy)는 훅 세션으로만 붙는다(화면·hc 터미널 없음). 승인은 훅 붙잡기, 대화 기록 보기·미리보기는 없다.
+    "agy": {"match": _named("agy"), "parse": lambda lines, plan_reader=None: None, "free_text": _free_text_digit,
+            "transcript": lambda info, home, runner=None: (None, None), "preview": None,
+            "push_wait": lambda: PUSH_PROMPT_BUDGET, "retry": False, "screen": None, "send_guard": True},
 }
-AGENT_ORDER = ("claude", "codex", "gemini", "copilot", "qwen", "opencode", "grok", "cursor", "amp")
+AGENT_ORDER = ("claude", "codex", "gemini", "copilot", "qwen", "opencode", "grok", "cursor", "amp", "agy")
 SCREEN_POLL_INTERVAL = 3.0  # "full" 에이전트 화면 판정 주기(초). 제목 이벤트가 먼저 오면 그때 바로 본다
 # 제목으로 작업 중을 모르는 "full" 에이전트(OpenCode·Cursor)는 앱에서 보낸 순간을 작업 중으로 둔다(판정 주기보다 짧은
 # 작업도 끝남 알림이 가게. hc events에는 화면 출력 이벤트가 없다, 실측 hc 0.1.21). 보낸 뒤 이 시간(초) 안에 본 화면은
@@ -8524,6 +8577,12 @@ class App:
         """POST /hook/<agent> 한 건. 반환: 응답 JSON(dict), None(빈 본문), HOOK_NO_REPLY(이미 끊김)."""
         if agent not in HOOK_AGENTS:
             raise ApiError(404, "no_route")
+        if agent == "agy":  # camelCase 본문을 Claude 훅 모양으로(FOREIGN_HOOK_KEYS의 hookEventName도 이 변환이 없앤다)
+            body = agy_hook_body(body)
+            if body is None:
+                return None
+            if not body:
+                raise ApiError(400, "bad_hook")
         if any(k in body for k in FOREIGN_HOOK_KEYS):
             return None  # Claude 훅을 빌려 부르는 다른 에이전트(Grok 등): 등록·붙잡기 없이 넘긴다
         ev = body.get("hook_event_name")
@@ -8575,6 +8634,11 @@ class App:
             return self._hook_hold(tid, hook_permission_hold(agent, body), alive)
         if ev == "PreToolUse":
             hold = None
+            if agent == "agy":
+                if tool not in AGY_HOLD_TOOLS:
+                    return None  # 출력 없음 = 허용(`{}`는 거부다)
+                res = self._hook_hold(tid, hook_permission_hold(agent, body), alive)
+                return res if res != {} else {"decision": "ask"}  # 붙잡지 못했다: agy의 평소 승인 흐름
             if agent == "claude" and tool == "AskUserQuestion":
                 hold = hook_question_hold(agent, body)
             elif agent == "claude" and tool == "ExitPlanMode":
@@ -8740,8 +8804,11 @@ class App:
     def _hook_decide(self, tid, hold, result):
         if not self.hooks.finish(hold, "decided", result):
             raise ApiError(409, "not_blocked")  # 그사이 PC에서 답했거나 시간이 지났다
-        log.info("훅 답 %s %s", tid, result["hookSpecificOutput"].get("permissionDecision")
-                 or result["hookSpecificOutput"]["decision"]["behavior"])
+        if isinstance(result.get("decision"), str):  # agy
+            log.info("훅 답 %s %s", tid, result["decision"])
+        else:
+            log.info("훅 답 %s %s", tid, result["hookSpecificOutput"].get("permissionDecision")
+                     or result["hookSpecificOutput"]["decision"]["behavior"])
 
     def hook_api_answer(self, tid, body):
         """잠금화면 버튼(허락·계속 허용·거절). 키 대신 훅 결정으로 답한다."""
@@ -9967,8 +10034,8 @@ ROUTES = [
     ("GET", re.compile(r"^/api/usage$"), "usage"),
     ("GET", re.compile(r"^/api/push/status$"), "push_status"),
     ("POST", re.compile(r"^/api/push/test$"), "push_test"),
-    ("POST", re.compile(r"^/hook/(claude|codex|qwen|opencode)$"), "hook"),
-    ("POST", re.compile(r"^/hook/(claude|codex|qwen|opencode)/wait$"), "hook_wait"),
+    ("POST", re.compile(r"^/hook/(claude|codex|qwen|opencode|agy)$"), "hook"),
+    ("POST", re.compile(r"^/hook/(claude|codex|qwen|opencode|agy)/wait$"), "hook_wait"),
 ]
 
 
@@ -11132,7 +11199,7 @@ def cmd_pair(out=None, cfg=None, runner=None, enable_vt=None):
 
 
 def cmd_hook(args, stdin=None, stdout=None, env=None, timeout=HOOK_CLIENT_TIMEOUT):
-    """`sheltie.py hook <claude|codex|qwen|opencode>`: 에이전트 훅(OpenCode는 플러그인)이 부른다. stdin의 훅 JSON을 로컬 서버에 넘기고
+    """`sheltie.py hook <claude|codex|qwen|opencode|agy>`: 에이전트 훅(OpenCode는 플러그인)이 부른다. stdin의 훅 JSON을 로컬 서버에 넘기고
     서버 응답(JSON)을 그대로 stdout에 쓴다. herdr 안(HC_TERMINAL_ID)이거나 서버가 꺼져 있거나 어떤 오류든
     아무것도 쓰지 않고 0으로 끝난다 → 에이전트가 평소 터미널 대화상자를 띄운다. 로그 파일은 열지 않는다."""
     env = os.environ if env is None else env

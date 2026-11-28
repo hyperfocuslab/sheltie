@@ -439,6 +439,23 @@ class InstallPs1Test(unittest.TestCase):
         self.assertEqual(read_json(q), {"model": "x", "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "mine"}]}]}})
         self.assertFalse(os.path.exists(plugin))
 
+    def test_hooks_agy(self):
+        g = os.path.join(self.profile, ".gemini", "config", "hooks.json")
+        os.makedirs(os.path.dirname(g))
+        with open(g, "w", encoding="utf-8") as f:
+            json.dump({"lint": {"Stop": [{"command": "mine"}]}}, f)
+        for _ in range(2):
+            r = self.run_install()
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        d = read_json(g)
+        self.assertEqual(d["lint"], {"Stop": [{"command": "mine"}]})
+        inner = "& '%s' '%s' hook agy" % (sys.executable, self.server_path())
+        self.assertEqual(d["sheltie"]["Stop"],
+                         [{"type": "command", "command": 'powershell.exe -NoProfile -Command "%s"' % inner, "timeout": 10}])
+        r = self.run_install("-Uninstall")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(read_json(g), {"lint": {"Stop": [{"command": "mine"}]}})
+
     def test_py_launcher_without_python(self):
         # py 런처는 있는데 파이썬이 없으면 출력이 비어도 죽지 않고 "python이 없다"로 끝나야 한다(7950 실측: null-valued 오류).
         with open(os.path.join(self.bin, "py.cmd"), "w", newline="") as f:

@@ -995,6 +995,42 @@ class InstallHooksTest(InstallTest):
         self.assertTrue(read(os.path.join(xdg, "opencode", "plugins", "sheltie.js")).startswith("// sheltie-opencode-plugin"))
         self.assertFalse(os.path.exists(self.oc_dir()))
 
+    # --- Antigravity CLI(agy): ~/.gemini/config/hooks.json, 최상위 키가 훅 이름
+    def agy_hooks(self):
+        return os.path.join(self.home, ".gemini", "config", "hooks.json")
+
+    def test_agy_install_keeps_other_hooks_idempotent_and_uninstall(self):
+        other = {"lint": {"PostToolUse": [{"matcher": "run_command", "hooks": [{"command": "./lint.sh"}]}]}}
+        self.write_json(self.agy_hooks(), other)
+        r = self.run_install()
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        d = read_json(self.agy_hooks())
+        self.assertEqual(d["lint"], other["lint"])
+        self.assertEqual(set(d["sheltie"]), {"SessionStart", "PreInvocation", "Stop"})  # PreToolUse 없음(PC agy가 멈춘다)
+        self.assertNotIn("hooks", d)
+        self.assertEqual(d["sheltie"]["Stop"], [{"type": "command", "command": self.cmd("agy"), "timeout": 10}])
+        self.assertIn("agy 훅 등록", r.stdout)
+        r = self.run_install()
+        self.assertIn("agy 훅이 이미 등록돼 있다", r.stdout)
+        self.assertEqual(read_json(self.agy_hooks()), d)
+        r = self.run_install("--uninstall")
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertEqual(read_json(self.agy_hooks()), other)
+
+    def test_agy_dir_missing_is_skipped(self):
+        r = self.run_install()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".gemini")))
+        self.assertIn("agy: %s 없음" % os.path.join(self.home, ".gemini"), r.stdout)
+
+    def test_agy_fresh_file_created_when_gemini_dir_exists(self):
+        os.makedirs(os.path.join(self.home, ".gemini"))
+        r = self.run_install()
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertEqual(list(read_json(self.agy_hooks())), ["sheltie"])
+        self.assertEqual(self.run_install("--uninstall").returncode, 0)
+        self.assertFalse(os.path.exists(self.agy_hooks()))
+
     def test_qwen_merge_keeps_other_hooks_backup_once_no_duplicates(self):
         orig = {"model": {"name": "qwen3"}, "hooks": {
             "Stop": [{"hooks": [{"type": "command", "command": "echo mine"}]}],

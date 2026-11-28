@@ -205,7 +205,7 @@ old_cleanup() {
     _left=""
     # dry-run은 훅 파일을 안 바꾸므로 훅을 고칠 예정이면(--no-hooks가 아니면) 고쳐졌다고 본다.
     [ "$DRY" = 1 ] && [ "$NOHOOKS" != 1 ] || for _f in "$HOME/.claude/settings.json" "$HOME/.codex/hooks.json" \
-        "$HOME/.qwen/settings.json" "$OPENCODE_DIR/plugins/sheltie.js"; do
+        "$HOME/.qwen/settings.json" "$OPENCODE_DIR/plugins/sheltie.js" "$HOME/.gemini/config/hooks.json"; do
       [ ! -f "$_f" ] || ! grep -F "$OLD_SERVER_NAME" "$_f" >/dev/null 2>&1 || _left="${_left:+$_left, }$_f"
     done
     if [ -n "$_left" ] && [ -d "$OLD_DATA_DIR" ]; then
@@ -220,12 +220,14 @@ old_cleanup() {
   fi
 }
 
-# Claude Code·Codex·Qwen Code 훅 병합과 OpenCode 플러그인 쓰기 스크립트(이 한 곳만 고친다. install.ps1에 같은 글자로 들어 있고 테스트가 비교한다).
+# Claude Code·Codex·Qwen Code·agy 훅 병합과 OpenCode 플러그인 쓰기 스크립트(이 한 곳만 고친다. install.ps1에 같은 글자로 들어 있고 테스트가 비교한다).
 HOOKS_PY=$(cat <<'HOOKS_PY_EOF'
 # ---- hooks_merge.py begin (install.sh and install.ps1 embed this identical text; a test compares them)
-# usage: hooks_merge.py <install|uninstall> <claude|codex|qwen|opencode> <settings-file> <python-exe> <server-file> <posix|windows> [dry]
+# usage: hooks_merge.py <install|uninstall> <claude|codex|qwen|opencode|agy> <settings-file> <python-exe> <server-file> <posix|windows> [dry]
 # For opencode <settings-file> is the plugin file (plugins/sheltie.js): written or removed whole, only when it carries
 # our mark on its first line (another file with that name is left alone: broken).
+# For agy <settings-file> is ~/.gemini/config/hooks.json: its top-level keys are hook names (no "hooks" wrapper);
+# only the key "sheltie" is written or removed, other names are kept.
 # Prints exactly one status word: added | updated | unchanged | removed | absent | broken | error
 import json, os, shutil, sys
 
@@ -495,9 +497,81 @@ def plugin_main():
     return "updated" if existed else "added"
 
 
+AGY_NAME = "sheltie"
+
+
+def agy_entry():
+    def h(timeout):
+        if flavor == "windows":
+            inner = "& '%s' '%s' hook agy" % (py.replace("'", "''"), server.replace("'", "''"))
+            cmd = 'powershell.exe -NoProfile -Command "%s"' % inner
+        else:
+            cmd = '"%s" "%s" hook agy' % (py, server)
+        return {"type": "command", "command": cmd, "timeout": timeout}
+    # No PreToolUse: agy has no "only when it would ask" event, so holding every run/write would stall agy on the PC
+    # until the phone answers. Approval stays in agy's own flow (the server still handles PreToolUse if added by hand).
+    return {"SessionStart": [h(10)], "PreInvocation": [h(10)], "Stop": [h(10)]}
+
+
+def agy_ours(entry):
+    if not isinstance(entry, dict):
+        return False
+    for groups in entry.values():
+        for g in groups if isinstance(groups, list) else []:
+            hs = g.get("hooks") if isinstance(g, dict) and isinstance(g.get("hooks"), list) else [g]
+            if any(isinstance(h, dict) and ours(h.get("command")) for h in hs):
+                return True
+    return False
+
+
+def agy_main():
+    doc = {}
+    existed = os.path.exists(path)
+    if existed:
+        try:
+            with open(path, encoding="utf-8-sig") as f:
+                text = f.read()
+            doc = json.loads(text) if text.strip() else {}
+        except (ValueError, OSError):
+            return "broken"
+        if not isinstance(doc, dict):
+            return "broken"
+    elif action == "uninstall":
+        return "absent"
+    cur = doc.get(AGY_NAME)
+    if cur is not None and not agy_ours(cur):
+        return "error" if action == "install" else "absent"  # a hook of that name that is not ours: leave it alone
+    if action == "install":
+        new = agy_entry()
+        if cur == new:
+            return "unchanged"
+        doc[AGY_NAME] = new
+    else:
+        if cur is None:
+            return "absent"
+        del doc[AGY_NAME]
+    if not dry:
+        if action == "uninstall" and not doc:
+            os.remove(path)
+            return "removed"
+        if existed and not os.path.exists(path + ".sheltie-bak"):
+            shutil.copy2(path, path + ".sheltie-bak")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".sheltie-tmp"
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(doc, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        os.replace(tmp, path)
+    if action == "uninstall":
+        return "removed"
+    return "updated" if cur is not None else "added"
+
+
 def main():
     if target == "opencode":
         return plugin_main()
+    if target == "agy":
+        return agy_main()
     doc = {}
     existed = os.path.exists(path)
     if existed:
@@ -568,17 +642,18 @@ except Exception:
 HOOKS_PY_EOF
 )
 
-# hooks_apply <install|uninstall> <python>: 있는 에이전트(~/.claude, ~/.codex, ~/.qwen)의 훅 설정 파일에 우리 항목을
+# hooks_apply <install|uninstall> <python>: 있는 에이전트(~/.claude, ~/.codex, ~/.qwen, ~/.gemini)의 훅 설정 파일에 우리 항목을
 # 넣거나 빼고, OpenCode(설정 폴더가 있을 때)는 전역 플러그인 파일(plugins/sheltie.js)을 쓰거나 지운다.
 hooks_apply() {
   _act=$1; _py=$2
   _dryarg=""; [ "$DRY" != 1 ] || _dryarg=dry
   _cxhooks=0
-  for _t in claude codex qwen opencode; do
+  for _t in claude codex qwen opencode agy; do
     _dir="$HOME/.$_t"; _file="$_dir/settings.json"
     case "$_t" in
       codex) _file="$_dir/hooks.json" ;;
       opencode) _dir=$OPENCODE_DIR; _file="$_dir/plugins/sheltie.js" ;;
+      agy) _dir="$HOME/.gemini"; _file="$_dir/config/hooks.json" ;;
     esac
     if [ ! -d "$_dir" ]; then say "($_t: $_dir 없음, 훅 건너뜀)"; continue; fi
     _res=$("$_py" -c "$HOOKS_PY" "$_act" "$_t" "$_file" "$_py" "$SERVER" posix $_dryarg 2>/dev/null) || _res=error
@@ -858,7 +933,7 @@ if [ "$MODE" = uninstall ]; then
   [ ! -e "$SYS_PLIST" ] || say "/Library/LaunchAgents에도 설치돼 있다. 지우려면: sudo rm $SYS_PLIST"
   if [ "$NOHOOKS" != 1 ]; then
     if UPY=$(command -v python3 2>/dev/null) && [ -n "$UPY" ]; then hooks_apply uninstall "$UPY"
-    else say "python3가 없어 에이전트 훅은 그대로다. ~/.claude/settings.json, ~/.codex/hooks.json, ~/.qwen/settings.json 에서 'sheltie.py' hook 항목을, $OPENCODE_DIR/plugins/sheltie.js 를 직접 지워라."; fi
+    else say "python3가 없어 에이전트 훅은 그대로다. ~/.claude/settings.json, ~/.codex/hooks.json, ~/.qwen/settings.json 에서 'sheltie.py' hook 항목을, ~/.gemini/config/hooks.json 에서 \"sheltie\" 항목을, $OPENCODE_DIR/plugins/sheltie.js 를 직접 지워라."; fi
   fi
   _kept=$CONFIG_DIR; [ -d "$_kept" ] || [ ! -d "$OLD_CONFIG_DIR" ] || _kept=$OLD_CONFIG_DIR
   say "해제 완료. 설정과 토큰은 남겼다: $_kept (지우려면 직접 삭제)"

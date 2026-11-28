@@ -1,0 +1,20 @@
+{
+  "artifactDirectoryPath": "/Users/me/.gemini/antigravity-cli/brain/1c09bec5-4e8a-4f27-ae4d-2033b6312b3d",
+  "conversationId": "1c09bec5-4e8a-4f27-ae4d-2033b6312b3d",
+  "cwd": "/Users/me/proj",
+  "hookEventName": "PreToolUse",
+  "lastUserInput": "README.txt 파일을 만들어 hi 라고 쓰고, ls 실행하고, README.txt를 읽고 끝내",
+  "modelName": "gemini-4-neon-high",
+  "stepIdx": 6,
+  "toolCall": {
+    "args": {
+      "Path": "/Users/me/proj/README.txt"
+    },
+    "id": "call_10101614060894264193",
+    "name": "read_file"
+  },
+  "transcriptPath": "/Users/me/.gemini/antigravity-cli/brain/1c09bec5-4e8a-4f27-ae4d-2033b6312b3d/.system_generated/logs/transcript_full.jsonl",
+  "workspacePaths": [
+    "/Users/me/proj"
+  ]
+}

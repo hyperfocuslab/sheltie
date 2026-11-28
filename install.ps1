@@ -288,9 +288,11 @@
   # Merge script for Claude Code / Codex / Qwen Code hook files and the OpenCode plugin file. Same text as in install.sh (a test compares them). Needs python.exe, not pythonw.
   $HOOKS_PY = @'
 # ---- hooks_merge.py begin (install.sh and install.ps1 embed this identical text; a test compares them)
-# usage: hooks_merge.py <install|uninstall> <claude|codex|qwen|opencode> <settings-file> <python-exe> <server-file> <posix|windows> [dry]
+# usage: hooks_merge.py <install|uninstall> <claude|codex|qwen|opencode|agy> <settings-file> <python-exe> <server-file> <posix|windows> [dry]
 # For opencode <settings-file> is the plugin file (plugins/sheltie.js): written or removed whole, only when it carries
 # our mark on its first line (another file with that name is left alone: broken).
+# For agy <settings-file> is ~/.gemini/config/hooks.json: its top-level keys are hook names (no "hooks" wrapper);
+# only the key "sheltie" is written or removed, other names are kept.
 # Prints exactly one status word: added | updated | unchanged | removed | absent | broken | error
 import json, os, shutil, sys
 
@@ -560,9 +562,81 @@ def plugin_main():
     return "updated" if existed else "added"
 
 
+AGY_NAME = "sheltie"
+
+
+def agy_entry():
+    def h(timeout):
+        if flavor == "windows":
+            inner = "& '%s' '%s' hook agy" % (py.replace("'", "''"), server.replace("'", "''"))
+            cmd = 'powershell.exe -NoProfile -Command "%s"' % inner
+        else:
+            cmd = '"%s" "%s" hook agy' % (py, server)
+        return {"type": "command", "command": cmd, "timeout": timeout}
+    # No PreToolUse: agy has no "only when it would ask" event, so holding every run/write would stall agy on the PC
+    # until the phone answers. Approval stays in agy's own flow (the server still handles PreToolUse if added by hand).
+    return {"SessionStart": [h(10)], "PreInvocation": [h(10)], "Stop": [h(10)]}
+
+
+def agy_ours(entry):
+    if not isinstance(entry, dict):
+        return False
+    for groups in entry.values():
+        for g in groups if isinstance(groups, list) else []:
+            hs = g.get("hooks") if isinstance(g, dict) and isinstance(g.get("hooks"), list) else [g]
+            if any(isinstance(h, dict) and ours(h.get("command")) for h in hs):
+                return True
+    return False
+
+
+def agy_main():
+    doc = {}
+    existed = os.path.exists(path)
+    if existed:
+        try:
+            with open(path, encoding="utf-8-sig") as f:
+                text = f.read()
+            doc = json.loads(text) if text.strip() else {}
+        except (ValueError, OSError):
+            return "broken"
+        if not isinstance(doc, dict):
+            return "broken"
+    elif action == "uninstall":
+        return "absent"
+    cur = doc.get(AGY_NAME)
+    if cur is not None and not agy_ours(cur):
+        return "error" if action == "install" else "absent"  # a hook of that name that is not ours: leave it alone
+    if action == "install":
+        new = agy_entry()
+        if cur == new:
+            return "unchanged"
+        doc[AGY_NAME] = new
+    else:
+        if cur is None:
+            return "absent"
+        del doc[AGY_NAME]
+    if not dry:
+        if action == "uninstall" and not doc:
+            os.remove(path)
+            return "removed"
+        if existed and not os.path.exists(path + ".sheltie-bak"):
+            shutil.copy2(path, path + ".sheltie-bak")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".sheltie-tmp"
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(doc, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        os.replace(tmp, path)
+    if action == "uninstall":
+        return "removed"
+    return "updated" if cur is not None else "added"
+
+
 def main():
     if target == "opencode":
         return plugin_main()
+    if target == "agy":
+        return agy_main()
     doc = {}
     existed = os.path.exists(path)
     if existed:
@@ -658,13 +732,17 @@ except Exception:
     if ($DRY) { $pre = '(dry-run) ' }
     $cxHooks = $false
     try {
-      foreach ($agent in @('claude', 'codex', 'qwen', 'opencode')) {
+      foreach ($agent in @('claude', 'codex', 'qwen', 'opencode', 'agy')) {
         $dir = Join-Path $env:USERPROFILE ".$agent"
         $name = 'settings.json'
         if ($agent -eq 'codex') { $name = 'hooks.json' }
         if ($agent -eq 'opencode') {
           $dir = Join-Path $env:USERPROFILE '.config\opencode'
           $name = 'plugins\sheltie.js'
+        }
+        if ($agent -eq 'agy') {
+          $dir = Join-Path $env:USERPROFILE '.gemini'
+          $name = 'config\hooks.json'
         }
         $file = Join-Path $dir $name
         if (-not (Test-Path -LiteralPath $dir -PathType Container)) { Say (T 'hk_skip' $agent $dir); continue }
@@ -1343,7 +1421,8 @@ if n != c:
     # Dry-run does not change hook files: if hooks would be updated, count them as updated.
     if (-not ($DRY -and -not $NOHOOKS)) {
       $hookFiles = @((Join-Path $env:USERPROFILE '.claude\settings.json'), (Join-Path $env:USERPROFILE '.codex\hooks.json'),
-        (Join-Path $env:USERPROFILE '.qwen\settings.json'), (Join-Path $env:USERPROFILE '.config\opencode\plugins\sheltie.js'))
+        (Join-Path $env:USERPROFILE '.qwen\settings.json'), (Join-Path $env:USERPROFILE '.config\opencode\plugins\sheltie.js'),
+        (Join-Path $env:USERPROFILE '.gemini\config\hooks.json'))
       foreach ($f in $hookFiles) {
         if ((Test-Path -LiteralPath $f -PathType Leaf) -and ([IO.File]::ReadAllText($f).Contains($OLD_SERVER_NAME))) { $left += $f }
       }
