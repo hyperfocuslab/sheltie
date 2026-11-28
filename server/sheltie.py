@@ -2742,8 +2742,8 @@ def is_cursor(info):
 # 한 질문), `N. 질문 (multi-select)`, `› [ ] 항목`(단일 선택도 체크칸, 커서 ›), 끝에 늘 `[ ] Other: (type to answer)`,
 # 힌트 `↑/↓ option · ←/→ question · Space select · Enter next/submit · Esc to skip`. 키(실측): 숫자 무시. enter가 커서 항목을
 # 고르고 다음 질문(마지막이면 제출): 단일 선택은 ↑/↓ + enter. Other는 커서 → 붙여넣기+enter. 복수 선택은 ↑/↓ + space 토글,
-# tab = 다음 질문. 마지막 질문의 복수 선택은 enter 한 번에 제출이 안 된 적이 있어(원인 미확인) 카드 없음. esc 건너뛰기는
-# 실측 못 해 거절 버튼 없음. PC에서 Other에 글을 넣었으면 카드 없음. 계정 한도로 카드 답은 실제로 확인 못 했다(fixture만).
+# tab = 다음 질문. 마지막 질문의 복수 선택은 고른 항목 위에서 enter(커서 항목을 체크한 채 제출, 실측 2026.11.28). esc 건너뛰기는
+# 실측 못 해 거절 버튼 없음. PC에서 Other에 글을 넣었으면 카드 없음. 카드 답은 실제 cursor-agent로 확인(2026.11.28).
 CURSOR_ROW_RE = re.compile(r"^(→\s+)?(\S.*?) \(([^()]+)\)$")
 CURSOR_SHELL_Q = "Run this command?"
 CURSOR_WRITE_Q = "Write to this file?"
@@ -2972,8 +2972,6 @@ def _parse_cursor_question(lines):
     checked = [k for k, r in enumerate(rows[:-1]) if r.group(2) == "x"]
     last = n == total
     if multi:
-        if last:
-            return None  # 마지막 질문의 복수 선택 enter는 한 번에 제출이 안 된 적이 있다(원인 미확인)
         opts, free = [(lb, None, None) for lb in labels[:-1]], None
     else:
         if len(checked) > 1:
@@ -3036,16 +3034,25 @@ def _free_text_cursor(p, num, text):
 
 
 def _multi_cursor(p, num, want):
-    """복수 선택(마지막 질문이 아닐 때만 카드): 숫자 키 무시. ↑/↓로 항목마다 가서 space 토글, tab = 다음 질문(실측).
-    enter는 커서 항목까지 골라 버려 쓰지 않는다."""
+    """복수 선택: 숫자 키 무시. ↑/↓로 항목마다 가서 space 토글(실측). 확정은 마지막 질문이 아니면 tab(다음 질문),
+    마지막 질문이면 enter(제출). enter는 커서 항목을 체크(토글 아님)한 채 제출한다(실측 2026.11.28: 체크된 항목 위면
+    그대로, 안 된 항목 위면 추가): 마지막 질문은 고른 항목 위로 커서를 옮긴 뒤 enter, 빈 답은 400."""
     cur = p.get("selected")
-    if cur is None or p.get("last_tab", True):
+    if cur is None:
         raise ApiError(409, "no_cursor")
+    last = p.get("last_tab", True)
+    if last and not want:
+        raise ApiError(400, "bad_option")
     keys = []
     for i in sorted(want.symmetric_difference(set(p["checked"]))):
         keys += nav_keys(cur, i) + ["space"]
         cur = i
-    return [("keys", keys + ["tab"])]
+    if not last:
+        return [("keys", keys + ["tab"])]
+    if cur not in want:
+        dest = min(want, key=lambda i: (abs(i - cur), i))
+        keys += nav_keys(cur, dest)
+    return [("keys", keys + ["enter"])]
 
 
 def _cursor_status_approve(p):

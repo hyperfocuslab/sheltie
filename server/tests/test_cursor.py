@@ -401,10 +401,8 @@ class CursorQuestionParseTests(unittest.TestCase):
         self.assertEqual((checked["checked"], checked["id"]), ([0], m["id"]))
 
     def test_no_card(self):
-        # 마지막 질문의 복수 선택(enter 한 번에 제출이 안 된 적이 있다, 원인 미확인), PC에서 Other에 글을 넣은 화면,
-        # 답한 뒤 기록
-        for name in ("question-multi-q2", "question-multi-q2-selected", "question-multi-q2-enter1",
-                     "question-other-typed", "question-single-answered"):
+        # PC에서 Other에 글을 넣은 화면, 답한 뒤 기록
+        for name in ("question-other-typed", "question-single-answered"):
             self.assertIsNone(card(name), name)
         # 커서가 없거나 질문 번호가 안 맞는 박스
         self.assertIsNone(hr.parse_prompt(cu("question-single").replace("›", " "), agent="cursor"))
@@ -490,9 +488,9 @@ class CursorQuestionApiTests(unittest.TestCase):
         self.screen("question-multi-q1")
         p1 = card("question-multi-q1")
         self.app.api_prompt_answer("c1", {"prompt_id": p1["id"], "text": "DuckDB embedded"})
-        # 다음 질문(마지막 복수 선택: 카드 없음)도 같은 박스: 새 알림 없음, 막힘 유지
+        # 다음 질문(마지막 복수 선택)은 새 카드지만 같은 박스: 새 알림 없음, 막힘 유지
         self.screen("question-multi-q2")
-        self.assertIsNone(self.app.api_prompt("c1")["prompt"])
+        self.assertEqual(self.app.api_prompt("c1")["prompt"]["title"], "Setup 2/2")
         self.assertEqual(self.by()["c1"]["status"]["state"], "blocked")
         self.screen("question-multi-q2-selected")
         self.assertEqual(self.err(self.app.api_prompt_answer, "c1", {"prompt_id": p1["id"], "option_index": 0}),
@@ -511,12 +509,32 @@ class CursorQuestionApiTests(unittest.TestCase):
         self.app.api_prompt_answer("c1", {"prompt_id": m["id"], "option_indices": [0, 2]})
         self.assertEqual(self.hc.keys_calls, [("c1", ["space", "down", "down", "space", "tab"])])
 
-    def test_last_multi_select_without_card(self):
-        # 질문 하나짜리 복수 선택도 마지막 질문이라 카드 없음: 막힘 알림만
+    def test_last_multi_select_card(self):
+        # 마지막 질문의 복수 선택: enter가 커서 항목을 체크한 채 제출(실측 2026.11.28)
+        q = card("question-multi-q2")
+        self.assertEqual((q["title"], q["question"], labels(q), q["multi_select"], q["checked"], q["selected"],
+                          q["free_text_index"], q["last_tab"]),
+                         ("Setup 2/2", "Which features?", ["Auth", "Logging", "Cache"], True, [], 0, None, True))
+        # 마지막으로 토글한 항목(고른 것) 위에서 enter
+        self.assertEqual(hr.answer_steps(q, option_indices=[0, 2]), [("keys", ["space", "down", "down", "space", "enter"])])
+        self.assertEqual(hr.answer_steps(q, option_indices=[0]), [("keys", ["space", "enter"])])
+        # 이미 체크된 화면(Auth·Cache, 커서 Cache)에서 Auth만: Cache를 끄면 커서가 안 고른 항목 위라 Auth로 올라가 enter
+        sel = card("question-multi-q2-selected")
+        self.assertEqual((sel["checked"], sel["selected"]), ([0, 2], 2))
+        self.assertEqual(hr.answer_steps(sel, option_indices=[0]), [("keys", ["space", "up", "up", "enter"])])
+        # 바꿀 게 없고 커서가 고른 항목 위: enter만
+        self.assertEqual(hr.answer_steps(sel, option_indices=[0, 2]), [("keys", ["enter"])])
+        # 빈 답은 enter가 커서 항목을 골라 버려 못 한다
+        with self.assertRaises(hr.ApiError) as e:
+            hr.answer_steps(q, option_indices=[])
+        self.assertEqual((e.exception.code, e.exception.body["error"]), (400, "bad_option"))
+
+    def test_last_multi_select_card_answer(self):
         self.screen("question-multi-q2")
-        self.assertEqual([(s, c) for s, c, _ in self.states()], [("blocked", "HR_BLOCKED")])
-        self.assertIsNone(self.pusher.payloads[0]["prompt_id"])
-        self.assertEqual(self.err(self.app.api_answer, "c1", {"action": "approve"}), (409, "needs_manual"))
+        m = self.app.api_prompt("c1")["prompt"]
+        self.assertTrue(m["multi_select"])
+        self.app.api_prompt_answer("c1", {"prompt_id": m["id"], "option_indices": [1]})
+        self.assertEqual(self.hc.keys_calls, [("c1", ["down", "space", "enter"])])
 
 
 class CursorTranscriptTests(unittest.TestCase):
