@@ -6832,6 +6832,12 @@ HOOK_AGENTS = ("claude", "codex", "qwen", "opencode")
 # camelCase 필드 hookEventName·sessionId·workspaceRoot를 snake_case와 같이 보낸다. Cursor 2026.11.19는
 # ~/.claude/settings.json 훅을 claude-code 호환으로 부르며 cursor_version·conversation_id를 넣는다).
 FOREIGN_HOOK_ENV = ("GROK_SESSION_ID", "GROK_HOOK_EVENT")
+
+
+def headless_claude(env):
+    """`claude -p`·Agent SDK 실행(CLAUDE_CODE_ENTRYPOINT=sdk-cli/sdk-ts/sdk-py): 사람이 보는 세션이 아니다.
+    스크립트가 돌릴 때마다 종료 알림이 쌓이고 권한 요청을 붙잡으면 스크립트가 멈추니 훅을 넘긴다."""
+    return str(env.get("CLAUDE_CODE_ENTRYPOINT") or "").startswith("sdk-")
 FOREIGN_HOOK_KEYS = ("workspaceRoot", "hookEventName", "cursor_version")
 # app 값은 hc status가 그 에이전트에 쓰는 이름(Qwen "qwen-code")이나 에이전트 이름 그대로
 HOOK_APPS = {"claude": "claude-code", "codex": "codex", "qwen": "qwen-code", "opencode": "opencode"}
@@ -11009,7 +11015,7 @@ def cmd_hook(args, stdin=None, stdout=None, env=None, timeout=HOOK_CLIENT_TIMEOU
         if env.get("HC_TERMINAL_ID"):
             return 0
         # Grok Build는 ~/.claude의 훅을 같이 읽어 부른다(1.0.77 실측). Claude 세션이 아니니 넘긴다.
-        if any(env.get(k) for k in FOREIGN_HOOK_ENV):
+        if any(env.get(k) for k in FOREIGN_HOOK_ENV) or headless_claude(env):
             return 0
         agent = args[0] if args else None
         if agent not in HOOK_AGENTS:
@@ -11052,7 +11058,7 @@ def cmd_hook_wait(args, stdin=None, stderr=None, env=None, timeout=HOOK_CLIENT_T
     try:
         if env.get("HC_TERMINAL_ID"):
             return 0  # herdr 안: hc 터미널로 보낸다(두 번 전달 방지)
-        if any(env.get(k) for k in FOREIGN_HOOK_ENV):
+        if any(env.get(k) for k in FOREIGN_HOOK_ENV) or headless_claude(env):
             return 0
         agent = args[0] if args else None
         if agent not in HOOK_WAKE_AGENTS:

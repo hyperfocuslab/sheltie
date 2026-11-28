@@ -718,6 +718,16 @@ class HookCommandTests(HookBase):
         self.assertEqual((rc, out), (0, b""))
         self.assertEqual(self.app.hooks.sessions, {})
 
+    def test_headless_claude_ignored(self):
+        # claude -p·Agent SDK 실행은 세션을 만들지 않는다(끝날 때 종료 알림이 가지 않는다). 대화형·데스크톱은 그대로.
+        for ep in ("sdk-cli", "sdk-ts", "sdk-py"):
+            rc, out = self.run_cmd("claude", load("claude-session-start-2.1.329.json"), env={"CLAUDE_CODE_ENTRYPOINT": ep})
+            self.assertEqual((rc, out), (0, b""))
+        self.assertEqual(self.app.hooks.sessions, {})
+        for ep in ("cli", "claude-desktop"):
+            self.run_cmd("claude", load("claude-session-start-2.1.329.json"), env={"CLAUDE_CODE_ENTRYPOINT": ep})
+        self.assertEqual(len(self.app.hooks.sessions), 1)
+
     def test_server_down_prints_nothing(self):
         s = socket.socket()
         s.bind(("127.0.0.1", 0))
