@@ -745,7 +745,9 @@ except Exception:
           $name = 'config\hooks.json'
         }
         $file = Join-Path $dir $name
-        if (-not (Test-Path -LiteralPath $dir -PathType Container)) { Say (T 'hk_skip' $agent $dir); continue }
+        # agy creates ~/.gemini on first run: register anyway when agy itself is installed (install order does not matter).
+        $agyBin = ($agent -eq 'agy') -and ($Act -eq 'install') -and ((Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA 'agy\bin\agy.exe')) -or [bool](Get-Command agy -ErrorAction SilentlyContinue))
+        if (-not $agyBin -and -not (Test-Path -LiteralPath $dir -PathType Container)) { Say (T 'hk_skip' $agent $dir); continue }
         $pa = @($script, $Act, $agent, $file, $Py, $SERVER, 'windows')
         if ($DRY) { $pa += 'dry' }
         $res = 'error'

@@ -132,7 +132,7 @@ MAX_BODY = 64 * 1024
 # 이 프로세스가 뜬 시각(/api/health의 started). 설치기가 재설치 뒤 응답한 서버가 새 서버인지 대조한다.
 PROCESS_STARTED = time.time()
 # 서버 버전(/api/health의 server_version). 릴리스(ops/release-server.sh)마다 올린다. 자동 업데이트는 이보다 높은 버전만 받는다.
-SERVER_VERSION = "1.0.12"
+SERVER_VERSION = "1.0.13"
 POLL_INTERVAL = 15
 BIND_RETRY = 10
 EVENTS_MAX_BACKOFF = 30

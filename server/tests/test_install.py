@@ -1031,6 +1031,18 @@ class InstallHooksTest(InstallTest):
         self.assertEqual(self.run_install("--uninstall").returncode, 0)
         self.assertFalse(os.path.exists(self.agy_hooks()))
 
+    def test_agy_installed_without_gemini_dir_still_registers(self):
+        # agy를 깔았지만 아직 안 돌려 ~/.gemini가 없다: agy 명령이 있으면 등록한다(설치 순서와 상관없이)
+        b = os.path.join(self.home, ".local", "bin")
+        os.makedirs(b)
+        with open(os.path.join(b, "agy"), "w") as f:
+            f.write("#!/bin/sh\n")
+        os.chmod(os.path.join(b, "agy"), 0o755)
+        r = self.run_install()
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertEqual(list(read_json(self.agy_hooks())), ["sheltie"])
+        self.assertIn("agy 훅 등록", r.stdout)
+
     def test_qwen_merge_keeps_other_hooks_backup_once_no_duplicates(self):
         orig = {"model": {"name": "qwen3"}, "hooks": {
             "Stop": [{"hooks": [{"type": "command", "command": "echo mine"}]}],

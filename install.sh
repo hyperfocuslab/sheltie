@@ -655,7 +655,10 @@ hooks_apply() {
       opencode) _dir=$OPENCODE_DIR; _file="$_dir/plugins/sheltie.js" ;;
       agy) _dir="$HOME/.gemini"; _file="$_dir/config/hooks.json" ;;
     esac
-    if [ ! -d "$_dir" ]; then say "($_t: $_dir 없음, 훅 건너뜀)"; continue; fi
+    # agy는 첫 실행 전엔 ~/.gemini가 없다: agy 명령이 있으면 등록한다(설치 순서와 상관없이 붙게).
+    if [ ! -d "$_dir" ] && ! { [ "$_t" = agy ] && [ "$_act" = install ] && { command -v agy >/dev/null 2>&1 || [ -x "$HOME/.local/bin/agy" ]; }; }; then
+      say "($_t: $_dir 없음, 훅 건너뜀)"; continue
+    fi
     _res=$("$_py" -c "$HOOKS_PY" "$_act" "$_t" "$_file" "$_py" "$SERVER" posix $_dryarg 2>/dev/null) || _res=error
     _pre=""; [ "$DRY" != 1 ] || _pre="(dry-run) "
     case "$_res" in
